@@ -126,9 +126,17 @@ function routePost(string $a): void {
         case 'save_checklist':  if (function_exists('doSaveChecklist'))  doSaveChecklist();  break;
         case 'delete_checklist_attachment':
             if (function_exists('doDeleteChecklistAttachment')) doDeleteChecklistAttachment(); break;
-        case 'save_task':       if (function_exists('doSaveTask') && canManageTasks()) doSaveTask(); break;
-        case 'toggle_task':     if (function_exists('doToggleTask') && canManageTasks()) doToggleTask(); break;
-        case 'del_task':        if (function_exists('doDelTask') && canManageTasks()) doDelTask(); break;
+        case 'save_task':       if (function_exists('doSaveTask') && canManageAnyChecklist()) doSaveTask(); break;
+        case 'toggle_task':     if (function_exists('doToggleTask') && canManageAnyChecklist()) doToggleTask(); break;
+        case 'del_task':        if (function_exists('doDelTask') && canManageAnyChecklist()) doDelTask(); break;
+        case 'save_checklist_meta': if (function_exists('doSaveChecklistMeta') && canManageAnyChecklist()) doSaveChecklistMeta(); break;
+        case 'toggle_checklist':    if (function_exists('doToggleChecklist') && canManageAnyChecklist()) doToggleChecklist(); break;
+        case 'save_section':    if (function_exists('doSaveSection') && canManageAnyChecklist()) doSaveSection(); break;
+        case 'del_section':     if (function_exists('doDelSection') && canManageAnyChecklist()) doDelSection(); break;
+        case 'save_assignee':   if (function_exists('doSaveAssignee') && canManageAnyChecklist()) doSaveAssignee(); break;
+        case 'del_assignee':    if (function_exists('doDelAssignee') && canManageAnyChecklist()) doDelAssignee(); break;
+        case 'save_validator':  if (function_exists('doSaveValidator') && canManageAnyChecklist()) doSaveValidator(); break;
+        case 'del_validator':   if (function_exists('doDelValidator') && canManageAnyChecklist()) doDelValidator(); break;
         case 'delete_checklist_month': if (function_exists('doDeleteChecklistMonth') && isSuperadmin()) doDeleteChecklistMonth(); break;
         case 'save_checklist_validation': if (function_exists('doSaveChecklistValidation')) doSaveChecklistValidation(); break;
         // Punch requests

@@ -1,27 +1,78 @@
 <?php
 // =========================================================
 // Checklist Reports — monthly report + audit report + CSV export
+//
+// All reports are scoped to a single checklist (chk_checklists). The
+// selector defaults to the location-assigned "Store Checklist" so the
+// existing outlet reports behave exactly as before; employee-assigned
+// (factory department) checklists share one scope under location_id = 0.
 // =========================================================
+
+// Active checklists for the report selector.
+function chkReportChecklists(): array {
+    try {
+        return getDb()->query(
+            "SELECT id, name, assign_type FROM chk_checklists WHERE is_active = 1 ORDER BY sort_order, id"
+        )->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { return []; }
+}
+
+// Resolve the selected checklist id (?checklist_id), defaulting to the first
+// location-assigned checklist (the merged Store checklist), else the first.
+function chkReportSelectedId(): int {
+    $want = (int)($_GET['checklist_id'] ?? 0);
+    $all  = chkReportChecklists();
+    foreach ($all as $c) if ((int)$c['id'] === $want) return $want;
+    foreach ($all as $c) if (($c['assign_type'] ?? '') === 'location') return (int)$c['id'];
+    return $all ? (int)$all[0]['id'] : 0;
+}
+
+function chkReportIsEmployeeMode(int $checklistId): bool {
+    $st = getDb()->prepare("SELECT assign_type FROM chk_checklists WHERE id = ?");
+    $st->execute([$checklistId]);
+    return $st->fetchColumn() === 'employee';
+}
+
+// A <form> GET selector for the active checklist, preserving extra hidden
+// params (e.g. the current month/date) so switching checklist keeps context.
+function chkReportSelectorHtml(int $selected, string $page, array $hidden = []): string {
+    $opts = '';
+    foreach (chkReportChecklists() as $c) {
+        $sel = ((int)$c['id'] === $selected) ? ' selected' : '';
+        $opts .= '<option value="' . (int)$c['id'] . '"' . $sel . '>' . h($c['name']) . '</option>';
+    }
+    $h = '<input type="hidden" name="page" value="' . h($page) . '">';
+    foreach ($hidden as $k => $v) $h .= '<input type="hidden" name="' . h($k) . '" value="' . h((string)$v) . '">';
+    return '<form method="GET" style="display:inline-flex;gap:8px;align-items:center">' . $h
+         . '<label class="text-muted" style="font-size:13px">Checklist</label>'
+         . '<select name="checklist_id" class="form-control" style="width:200px" onchange="this.form.submit()">' . $opts . '</select>'
+         . '</form>';
+}
 
 // ── Export Monthly Checklist Report as CSV ─────────────────
 function exportChecklistReport(): void {
     $db = getDb();
     $selectedMonth = (int)($_GET['month'] ?? date('m'));
     $selectedYear  = (int)($_GET['year']  ?? date('Y'));
-    $locationId    = (int)($_GET['location_id'] ?? 0);
+    $checklistId   = chkReportSelectedId();
+    $empMode       = chkReportIsEmployeeMode($checklistId);
+    $locationId    = $empMode ? 0 : (int)($_GET['location_id'] ?? 0);
 
-    if ($locationId < 1) { echo 'Location required.'; exit; }
+    if (!$empMode && $locationId < 1) { echo 'Location required.'; exit; }
 
     $daysInMonth = cal_days_in_month(CAL_GREGORIAN, $selectedMonth, $selectedYear);
-    $questions   = $db->query("SELECT id, task_description, section_name, is_active FROM chk_items ORDER BY section_name, id ASC")->fetchAll(PDO::FETCH_ASSOC);
+    $qs = $db->prepare("SELECT id, task_description, section_name, is_active FROM chk_items
+                        WHERE checklist_id = ? ORDER BY section_name, id ASC");
+    $qs->execute([$checklistId]);
+    $questions = $qs->fetchAll(PDO::FETCH_ASSOC);
 
     $responses = [];
     $st = $db->prepare(
         "SELECT item_id, DAY(log_date) AS day, response_value
          FROM chk_daily_responses
-         WHERE location_id = ? AND MONTH(log_date) = ? AND YEAR(log_date) = ?"
+         WHERE checklist_id = ? AND location_id = ? AND MONTH(log_date) = ? AND YEAR(log_date) = ?"
     );
-    $st->execute([$locationId, $selectedMonth, $selectedYear]);
+    $st->execute([$checklistId, $locationId, $selectedMonth, $selectedYear]);
     foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row) {
         $responses[$row['item_id']][$row['day']] = $row['response_value'];
     }
@@ -115,22 +166,28 @@ function pageChecklistReport(): void {
     $db = getDb();
     $selectedMonth = (int)($_GET['month'] ?? date('m'));
     $selectedYear  = (int)($_GET['year']  ?? date('Y'));
-    $locationId    = (int)($_GET['location_id'] ?? 0);
+    $checklistId   = chkReportSelectedId();
+    $empMode       = chkReportIsEmployeeMode($checklistId);
+    $locationId    = $empMode ? 0 : (int)($_GET['location_id'] ?? 0);
+    $haveScope     = $empMode || $locationId > 0;
 
     $daysInMonth = cal_days_in_month(CAL_GREGORIAN, $selectedMonth, $selectedYear);
     $locations   = getActiveLocations();
-    $questions   = $db->query("SELECT id, task_description, section_name, is_active FROM chk_items ORDER BY section_name, id ASC")->fetchAll(PDO::FETCH_ASSOC);
+    $qs = $db->prepare("SELECT id, task_description, section_name, is_active FROM chk_items
+                        WHERE checklist_id = ? ORDER BY section_name, id ASC");
+    $qs->execute([$checklistId]);
+    $questions = $qs->fetchAll(PDO::FETCH_ASSOC);
 
     $responses = [];
     $valByItemDay = [];   // [item_id][day] => 'done' | 'not_done' (operation validation)
     $openByDay = []; $closeByDay = []; $bankingByDay = [];
-    if ($locationId > 0) {
+    if ($haveScope) {
         $st = $db->prepare(
             "SELECT item_id, DAY(log_date) AS day, response_value
              FROM chk_daily_responses
-             WHERE location_id = ? AND MONTH(log_date) = ? AND YEAR(log_date) = ?"
+             WHERE checklist_id = ? AND location_id = ? AND MONTH(log_date) = ? AND YEAR(log_date) = ?"
         );
-        $st->execute([$locationId, $selectedMonth, $selectedYear]);
+        $st->execute([$checklistId, $locationId, $selectedMonth, $selectedYear]);
         foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row) {
             $responses[$row['item_id']][$row['day']] = $row['response_value'];
         }
@@ -140,9 +197,9 @@ function pageChecklistReport(): void {
             $vst = $db->prepare(
                 "SELECT item_id, DAY(log_date) AS day, status
                  FROM chk_validations
-                 WHERE location_id = ? AND MONTH(log_date) = ? AND YEAR(log_date) = ?"
+                 WHERE checklist_id = ? AND location_id = ? AND MONTH(log_date) = ? AND YEAR(log_date) = ?"
             );
-            $vst->execute([$locationId, $selectedMonth, $selectedYear]);
+            $vst->execute([$checklistId, $locationId, $selectedMonth, $selectedYear]);
             foreach ($vst->fetchAll(PDO::FETCH_ASSOC) as $row) {
                 $valByItemDay[(int)$row['item_id']][(int)$row['day']] = $row['status'];
             }
@@ -186,9 +243,17 @@ function pageChecklistReport(): void {
 <div class="form-card" style="margin-bottom:14px;max-width:none">
     <form method="GET" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
         <input type="hidden" name="page" value="checklist_report">
-        <div class="form-group" style="flex:1 1 260px;min-width:260px">
+        <div class="form-group">
+            <label>Checklist</label>
+            <select name="checklist_id" class="form-control" style="width:200px" onchange="this.form.submit()">
+                <?php foreach (chkReportChecklists() as $c): ?>
+                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h($c['name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group" style="flex:1 1 260px;min-width:260px;<?= $empMode ? 'display:none' : '' ?>">
             <label>Location</label>
-            <input type="hidden" name="location_id" id="crLocId" value="<?= (int)$locationId ?>" required>
+            <input type="hidden" name="location_id" id="crLocId" value="<?= (int)$locationId ?>"<?= $empMode ? '' : ' required' ?>>
             <?php
                 $crLocLabel = '';
                 foreach ($locations as $loc) {
@@ -198,7 +263,7 @@ function pageChecklistReport(): void {
             <span class="input-clear-wrap" style="display:flex;width:100%">
                 <input type="text" id="crLocSearch" class="form-control"
                        placeholder="Type to search location"
-                       value="<?= h($crLocLabel) ?>" autocomplete="off" required>
+                       value="<?= h($crLocLabel) ?>" autocomplete="off"<?= $empMode ? '' : ' required' ?>>
                 <button type="button" id="crLocClear" class="input-clear-btn" data-no-auto aria-label="Clear" tabindex="-1">&times;</button>
                 <div id="crLocList" style="position:absolute;top:100%;left:0;right:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-top:2px;max-height:280px;overflow-y:auto;display:none;z-index:100;box-shadow:0 6px 18px rgba(0,0,0,.35)"></div>
             </span>
@@ -220,16 +285,16 @@ function pageChecklistReport(): void {
             </select>
         </div>
         <button type="submit" class="btn btn-primary">View Report</button>
-        <?php if ($locationId > 0): ?>
-        <a href="?page=export_checklist_report&location_id=<?= $locationId ?>&month=<?= $selectedMonth ?>&year=<?= $selectedYear ?>"
+        <?php if ($haveScope): ?>
+        <a href="?page=export_checklist_report&checklist_id=<?= $checklistId ?>&location_id=<?= $locationId ?>&month=<?= $selectedMonth ?>&year=<?= $selectedYear ?>"
            class="btn btn-ghost" target="_blank">📥 Export CSV</a>
         <?php endif; ?>
     </form>
 </div>
 
-<?php if ($locationId > 0): ?>
+<?php if ($haveScope): ?>
 <div class="report-header-box">
-    <strong><?= h($locationName) ?></strong> — <?= date('F Y', mktime(0,0,0,$selectedMonth,1,$selectedYear)) ?>
+    <strong><?= h($empMode ? '' : $locationName) ?></strong> — <?= date('F Y', mktime(0,0,0,$selectedMonth,1,$selectedYear)) ?>
 </div>
 <div class="table-wrap" style="overflow-x:auto" id="reportWrap">
     <table class="rpt-table table">
@@ -382,7 +447,17 @@ function pageChecklistAudit(): void {
     $filterDate  = (string)($_GET['log_date'] ?? date('Y-m-d'));
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $filterDate)) $filterDate = date('Y-m-d');
 
-    $sectionOptions = ['1.Morning', '2.Afternoon', '3.Evening'];
+    $checklistId = chkReportSelectedId();
+    // Location-assigned checklists show the location-wise tree; employee-assigned
+    // (department) checklists have no locations, so we show just the checklist.
+    $empMode = chkReportIsEmployeeMode($checklistId);
+    $checklistName = '';
+    foreach (chkReportChecklists() as $rc) { if ((int)$rc['id'] === $checklistId) { $checklistName = $rc['name']; break; } }
+    // Section options come from the selected checklist's bands; fall back to
+    // the legacy three so an un-migrated install still renders.
+    $secNamesSt = $db->prepare("SELECT name FROM chk_sections WHERE checklist_id = ? ORDER BY sort_order, id");
+    $secNamesSt->execute([$checklistId]);
+    $sectionOptions = $secNamesSt->fetchAll(PDO::FETCH_COLUMN) ?: ['1.Morning', '2.Afternoon', '3.Evening'];
     $statusOptions  = ['complete' => 'Complete', 'partial' => 'Partial', 'pending' => 'Pending'];
 
     $sections = array_values(array_intersect((array)($_GET['section'] ?? []), $sectionOptions));
@@ -417,13 +492,13 @@ function pageChecklistAudit(): void {
             fn($l) => isset($selSet[(int)$l['location_id']])
         ));
 
-        // Active items, restricted to selected sections.
-        $itemSql = "SELECT id, task_description, section_name FROM chk_items WHERE is_active = 1";
-        $itemParams = [];
+        // Active items for this checklist, restricted to selected sections.
+        $itemSql = "SELECT id, task_description, section_name FROM chk_items WHERE is_active = 1 AND checklist_id = ?";
+        $itemParams = [$checklistId];
         if ($sectionFilterActive) {
             $ph = implode(',', array_fill(0, count($sections), '?'));
             $itemSql .= " AND section_name IN ($ph)";
-            $itemParams = $sections;
+            $itemParams = array_merge($itemParams, $sections);
         }
         $itemSql .= " ORDER BY section_name, id ASC";
         $itemSt = $db->prepare($itemSql);
@@ -441,9 +516,9 @@ function pageChecklistAudit(): void {
                     e.full_name AS staff_member, e.employee_code AS staff_code
              FROM chk_daily_responses a
              LEFT JOIN employees e ON a.employee_code = e.employee_code
-             WHERE a.log_date = ?"
+             WHERE a.checklist_id = ? AND a.log_date = ?"
         );
-        $respSt->execute([$filterDate]);
+        $respSt->execute([$checklistId, $filterDate]);
         foreach ($respSt->fetchAll(PDO::FETCH_ASSOC) as $row) {
             $responsesByLoc[(int)$row['location_id']][(int)$row['item_id']] = $row;
         }
@@ -455,9 +530,9 @@ function pageChecklistAudit(): void {
                         e.full_name AS val_name
                  FROM chk_validations cv
                  LEFT JOIN employees e ON cv.validated_by = e.employee_code
-                 WHERE cv.log_date = ?"
+                 WHERE cv.checklist_id = ? AND cv.log_date = ?"
             );
-            $valSt->execute([$filterDate]);
+            $valSt->execute([$checklistId, $filterDate]);
             foreach ($valSt->fetchAll(PDO::FETCH_ASSOC) as $row) {
                 $valByLoc[(int)$row['location_id']][(int)$row['item_id']] = $row;
             }
@@ -508,10 +583,19 @@ function pageChecklistAudit(): void {
         <input type="hidden" name="page" value="checklist_audit">
         <input type="hidden" name="view" value="1">
         <div class="form-group">
+            <label>Checklist</label>
+            <select name="checklist_id" class="form-control" style="width:180px" onchange="this.form.submit()">
+                <?php foreach (chkReportChecklists() as $c): ?>
+                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h($c['name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group">
             <label>Date</label>
             <input type="date" name="log_date" class="form-control" style="width:160px"
                    value="<?= h($filterDate) ?>" max="<?= h(date('Y-m-d')) ?>">
         </div>
+        <?php if (!$empMode): ?>
         <div class="form-group">
             <label>Location</label>
             <div class="ms-filter" data-label="Location" style="width:220px">
@@ -529,6 +613,7 @@ function pageChecklistAudit(): void {
                 </div>
             </div>
         </div>
+        <?php endif; ?>
         <div class="form-group">
             <label>Section</label>
             <div class="ms-filter" data-label="Section" style="width:170px">
@@ -684,7 +769,49 @@ function pageChecklistAudit(): void {
 </script>
 
 <?php if (!$viewClicked): ?>
-<div class="rpt-prompt">Pick filters and click <strong>View</strong> to load the audit tree.</div>
+<div class="rpt-prompt">Pick filters and click <strong>View</strong> to load.</div>
+<?php elseif ($empMode): ?>
+<?php
+    // Department (employee-assigned) checklist — one shared scope (location 0),
+    // shown as a flat section → task list rather than a location tree.
+    $resps0 = $responsesByLoc[0] ?? [];
+    $vals0  = $valByLoc[0] ?? [];
+    $aDone = 0; $aTotal = 0;
+    foreach ($sections as $sec) foreach (($itemsBySection[$sec] ?? []) as $it) { $aTotal++; if (isset($resps0[(int)$it['id']])) $aDone++; }
+?>
+<div class="text-muted" style="margin-bottom:8px">
+    <strong><?= h($checklistName) ?></strong> — <?= h(date('D, d M Y', strtotime($filterDate))) ?> · <?= $aDone ?>/<?= $aTotal ?> filled
+</div>
+<div class="table-wrap"><table class="table" style="font-size:13px">
+    <thead><tr>
+        <th style="width:48px;text-align:center">#</th>
+        <th>Task</th>
+        <th style="width:110px">Response</th>
+        <th style="width:320px">Filled / Validation</th>
+    </tr></thead>
+    <tbody>
+    <?php $sr = 1; foreach ($sections as $sec): $secItems = $itemsBySection[$sec] ?? []; if (!$secItems) continue; ?>
+        <tr><td colspan="4" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px"><?= h($sec) ?></td></tr>
+        <?php foreach ($secItems as $it):
+            $iid = (int)$it['id']; $r = $resps0[$iid] ?? null;
+            $isNo = $r && mb_strtolower($r['response_value']) === 'no';
+            $cv = $vals0[$iid] ?? null;
+        ?>
+        <tr>
+            <td style="text-align:center;color:var(--muted)"><?= $sr++ ?></td>
+            <td style="white-space:normal;word-break:break-word"><?= h($it['task_description']) ?></td>
+            <td><?php if ($r): ?><span style="font-weight:700;color:<?= $isNo ? 'var(--red)' : 'var(--green)' ?>"><?= h($r['response_value']) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
+            <td style="color:var(--muted);font-size:12px">
+                <?php if ($r): ?><?= h($r['staff_member'] ?? $r['staff_code'] ?? '—') ?> · <?= h(date('H:i', strtotime($r['submitted_at']))) ?><?php else: ?>—<?php endif; ?>
+                <?php if ($cv): $cvDone = $cv['status'] === 'done'; ?>
+                    <div style="margin-top:3px;color:<?= $cvDone ? 'var(--green)' : 'var(--red)' ?>"><?= $cvDone ? '&#10003; Done' : '&#10007; Not done' ?> · <?= h($cv['val_name'] ?? '—') ?><?php if (!empty($cv['remarks'])): ?> · &ldquo;<?= h($cv['remarks']) ?>&rdquo;<?php endif; ?></div>
+                <?php endif; ?>
+            </td>
+        </tr>
+        <?php endforeach; ?>
+    <?php endforeach; ?>
+    </tbody>
+</table></div>
 <?php else: ?>
 <div class="text-muted" style="margin-bottom:8px">
     Tree for <strong><?= h(date('D, d M Y', strtotime($filterDate))) ?></strong> — <?= count($locTree) ?> location<?= count($locTree) === 1 ? '' : 's' ?> shown.
@@ -806,7 +933,10 @@ function pageChecklistOverview(): void {
     // First load (no view yet): all options pre-checked. On submit: keep what
     // the user checked, intersected with the allowlist. If they uncheck
     // everything, fall back to "all" so the grid never goes blank by accident.
-    $sectionOptions = ['1.Morning', '2.Afternoon', '3.Evening'];
+    $checklistId = chkReportSelectedId();
+    $secNamesSt = $db->prepare("SELECT name FROM chk_sections WHERE checklist_id = ? ORDER BY sort_order, id");
+    $secNamesSt->execute([$checklistId]);
+    $sectionOptions = $secNamesSt->fetchAll(PDO::FETCH_COLUMN) ?: ['1.Morning', '2.Afternoon', '3.Evening'];
     $statusOptions  = ['complete' => 'Complete', 'partial' => 'Partial', 'pending' => 'Pending'];
     if ($viewClicked) {
         $sections = array_values(array_intersect((array)($_GET['section'] ?? []), $sectionOptions));
@@ -843,11 +973,13 @@ function pageChecklistOverview(): void {
 
         if ($sectionFilterActive) {
             $ph = implode(',', array_fill(0, count($sections), '?'));
-            $tq = $db->prepare("SELECT COUNT(*) FROM chk_items WHERE is_active = 1 AND section_name IN ($ph)");
-            $tq->execute($sections);
+            $tq = $db->prepare("SELECT COUNT(*) FROM chk_items WHERE is_active = 1 AND checklist_id = ? AND section_name IN ($ph)");
+            $tq->execute(array_merge([$checklistId], $sections));
             $totalQ = (int)($tq->fetchColumn() ?: 0);
         } else {
-            $totalQ = (int)($db->query("SELECT COUNT(*) FROM chk_items WHERE is_active = 1")->fetchColumn() ?: 0);
+            $tq = $db->prepare("SELECT COUNT(*) FROM chk_items WHERE is_active = 1 AND checklist_id = ?");
+            $tq->execute([$checklistId]);
+            $totalQ = (int)($tq->fetchColumn() ?: 0);
         }
 
         if ($mode === 'day') {
@@ -858,18 +990,18 @@ function pageChecklistOverview(): void {
                     "SELECT r.location_id, COUNT(*) AS done
                      FROM chk_daily_responses r
                      JOIN chk_items i ON i.id = r.item_id
-                     WHERE r.log_date = ? AND i.section_name IN ($ph)
+                     WHERE r.checklist_id = ? AND r.log_date = ? AND i.section_name IN ($ph)
                      GROUP BY r.location_id"
                 );
-                $st->execute(array_merge([$selectedDay], $sections));
+                $st->execute(array_merge([$checklistId, $selectedDay], $sections));
             } else {
                 $st = $db->prepare(
                     "SELECT location_id, COUNT(*) AS done
                      FROM chk_daily_responses
-                     WHERE log_date = ?
+                     WHERE checklist_id = ? AND log_date = ?
                      GROUP BY location_id"
                 );
-                $st->execute([$selectedDay]);
+                $st->execute([$checklistId, $selectedDay]);
             }
             foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
                 $dayCell[(int)$r['location_id']] = (int)$r['done'];
@@ -882,18 +1014,18 @@ function pageChecklistOverview(): void {
                     "SELECT r.location_id, DAY(r.log_date) AS day, COUNT(*) AS done
                      FROM chk_daily_responses r
                      JOIN chk_items i ON i.id = r.item_id
-                     WHERE r.log_date BETWEEN ? AND ? AND i.section_name IN ($ph)
+                     WHERE r.checklist_id = ? AND r.log_date BETWEEN ? AND ? AND i.section_name IN ($ph)
                      GROUP BY r.location_id, DAY(r.log_date)"
                 );
-                $st->execute(array_merge([$monthStart, $monthEnd], $sections));
+                $st->execute(array_merge([$checklistId, $monthStart, $monthEnd], $sections));
             } else {
                 $st = $db->prepare(
                     "SELECT location_id, DAY(log_date) AS day, COUNT(*) AS done
                      FROM chk_daily_responses
-                     WHERE log_date BETWEEN ? AND ?
+                     WHERE checklist_id = ? AND log_date BETWEEN ? AND ?
                      GROUP BY location_id, DAY(log_date)"
                 );
-                $st->execute([$monthStart, $monthEnd]);
+                $st->execute([$checklistId, $monthStart, $monthEnd]);
             }
             foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
                 $cell[(int)$r['location_id']][(int)$r['day']] = (int)$r['done'];
@@ -907,6 +1039,14 @@ function pageChecklistOverview(): void {
     <form method="GET" id="chkOvForm" class="chk-ov-mode-<?= h($mode) ?>" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
         <input type="hidden" name="page" value="checklist_overview">
         <input type="hidden" name="view" value="1">
+        <div class="form-group">
+            <label>Checklist</label>
+            <select name="checklist_id" class="form-control" style="width:180px" onchange="this.form.submit()">
+                <?php foreach (chkReportChecklists() as $c): ?>
+                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h($c['name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
         <div class="form-group">
             <label>View</label>
             <select name="mode" id="chkOvMode" class="form-control" style="width:110px">
@@ -1085,8 +1225,9 @@ function pageChecklistOverview(): void {
 <div class="form-card" style="max-width:none;margin-bottom:14px;border-left:3px solid var(--red)">
     <div class="form-section-title" style="color:var(--red)">⚠️ Delete Checklist Data for a Month</div>
     <form method="POST" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap"
-          onsubmit="return confirm('Delete ALL checklist responses for the selected month across every location? This cannot be undone.');">
+          onsubmit="return confirm('Delete ALL responses for the selected checklist + month across every location? This cannot be undone.');">
         <input type="hidden" name="action" value="delete_checklist_month">
+        <input type="hidden" name="checklist_id" value="<?= (int)$checklistId ?>">
         <div class="form-group">
             <label>Month</label>
             <select name="month" class="form-control" style="width:140px" required>
@@ -1282,33 +1423,37 @@ function doDeleteChecklistMonth(): void {
     }
     $month = (int)($_POST['month'] ?? 0);
     $year  = (int)($_POST['year']  ?? 0);
+    $checklistId = (int)($_POST['checklist_id'] ?? 0);
     if ($month < 1 || $month > 12 || $year < 2024 || $year > 2099) {
         flash('error', 'Invalid month or year.');
         header('Location: index.php?page=checklist_overview'); exit;
     }
+    if ($checklistId < 1) {
+        flash('error', 'Select a checklist before deleting a month.');
+        header('Location: index.php?page=checklist_overview&view=1&month=' . $month . '&year=' . $year); exit;
+    }
     $monthStart = sprintf('%04d-%02d-01', $year, $month);
     $monthEnd   = date('Y-m-t', strtotime($monthStart));
     $monthName  = date('F Y', strtotime($monthStart));
+    $back = 'index.php?page=checklist_overview&view=1&checklist_id=' . $checklistId . '&month=' . $month . '&year=' . $year;
 
     $db = getDb();
     try {
-        $count = (int)$db->query(
-            "SELECT COUNT(*) FROM chk_daily_responses
-             WHERE log_date BETWEEN " . $db->quote($monthStart) . " AND " . $db->quote($monthEnd)
-        )->fetchColumn();
+        $cs = $db->prepare(
+            "SELECT COUNT(*) FROM chk_daily_responses WHERE checklist_id = ? AND log_date BETWEEN ? AND ?");
+        $cs->execute([$checklistId, $monthStart, $monthEnd]);
+        $count = (int)$cs->fetchColumn();
         if ($count === 0) {
             flash('error', 'No checklist responses found for ' . $monthName . '.');
-            header('Location: index.php?page=checklist_overview&view=1&month=' . $month . '&year=' . $year); exit;
+            header('Location: ' . $back); exit;
         }
-        $del = $db->prepare(
-            "DELETE FROM chk_daily_responses WHERE log_date BETWEEN ? AND ?"
-        );
-        $del->execute([$monthStart, $monthEnd]);
+        $db->prepare("DELETE FROM chk_daily_responses WHERE checklist_id = ? AND log_date BETWEEN ? AND ?")
+           ->execute([$checklistId, $monthStart, $monthEnd]);
         flash('success', 'Deleted ' . $count . ' checklist response' . ($count === 1 ? '' : 's') . ' for ' . $monthName . '.');
     } catch (Exception $e) {
         flash('error', 'Delete failed: ' . $e->getMessage());
     }
-    header('Location: index.php?page=checklist_overview&view=1&month=' . $month . '&year=' . $year); exit;
+    header('Location: ' . $back); exit;
 }
 
 // ===========================================================
@@ -1320,30 +1465,51 @@ function doDeleteChecklistMonth(): void {
 // txn_checklist_validate. Surfaced on the Monthly Report (cell borders)
 // and the Checklist Audit (validator name/time/remark).
 function pageChecklistValidate(): void {
-    if (!isSuperadmin() && !hasTxn('checklist_validate')) { echo '<p>Access denied.</p>'; return; }
     $db = getDb();
+    $me = myCode();
+    // The txn_checklist_validate role only reveals the page; validation itself
+    // is limited to users added as validators (chk_validators). Superadmin is
+    // the global override.
+    $canSeePage = isSuperadmin() || hasTxn('checklist_validate') || chkUserHasValidation($me);
+    if (!$canSeePage) { echo '<p>Access denied.</p>'; return; }
 
-    $locationId = (int)($_GET['location_id'] ?? 0);
+    // Checklists this user is actually allowed to validate.
+    $validatable = array_values(array_filter(chkReportChecklists(),
+        fn($c) => chkCanValidateChecklist((int)$c['id'], $me)));
+    if (!$validatable) {
+        echo '<div class="page-header"><h2>✔️ Validate Checklist</h2></div>';
+        echo '<div class="rpt-prompt">You are not assigned as a validator for any checklist. Ask an admin to add you under <strong>Manage Checklists → Validators</strong>.</div>';
+        return;
+    }
+
+    $checklistId = (int)($_GET['checklist_id'] ?? 0);
+    $okSel = false; foreach ($validatable as $c) if ((int)$c['id'] === $checklistId) $okSel = true;
+    if (!$okSel) $checklistId = (int)$validatable[0]['id'];
+    $empMode = chkReportIsEmployeeMode($checklistId);
+
+    $locationId = $empMode ? 0 : (int)($_GET['location_id'] ?? 0);
     $logDate    = (string)($_GET['log_date'] ?? date('Y-m-d'));
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $logDate)) $logDate = date('Y-m-d');
     $today      = date('Y-m-d');
     $locations  = getActiveLocations();
 
-    $viewClicked = $locationId > 0;
+    $viewClicked = !empty($_GET['view']) || (!$empMode && $locationId > 0);
     $locationName = '';
     $items = []; $responses = []; $vals = [];
     if ($viewClicked) {
         foreach ($locations as $loc) {
             if ((int)$loc['location_id'] === $locationId) { $locationName = $loc['location_name']; break; }
         }
-        $items = $db->query("SELECT id, task_description, section_name FROM chk_items WHERE is_active = 1 ORDER BY section_name, id ASC")->fetchAll(PDO::FETCH_ASSOC);
+        $is = $db->prepare("SELECT id, task_description, section_name FROM chk_items WHERE is_active = 1 AND checklist_id = ? ORDER BY section_name, id ASC");
+        $is->execute([$checklistId]);
+        $items = $is->fetchAll(PDO::FETCH_ASSOC);
 
-        $rs = $db->prepare("SELECT item_id, response_value FROM chk_daily_responses WHERE location_id = ? AND log_date = ?");
-        $rs->execute([$locationId, $logDate]);
+        $rs = $db->prepare("SELECT item_id, response_value FROM chk_daily_responses WHERE checklist_id = ? AND location_id = ? AND log_date = ?");
+        $rs->execute([$checklistId, $locationId, $logDate]);
         foreach ($rs->fetchAll(PDO::FETCH_ASSOC) as $r) $responses[(int)$r['item_id']] = $r['response_value'];
 
-        $vs = $db->prepare("SELECT item_id, status, remarks FROM chk_validations WHERE location_id = ? AND log_date = ?");
-        $vs->execute([$locationId, $logDate]);
+        $vs = $db->prepare("SELECT item_id, status, remarks FROM chk_validations WHERE checklist_id = ? AND location_id = ? AND log_date = ?");
+        $vs->execute([$checklistId, $locationId, $logDate]);
         foreach ($vs->fetchAll(PDO::FETCH_ASSOC) as $v) $vals[(int)$v['item_id']] = $v;
     }
 ?>
@@ -1352,13 +1518,22 @@ function pageChecklistValidate(): void {
 <div class="form-card" style="margin-bottom:14px;max-width:none">
     <form method="GET" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
         <input type="hidden" name="page" value="checklist_validate">
-        <div class="form-group" style="flex:1 1 260px;min-width:260px">
+        <input type="hidden" name="view" value="1">
+        <div class="form-group">
+            <label>Checklist</label>
+            <select name="checklist_id" class="form-control" style="width:200px" onchange="this.form.submit()">
+                <?php foreach ($validatable as $c): ?>
+                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h($c['name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group" style="flex:1 1 260px;min-width:260px;<?= $empMode ? 'display:none' : '' ?>">
             <label>Location</label>
-            <input type="hidden" name="location_id" id="cvLocId" value="<?= (int)$locationId ?>" required>
+            <input type="hidden" name="location_id" id="cvLocId" value="<?= (int)$locationId ?>"<?= $empMode ? '' : ' required' ?>>
             <span class="input-clear-wrap" style="display:flex;width:100%">
                 <input type="text" id="cvLocSearch" class="form-control"
                        placeholder="Type to search location"
-                       value="<?= h($locationName) ?>" autocomplete="off" required>
+                       value="<?= h($locationName) ?>" autocomplete="off"<?= $empMode ? '' : ' required' ?>>
                 <button type="button" id="cvLocClear" class="input-clear-btn" data-no-auto aria-label="Clear" tabindex="-1">&times;</button>
                 <div id="cvLocList" style="position:absolute;top:100%;left:0;right:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-top:2px;max-height:280px;overflow-y:auto;display:none;z-index:100;box-shadow:0 6px 18px rgba(0,0,0,.35)"></div>
             </span>
@@ -1372,16 +1547,17 @@ function pageChecklistValidate(): void {
     </form>
 </div>
 
-<?php if (!$viewClicked): ?>
-<div class="rpt-prompt">Pick a location and date, then click <strong>Load</strong> to validate that day's tasks.</div>
+<?php if (!$viewClicked || (!$empMode && $locationId < 1)): ?>
+<div class="rpt-prompt"><?= $empMode ? 'Pick a date, then click <strong>Load</strong>.' : 'Pick a location and date, then click <strong>Load</strong> to validate that day\'s tasks.' ?></div>
 <?php elseif (!$items): ?>
 <div class="rpt-prompt">No active checklist tasks found.</div>
 <?php else: ?>
 <div class="report-header-box">
-    <strong><?= h($locationName ?: ('Location #' . $locationId)) ?></strong> — <?= date('D, d M Y', strtotime($logDate)) ?>
+    <strong><?= h($empMode ? '' : ($locationName ?: ('Location #' . $locationId))) ?></strong> — <?= date('D, d M Y', strtotime($logDate)) ?>
 </div>
 <form method="POST">
     <input type="hidden" name="action" value="save_checklist_validation">
+    <input type="hidden" name="checklist_id" value="<?= (int)$checklistId ?>">
     <input type="hidden" name="location_id" value="<?= (int)$locationId ?>">
     <input type="hidden" name="log_date" value="<?= h($logDate) ?>">
     <div class="table-wrap">
@@ -1479,25 +1655,27 @@ function pageChecklistValidate(): void {
 
 // POST: save (upsert) the operation team's validations for one location/day.
 function doSaveChecklistValidation(): void {
-    if (!isSuperadmin() && !hasTxn('checklist_validate')) {
+    $db          = getDb();
+    $code        = myCode();
+    $checklistId = (int)($_POST['checklist_id'] ?? 0);
+    if ($checklistId <= 0 || !chkCanValidateChecklist($checklistId, $code)) {
         flash('error', 'Access denied.');
         header('Location: index.php?page=checklist_validate'); exit;
     }
-    $db         = getDb();
-    $locationId = (int)($_POST['location_id'] ?? 0);
+    $empMode    = chkReportIsEmployeeMode($checklistId);
+    $locationId = $empMode ? 0 : (int)($_POST['location_id'] ?? 0);
     $logDate    = (string)($_POST['log_date'] ?? '');
-    if ($locationId <= 0 || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $logDate)) {
+    if ((!$empMode && $locationId <= 0) || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $logDate)) {
         flash('error', 'Invalid location or date.');
         header('Location: index.php?page=checklist_validate'); exit;
     }
     $statuses = (array)($_POST['status'] ?? []);
     $remarks  = (array)($_POST['remark'] ?? []);
-    $code     = myCode();
 
     $up = $db->prepare(
-        "INSERT INTO chk_validations (location_id, item_id, log_date, status, remarks, validated_by)
-         VALUES (?,?,?,?,?,?)
-         ON DUPLICATE KEY UPDATE status=VALUES(status), remarks=VALUES(remarks),
+        "INSERT INTO chk_validations (checklist_id, location_id, item_id, log_date, status, remarks, validated_by)
+         VALUES (?,?,?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE checklist_id=VALUES(checklist_id), status=VALUES(status), remarks=VALUES(remarks),
                                  validated_by=VALUES(validated_by), validated_at=NOW()"
     );
     $del = $db->prepare("DELETE FROM chk_validations WHERE location_id=? AND item_id=? AND log_date=?");
@@ -1510,7 +1688,7 @@ function doSaveChecklistValidation(): void {
             $st  = (string)$st;
             $rem = trim((string)($remarks[$itemId] ?? ''));
             if ($st === 'done' || $st === 'not_done') {
-                $up->execute([$locationId, $itemId, $logDate, $st, ($rem !== '' ? mb_substr($rem, 0, 500) : null), $code]);
+                $up->execute([$checklistId, $locationId, $itemId, $logDate, $st, ($rem !== '' ? mb_substr($rem, 0, 500) : null), $code]);
                 $saved++;
             } else {
                 $del->execute([$locationId, $itemId, $logDate]);
@@ -1520,6 +1698,6 @@ function doSaveChecklistValidation(): void {
     } catch (Exception $e) {
         flash('error', $e->getMessage());
     }
-    header('Location: index.php?page=checklist_validate&location_id=' . $locationId . '&log_date=' . urlencode($logDate));
+    header('Location: index.php?page=checklist_validate&view=1&checklist_id=' . $checklistId . '&location_id=' . $locationId . '&log_date=' . urlencode($logDate));
     exit;
 }

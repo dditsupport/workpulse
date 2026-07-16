@@ -51,6 +51,7 @@ function timeEntryLabel(array $e): string {
         return 'WP-' . (int)$e['issue_id'] . ($s !== '' ? ' — ' . $s : '');
     }
     if (!empty($e['task_id'])) return (string)($e['task_name'] ?? ('Task #' . (int)$e['task_id']));
+    if (!empty($e['checklist_id'])) return 'Checklist — ' . (string)($e['checklist_name'] ?? ('#' . (int)$e['checklist_id']));
     return (string)($e['task_label'] ?? '—');
 }
 
@@ -372,10 +373,11 @@ function pageMyTime(): void {
     $edit = null;
     if (!empty($_GET['edit'])) {
         $est = $db->prepare(
-            "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name
+            "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name
              FROM time_entries t
              LEFT JOIN issues i      ON t.issue_id = i.id
              LEFT JOIN time_tasks tk ON t.task_id  = tk.id
+             LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id
              WHERE t.id = ?"
         );
         $est->execute([(int)$_GET['edit']]);
@@ -384,10 +386,11 @@ function pageMyTime(): void {
     }
 
     $st = $db->prepare(
-        "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name
+        "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name
          FROM time_entries t
          LEFT JOIN issues i      ON t.issue_id = i.id
          LEFT JOIN time_tasks tk ON t.task_id  = tk.id
+         LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id
          WHERE t.employee_code = ? AND t.entry_date BETWEEN ? AND ?
          ORDER BY t.entry_date ASC, t.created_at ASC"
     );
@@ -406,16 +409,19 @@ function pageMyTime(): void {
     $dayTotals = array_fill_keys($days, 0);
     $weekTotal = 0;
     foreach ($entries as $e) {
-        if (!empty($e['issue_id']))      $key = 'i' . (int)$e['issue_id'];
-        elseif (!empty($e['task_id']))   $key = 'k' . (int)$e['task_id'];
-        else                             $key = 't' . mb_strtolower(trim((string)($e['task_label'] ?? '')));
+        if (!empty($e['issue_id']))         $key = 'i' . (int)$e['issue_id'];
+        elseif (!empty($e['task_id']))      $key = 'k' . (int)$e['task_id'];
+        elseif (!empty($e['checklist_id'])) $key = 'c' . (int)$e['checklist_id'];
+        else                                $key = 't' . mb_strtolower(trim((string)($e['task_label'] ?? '')));
         if (!isset($grid[$key])) {
             $grid[$key] = [
-                'issue_id'      => $e['issue_id'],
-                'issue_summary' => $e['issue_summary'] ?? null,
-                'task_id'       => $e['task_id'] ?? null,
-                'task_name'     => $e['task_name'] ?? null,
-                'task_label'    => $e['task_label'] ?? null,
+                'issue_id'       => $e['issue_id'],
+                'issue_summary'  => $e['issue_summary'] ?? null,
+                'task_id'        => $e['task_id'] ?? null,
+                'task_name'      => $e['task_name'] ?? null,
+                'checklist_id'   => $e['checklist_id'] ?? null,
+                'checklist_name' => $e['checklist_name'] ?? null,
+                'task_label'     => $e['task_label'] ?? null,
                 'cells'         => array_fill_keys($days, 0),
                 'total'         => 0,
                 'entries'       => [],   // individual rows, for the expandable sub-rows
@@ -771,11 +777,12 @@ function timeReportRows(string $emp, string $from, string $to, string $ticket): 
         if ($tid !== null) { $where[] = 't.issue_id = ?'; $params[] = $tid; }
         else               { $where[] = '1=0'; }
     }
-    $sql = "SELECT t.*, e.full_name AS emp_name, i.summary AS issue_summary, tk.name AS task_name
+    $sql = "SELECT t.*, e.full_name AS emp_name, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name
             FROM time_entries t
             LEFT JOIN employees e  ON t.employee_code = e.employee_code
             LEFT JOIN issues i     ON t.issue_id = i.id
-            LEFT JOIN time_tasks tk ON t.task_id = tk.id";
+            LEFT JOIN time_tasks tk ON t.task_id = tk.id
+            LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id";
     if ($where) $sql .= ' WHERE ' . implode(' AND ', $where);
     $sql .= ' ORDER BY t.entry_date DESC, e.full_name ASC, t.created_at ASC LIMIT 1000';
     $st = $db->prepare($sql);
