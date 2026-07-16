@@ -1,0 +1,1414 @@
+<?php
+// =========================================================
+// Policies — publish + view + consent capture
+// Phase 5 of the WorkPulse roadmap.
+//
+// Schema:    migrations/2026_05_08_phase5_policy_module.sql
+// Storage:   uploads/policies/YYYY-MM/{stored}.pdf
+// Frontend:  Mozilla PDF.js (drop pdf.mjs + pdf.worker.mjs into
+//            lib/pdfjs/ — see policyPdfjsAssetUrl() below).
+// =========================================================
+
+require_once __DIR__ . '/SmsService.php';
+
+// ── Constants ────────────────────────────────────────────
+define('POLICY_UPLOAD_DIR',     __DIR__ . '/../uploads/policies/');
+define('POLICY_MAX_BYTES',      15 * 1024 * 1024); // 15 MB cap per PDF
+define('POLICY_DEFAULT_GRACE',  7);                // days
+define('POLICY_VIEW_MIN_SECS',  5);                // global floor
+define('POLICY_VIEW_PAGE_RATIO',0.5);              // seconds per page (× total_pages)
+define('POLICY_VIEW_MAX_SECS',  120);              // cap
+define('POLICY_OTP_TTL_SECS',     600);             // 10 minutes — matches SMS template wording
+define('POLICY_OTP_RESEND_SECS',  60);              // min seconds between sends
+define('POLICY_OTP_MAX_ATTEMPTS', 5);               // wrong-OTP cap before forcing a new send
+
+// ── Scroll/time gate (shared by OTP request + final consent) ──
+// Returns ['ok' => bool, 'error' => string, 'min_secs' => int].
+// Reads from the same $_SESSION['policy_view_*'] keys that the PDF
+// viewer JS heartbeat populates (pagePolicyHeartbeat).
+function policyViewGateOk(int $vid): array {
+    if (($_SESSION['policy_view_start_id'] ?? 0) !== $vid) {
+        return ['ok' => false, 'error' => 'Open the policy first, then accept.', 'min_secs' => 0];
+    }
+    $viewSecs = time() - (int)($_SESSION['policy_view_start'] ?? time());
+    $maxPage  = (int)($_SESSION['policy_view_max_page'] ?? 0);
+    $totalSes = (int)($_SESSION['policy_view_total']    ?? 0);
+    $totalPages = max(1, $totalSes);
+    $pagesOk    = $maxPage >= max(1, (int)ceil($totalPages * 0.9));
+    $minSecs    = min(POLICY_VIEW_MAX_SECS, max(POLICY_VIEW_MIN_SECS, (int)ceil($totalPages * POLICY_VIEW_PAGE_RATIO)));
+    $timeOk     = $viewSecs >= $minSecs;
+    if (!$pagesOk || !$timeOk) {
+        return ['ok' => false,
+                'error' => 'Please scroll through the document and stay for at least ' . $minSecs . ' s before accepting.',
+                'min_secs' => $minSecs];
+    }
+    return ['ok' => true, 'error' => '', 'min_secs' => $minSecs];
+}
+
+// Mask a phone number for UI display: "98••••1234".
+function policyMaskPhone(string $phone): string {
+    $digits = preg_replace('/\D+/', '', $phone) ?? '';
+    if (strlen($digits) < 4) return str_repeat('•', max(0, strlen($digits)));
+    $tail = substr($digits, -4);
+    $head = strlen($digits) > 6 ? substr($digits, 0, 2) : '';
+    return $head . str_repeat('•', max(2, strlen($digits) - strlen($head) - 4)) . $tail;
+}
+
+// ── Permission helpers ──────────────────────────────────
+function policyCanAdmin(): bool {
+    return isSuperadmin() || hasTxn('policy_admin');
+}
+// Who sees the consent dashboard. Policy admins always do (they're
+// the publishers); anyone with the dedicated txn_policy_dashboard
+// permission also does (assign to Operations / HR managers).
+function policyCanViewDashboard(): bool {
+    return policyCanAdmin() || hasTxn('policy_dashboard');
+}
+
+// ── Storage path resolver (mirrors pvAttachmentPath) ────
+function policyMonthBucket(string $when): string {
+    $ts = strtotime($when);
+    return date('Y-m', $ts ?: time());
+}
+function policyAttachmentPath(string $when, string $stored, bool $forWrite = false): string {
+    $bucketed = POLICY_UPLOAD_DIR . policyMonthBucket($when) . '/' . $stored;
+    if ($forWrite) return $bucketed;
+    if (is_file($bucketed)) return $bucketed;
+    $flat = POLICY_UPLOAD_DIR . $stored;
+    return is_file($flat) ? $flat : $bucketed;
+}
+
+// PDF.js asset URLs — both files must be present.
+// Relative path (no leading slash) so it works regardless of whether
+// WorkPulse is mounted at the domain root or under a subdirectory
+// like /wp/ or /test/.
+function policyPdfjsAssetUrl(string $name = 'pdf.mjs'): string {
+    return 'lib/pdfjs/' . $name;
+}
+
+// ── Audience helpers ────────────────────────────────────
+function policyStaffTypesForCategory(string $cat): array {
+    return $cat === 'store_management' ? ['retail'] : ['retail','ho','factory'];
+}
+
+// Returns an associative array:
+//   ['departments' => [int...], 'locations' => [int...]]
+// Empty arrays = no filter (everyone in scope of the staff-type passes).
+function policyAudienceForVersion(int $versionId): array {
+    $depts = [];
+    $locs  = [];
+    try {
+        $st = getDb()->prepare(
+            'SELECT department_id, location_id
+             FROM   policy_audience
+             WHERE  policy_version_id = ?'
+        );
+        $st->execute([$versionId]);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            if ($r['department_id'] !== null) $depts[] = (int)$r['department_id'];
+            if ($r['location_id']   !== null) $locs[]  = (int)$r['location_id'];
+        }
+    } catch (Exception $e) { /* tables may not exist */ }
+    return [
+        'departments' => array_values(array_unique($depts)),
+        'locations'   => array_values(array_unique($locs)),
+    ];
+}
+
+// Is the current employee in scope for this version?
+function policyEmployeeInScope(array $emp, array $version): bool {
+    $cat        = $version['category'];
+    $staffTypes = policyStaffTypesForCategory($cat);
+    if (!in_array($emp['staff_type'] ?? 'retail', $staffTypes, true)) return false;
+    $aud = policyAudienceForVersion((int)$version['id']);
+    if (!empty($aud['departments'])) {
+        if (!in_array((int)($emp['department_id'] ?? 0), $aud['departments'], true)) return false;
+    }
+    if (!empty($aud['locations'])) {
+        if (!in_array((int)($emp['location_id'] ?? 0), $aud['locations'], true)) return false;
+    }
+    return true;
+}
+
+// All currently-active versions visible to one employee, with consent state.
+function policyActiveVersionsForEmployee(string $empCode): array {
+    try {
+        $emp = getDb()->prepare(
+            'SELECT department_id, location_id, staff_type FROM employees WHERE employee_code = ? AND is_active = 1'
+        );
+        $emp->execute([$empCode]);
+        $eRow = $emp->fetch(PDO::FETCH_ASSOC);
+        if (!$eRow) return [];
+
+        // Latest version per active policy.
+        $st = getDb()->query(
+            "SELECT v.id, v.policy_id, v.version_label, v.effective_date, v.published_at,
+                    v.grace_days, v.what_changed, v.is_major_update,
+                    v.pdf_original_name, v.pdf_size_bytes,
+                    p.title, p.category, p.is_active AS policy_active
+             FROM   policy_versions v
+             JOIN   policies p ON p.id = v.policy_id
+             WHERE  p.is_active = 1
+               AND  v.superseded_at IS NULL
+             ORDER  BY v.published_at DESC"
+        );
+        $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+
+        $consents = getDb()->prepare(
+            'SELECT consented_at FROM policy_consents
+              WHERE policy_version_id = ? AND employee_code = ? LIMIT 1'
+        );
+
+        $out = [];
+        foreach ($rows as $v) {
+            if (!policyEmployeeInScope($eRow, $v)) continue;
+            $consents->execute([$v['id'], $empCode]);
+            $c = $consents->fetch(PDO::FETCH_ASSOC);
+            $consented = !empty($c);
+            $deadline  = strtotime($v['published_at']) + ((int)$v['grace_days'] * 86400);
+            // "blocking" = past grace deadline AND unaccepted. Drives the
+            // per-request hard-lock gate in index.php. Within grace, the
+            // user can navigate freely (soft nudge happens once at login).
+            $blocking  = !$consented && time() > $deadline;
+            $v['consented']    = $consented;
+            $v['consented_at'] = $c['consented_at'] ?? null;
+            $v['deadline']     = date('Y-m-d', $deadline);
+            $v['blocking']     = $blocking;
+            $out[] = $v;
+        }
+        return $out;
+    } catch (Exception $e) { return []; }
+}
+
+// Returns the FIRST blocking version for the current user, or null
+// if everything is consented or still inside grace. Used by the
+// whole-app blocking gate (Phase 5 step 4 — added to auth.php).
+function policyFirstBlockingVersion(string $empCode): ?array {
+    foreach (policyActiveVersionsForEmployee($empCode) as $v) {
+        if (!empty($v['blocking'])) return $v;
+    }
+    return null;
+}
+
+// First unaccepted in-scope policy regardless of grace period. Used as a
+// one-time soft nudge right after login — lands the user on the policy
+// page so they see the new policy, but they can navigate away (the
+// per-request hard-lock only fires after grace, via the function above).
+function policyFirstUnacceptedVersion(string $empCode): ?array {
+    foreach (policyActiveVersionsForEmployee($empCode) as $v) {
+        if (empty($v['consented'])) return $v;
+    }
+    return null;
+}
+
+// ── Pages ───────────────────────────────────────────────
+
+// Staff-facing list of policies relevant to me.
+function pagePolicies(): void {
+    $empCode = myCode();
+    if ($empCode === '') { echo '<div class="alert alert-error">Not logged in.</div>'; return; }
+    $versions = policyActiveVersionsForEmployee($empCode);
+?>
+<div class="page-header">
+    <h2 style="display:flex;align-items:center;gap:10px">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        Policies
+    </h2>
+</div>
+
+<?php if (empty($versions)): ?>
+<div class="rpt-prompt">No active policies apply to you right now.</div>
+<?php else: ?>
+<div class="table-wrap" data-stack>
+    <table class="table">
+        <thead>
+            <tr>
+                <th>Policy</th>
+                <th style="width:90px">Category</th>
+                <th style="width:120px">Version</th>
+                <th style="width:130px">Status</th>
+                <th style="width:90px"></th>
+            </tr>
+        </thead>
+        <tbody>
+        <?php foreach ($versions as $v):
+            $catLabel = ['hr'=>'HR','it'=>'IT','store_management'=>'Store Mgmt'][$v['category']] ?? $v['category'];
+        ?>
+            <tr>
+                <td>
+                    <strong><?= h($v['title']) ?></strong>
+                    <?php if (!empty($v['is_major_update'])): ?>
+                        <span class="badge badge-yellow" style="margin-left:6px">MAJOR UPDATE</span>
+                    <?php endif; ?>
+                    <?php if (!empty($v['what_changed'])): ?>
+                        <div class="text-muted" style="font-size:11px;margin-top:2px"><?= h($v['what_changed']) ?></div>
+                    <?php endif; ?>
+                </td>
+                <td><span class="badge badge-grey"><?= h($catLabel) ?></span></td>
+                <td><code><?= h($v['version_label']) ?></code><br>
+                    <span class="text-muted" style="font-size:11px"><?= h(date('d M Y', strtotime($v['effective_date']))) ?></span>
+                </td>
+                <td>
+                    <?php if (!empty($v['consented'])): ?>
+                        <span class="badge badge-green">Accepted <?= h(date('d M', strtotime($v['consented_at']))) ?></span>
+                    <?php elseif (!empty($v['blocking'])): ?>
+                        <span class="badge badge-red">Action required</span>
+                    <?php else:
+                        $daysLeft = (int)ceil((strtotime($v['deadline'] . ' 23:59:59') - time()) / 86400);
+                    ?>
+                        <span class="badge badge-yellow"><?= max(0, $daysLeft) ?> day<?= $daysLeft === 1 ? '' : 's' ?> to read</span>
+                    <?php endif; ?>
+                </td>
+                <td><a href="?page=policy_view&id=<?= (int)$v['id'] ?>" class="btn btn-sm btn-primary">Open</a></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+</div>
+<?php endif; ?>
+<?php
+}
+
+// PDF.js viewer + consent buttons.
+function pagePolicyView(): void {
+    $empCode = myCode();
+    if ($empCode === '') { echo '<div class="alert alert-error">Not logged in.</div>'; return; }
+    $vid = (int)($_GET['id'] ?? 0);
+    if ($vid < 1) { echo '<div class="alert alert-error">Invalid policy.</div>'; return; }
+
+    try {
+        $st = getDb()->prepare(
+            'SELECT v.*, p.title, p.category, p.is_active AS policy_active
+             FROM   policy_versions v
+             JOIN   policies p ON p.id = v.policy_id
+             WHERE  v.id = ?'
+        );
+        $st->execute([$vid]);
+        $v = $st->fetch(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { echo '<div class="alert alert-error">DB: ' . h($e->getMessage()) . '</div>'; return; }
+
+    if (!$v) { echo '<div class="alert alert-error">Policy not found.</div>'; return; }
+
+    // Scope check (admins always pass)
+    if (!policyCanAdmin()) {
+        $emp = getDb()->prepare('SELECT department_id, location_id, staff_type FROM employees WHERE employee_code = ? AND is_active = 1');
+        $emp->execute([$empCode]);
+        $eRow = $emp->fetch(PDO::FETCH_ASSOC);
+        if (!$eRow || !policyEmployeeInScope($eRow, $v)) {
+            echo '<div class="alert alert-error">This policy does not apply to you.</div>'; return;
+        }
+    }
+
+    $consentSt = getDb()->prepare('SELECT consented_at FROM policy_consents WHERE policy_version_id = ? AND employee_code = ? LIMIT 1');
+    $consentSt->execute([$vid, $empCode]);
+    $consented = (bool)$consentSt->fetch(PDO::FETCH_ASSOC);
+
+    $deadline    = strtotime($v['published_at']) + ((int)$v['grace_days'] * 86400);
+    $pastGrace   = time() > $deadline;
+    $catLabel    = ['hr'=>'HR','it'=>'IT','store_management'=>'Store Management'][$v['category']] ?? $v['category'];
+
+    // Initialise (or refresh) the consent-tracking session entry.
+    // We anchor view-time to the SERVER's clock — the client can't fake it.
+    if (!isset($_SESSION['policy_view_start']) || ($_SESSION['policy_view_start_id'] ?? 0) !== $vid) {
+        $_SESSION['policy_view_start']     = time();
+        $_SESSION['policy_view_start_id']  = $vid;
+        $_SESSION['policy_view_max_page']  = 0;
+        $_SESSION['policy_view_total']     = 0;
+    }
+
+    $pdfUrl = '?page=policy_pdf&id=' . $vid;
+?>
+<div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+    <a href="?page=policies" class="btn btn-sm btn-ghost">← Back</a>
+    <h2 style="margin:0"><?= h($v['title']) ?></h2>
+    <span class="badge badge-grey"><?= h($catLabel) ?></span>
+    <span class="badge badge-blue"><?= h($v['version_label']) ?></span>
+    <?php if (!empty($v['is_major_update'])): ?><span class="badge badge-yellow">MAJOR UPDATE</span><?php endif; ?>
+    <?php if (!empty($v['allow_download']) || policyCanAdmin()): ?>
+    <a href="?page=policy_pdf&id=<?= (int)$vid ?>&download=1"
+       class="btn btn-sm btn-ghost"
+       style="margin-left:auto"
+       title="Download a local copy of this PDF">
+        ⬇ Download PDF
+    </a>
+    <?php endif; ?>
+    <?php if ($consented): ?><span class="badge badge-green" style="<?= (!empty($v['allow_download']) || policyCanAdmin()) ? '' : 'margin-left:auto' ?>">Already accepted</span><?php endif; ?>
+</div>
+
+<?php if (!empty($v['what_changed'])): ?>
+<div class="form-card" style="max-width:none;margin-bottom:14px;border-left:3px solid var(--accent)">
+    <div class="form-section-title" style="margin-top:0">What changed</div>
+    <p style="margin:0;font-size:13px;line-height:1.5"><?= h($v['what_changed']) ?></p>
+</div>
+<?php endif; ?>
+
+<div class="form-card" style="max-width:none;padding:0;overflow:hidden">
+    <div id="pdfStatus" style="padding:10px 14px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted);display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span id="pdfStatusText">Loading PDF…</span>
+        <span style="margin-left:auto" id="pdfPageInfo"></span>
+    </div>
+    <div id="pdfContainer" style="max-height:75vh;overflow-y:auto;background:#1a1a1a;padding:14px">
+        <!-- canvases injected here, one per page -->
+    </div>
+</div>
+
+<?php
+$pendingOtp = !$consented
+              && isset($_SESSION['policy_otp'])
+              && (int)($_SESSION['policy_otp_vid'] ?? 0) === $vid
+              && time() <= (int)($_SESSION['policy_otp_expires'] ?? 0)
+              && (int)($_SESSION['policy_otp_attempts'] ?? 0) < POLICY_OTP_MAX_ATTEMPTS;
+$otpAttemptsLeft = $pendingOtp ? max(0, POLICY_OTP_MAX_ATTEMPTS - (int)($_SESSION['policy_otp_attempts'] ?? 0)) : 0;
+?>
+
+<?php if ($consented): ?>
+<div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <span class="text-muted" style="font-size:13px">You accepted this version on <?= h(date('d M Y H:i', strtotime($v['consented_at'] ?? 'now'))) ?>.</span>
+</div>
+<?php elseif ($pendingOtp): ?>
+<div class="form-card" style="max-width:none;margin-top:14px;padding:14px">
+    <div class="form-section-title" style="margin-top:0">Enter OTP to accept</div>
+    <p style="margin:0 0 10px;font-size:13px">
+        OTP sent to <strong><?= h($_SESSION['policy_otp_phone_mask'] ?? '') ?></strong>
+        — valid for <span id="otpCountdown">--:--</span>
+        <?php if ($otpAttemptsLeft < POLICY_OTP_MAX_ATTEMPTS): ?>
+            · <?= (int)$otpAttemptsLeft ?> attempt(s) left
+        <?php endif; ?>
+    </p>
+    <form method="POST" data-no-disable style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input type="hidden" name="action"            value="consent_policy">
+        <input type="hidden" name="policy_version_id" value="<?= $vid ?>">
+        <input type="text" name="otp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6"
+               class="form-control"
+               style="max-width:160px;letter-spacing:6px;text-align:center;font-size:18px"
+               placeholder="6-digit OTP" autocomplete="one-time-code" required autofocus>
+        <button type="submit" class="btn btn-success">Verify &amp; Accept</button>
+    </form>
+    <form method="POST" data-no-disable style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+        <input type="hidden" name="policy_version_id" value="<?= $vid ?>">
+        <button type="submit" name="action" value="request_policy_otp"
+                class="btn btn-ghost btn-sm" id="btnResendOtp">Resend OTP</button>
+        <button type="submit" name="action" value="cancel_policy_otp"
+                class="btn btn-ghost btn-sm">Cancel</button>
+    </form>
+</div>
+<script>
+(function () {
+    var expiresAt     = <?= (int)$_SESSION['policy_otp_expires'] ?> * 1000;
+    var resendReadyAt = <?= ((int)($_SESSION['policy_otp_last_sent'] ?? 0) + POLICY_OTP_RESEND_SECS) ?> * 1000;
+    var cd        = document.getElementById('otpCountdown');
+    var btnResend = document.getElementById('btnResendOtp');
+    var reloaded  = false;
+    function tick() {
+        var now  = Date.now();
+        var left = Math.max(0, Math.floor((expiresAt - now) / 1000));
+        if (cd) {
+            var m = Math.floor(left / 60), s = left % 60;
+            cd.textContent = m + ':' + (s < 10 ? '0' : '') + s;
+        }
+        var rLeft = Math.max(0, Math.floor((resendReadyAt - now) / 1000));
+        if (btnResend) {
+            if (rLeft > 0) {
+                btnResend.disabled    = true;
+                btnResend.textContent = 'Resend OTP (in ' + rLeft + 's)';
+            } else {
+                btnResend.disabled    = false;
+                btnResend.textContent = 'Resend OTP';
+            }
+        }
+        if (left <= 0 && !reloaded) { reloaded = true; location.reload(); }
+    }
+    tick();
+    setInterval(tick, 1000);
+})();
+</script>
+<?php else: ?>
+<form method="POST" id="consentForm" data-no-disable style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <input type="hidden" name="action"            value="request_policy_otp">
+    <input type="hidden" name="policy_version_id" value="<?= $vid ?>">
+    <button type="submit" id="btnAccept" class="btn btn-primary" disabled
+            title="Scroll through the entire document first">Request OTP</button>
+    <?php if (!$pastGrace): ?>
+        <a href="?page=policies" class="btn btn-ghost">Read Later</a>
+        <span class="text-muted" style="font-size:12px;margin-left:auto">
+            Grace period ends <?= h(date('d M Y', $deadline)) ?>
+        </span>
+    <?php else: ?>
+        <span class="text-muted" style="font-size:12px;margin-left:auto;color:var(--red)">
+            Grace period ended on <?= h(date('d M Y', $deadline)) ?> — Read Later disabled.
+        </span>
+    <?php endif; ?>
+</form>
+<?php endif; ?>
+
+<script type="module">
+// json_encode (not h()) — inside <script>, HTML entity decoding doesn't
+// happen, so h() would smuggle "&amp;" into the URL and PHP's $_GET
+// would split on the wrong delimiter.
+const pdfMjsUrl    = <?= json_encode(policyPdfjsAssetUrl('pdf.mjs'),        JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+const pdfWorkerUrl = <?= json_encode(policyPdfjsAssetUrl('pdf.worker.mjs'), JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+const pdfStreamUrl = <?= json_encode($pdfUrl,                               JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_AMP) ?>;
+const container  = document.getElementById('pdfContainer');
+const statusText = document.getElementById('pdfStatusText');
+const pageInfo   = document.getElementById('pdfPageInfo');
+const btnAccept  = document.getElementById('btnAccept');
+let totalPages = 0, maxPageSeen = 0;
+let viewSecs = 0;
+const viewStart = Date.now();
+
+function showError(html) {
+    statusText.innerHTML = html;
+    statusText.style.color = 'var(--red)';
+}
+
+(async () => {
+    // Step 1 — load PDF.js. Prefer vendored files at lib/pdfjs/ (no
+    // outbound network needed); fall back to a public CDN so the viewer
+    // works out-of-the-box before the admin has dropped the files in.
+    const CDN_VERSION  = '4.6.82';
+    const cdnPdfMjs    = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/' + CDN_VERSION + '/pdf.min.mjs';
+    const cdnWorkerMjs = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/' + CDN_VERSION + '/pdf.worker.min.mjs';
+    let pdfjs, workerUrl;
+    try {
+        pdfjs = await import(pdfMjsUrl);
+        workerUrl = pdfWorkerUrl;
+    } catch (errLocal) {
+        try {
+            pdfjs = await import(cdnPdfMjs);
+            workerUrl = cdnWorkerMjs;
+            statusText.style.opacity = '.75';
+            statusText.textContent = 'Using PDF.js from CDN — drop pdf.mjs + pdf.worker.mjs into lib/pdfjs/ to host locally.';
+        } catch (errCdn) {
+            showError(
+                'PDF viewer library failed to load (local + CDN both failed).<br>' +
+                'Local: <code>' + pdfMjsUrl + '</code><br>' +
+                'CDN: <code>' + cdnPdfMjs + '</code><br>' +
+                '<span style="opacity:.7">(' + (errCdn && errCdn.message ? errCdn.message : errCdn) + ')</span>'
+            );
+            return;
+        }
+    }
+    pdfjs.GlobalWorkerOptions.workerSrc = workerUrl;
+
+    // Step 2 — sanity-check that the PDF stream URL actually returns a PDF
+    // before handing it to PDF.js. This makes path/permission failures
+    // distinguishable from PDF.js library failures.
+    try {
+        const head = await fetch(pdfStreamUrl, { method: 'HEAD' });
+        if (!head.ok) {
+            showError('PDF file not accessible (HTTP ' + head.status + '). The file may have been deleted from <code>uploads/policies/</code>, or your role doesn’t have permission to view this policy.');
+            return;
+        }
+        const ct = head.headers.get('content-type') || '';
+        if (!ct.includes('pdf')) {
+            showError('Server returned <code>' + ct + '</code> instead of a PDF. Likely an auth redirect or PHP error — open <a href="' + pdfStreamUrl + '" target="_blank">' + pdfStreamUrl + '</a> directly to see the response.');
+            return;
+        }
+    } catch (err) {
+        showError('Could not reach the PDF stream: ' + (err && err.message ? err.message : err));
+        return;
+    }
+
+    // Step 3 — render
+    try {
+        const pdf = await pdfjs.getDocument(pdfStreamUrl).promise;
+        totalPages = pdf.numPages;
+        statusText.textContent = 'Read all ' + totalPages + ' page' + (totalPages === 1 ? '' : 's') + ' to request the acceptance OTP.';
+        const observer = new IntersectionObserver(entries => {
+            entries.forEach(e => {
+                if (e.isIntersecting) {
+                    const n = parseInt(e.target.dataset.pageNum, 10);
+                    if (n > maxPageSeen) maxPageSeen = n;
+                    updateProgress();
+                }
+            });
+        }, { root: container, threshold: 0.4 });
+
+        for (let i = 1; i <= totalPages; i++) {
+            const wrap = document.createElement('div');
+            wrap.className = 'pdf-page-wrap';
+            wrap.dataset.pageNum = i;
+            wrap.style.cssText = 'margin:0 auto 14px;max-width:900px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.5)';
+            const canvas = document.createElement('canvas');
+            canvas.style.cssText = 'display:block;width:100%;height:auto';
+            wrap.appendChild(canvas);
+            container.appendChild(wrap);
+            observer.observe(wrap);
+
+            const page = await pdf.getPage(i);
+            const viewport = page.getViewport({ scale: 1.5 });
+            canvas.width  = viewport.width;
+            canvas.height = viewport.height;
+            await page.render({ canvasContext: canvas.getContext('2d'), viewport }).promise;
+        }
+    } catch (err) {
+        showError('Failed to render PDF: ' + (err && err.message ? err.message : err));
+    }
+})();
+
+let lastReportedMax = -1, lastReportedTotal = -1;
+function updateProgress() {
+    pageInfo.textContent = 'Read ' + maxPageSeen + ' / ' + totalPages;
+    decideAcceptEnabled();
+    // Push to server immediately on any progress change so the server-side
+    // gate doesn't fall behind the client. The 5s polling beat is a fallback.
+    if (maxPageSeen !== lastReportedMax || totalPages !== lastReportedTotal) {
+        lastReportedMax   = maxPageSeen;
+        lastReportedTotal = totalPages;
+        sendHeartbeat();
+    }
+}
+function decideAcceptEnabled() {
+    if (!btnAccept) return;
+    viewSecs = Math.floor((Date.now() - viewStart) / 1000);
+    const pagesOk = totalPages > 0 && maxPageSeen >= Math.max(1, Math.ceil(totalPages * 0.9));
+    const minSecs = Math.min(<?= POLICY_VIEW_MAX_SECS ?>, Math.max(<?= POLICY_VIEW_MIN_SECS ?>, Math.ceil(totalPages * <?= POLICY_VIEW_PAGE_RATIO ?>)));
+    const timeOk  = viewSecs >= minSecs;
+    btnAccept.disabled = !(pagesOk && timeOk);
+    btnAccept.title = pagesOk && timeOk
+        ? 'You can now request the OTP to accept this policy'
+        : 'Scroll through the document (' + maxPageSeen + '/' + totalPages + ') and stay for at least ' + minSecs + ' s';
+}
+setInterval(decideAcceptEnabled, 1000);
+
+// Heartbeat — server uses this for its own validation. Sent as GET so it
+// routes through index.php's special-page dispatcher (POST would land in
+// routePost() with no action and silently exit).
+function sendHeartbeat() {
+    fetch('?page=policy_heartbeat&id=<?= $vid ?>&max_page=' + maxPageSeen + '&total=' + totalPages, { method: 'GET', cache: 'no-store' })
+        .catch(() => {});
+}
+// updateProgress() already pushes a beat on each scroll event; this 5s
+// interval is a fallback in case no scrolling has happened recently.
+setInterval(sendHeartbeat, 5000);
+</script>
+<?php
+}
+
+// Heartbeat endpoint — POST only, updates session state. Safe to call
+// repeatedly; never trusts the values blindly (they're capped + sanity-
+// checked in doConsentPolicy()).
+function pagePolicyHeartbeat(): void {
+    $vid = (int)($_GET['id'] ?? 0);
+    if ($vid < 1 || ($_SESSION['policy_view_start_id'] ?? 0) !== $vid) {
+        http_response_code(400); echo '{"ok":false}'; return;
+    }
+    $maxPage = max(0, min(10000, (int)($_GET['max_page'] ?? 0)));
+    $total   = max(0, min(10000, (int)($_GET['total']    ?? 0)));
+    $_SESSION['policy_view_max_page'] = max((int)($_SESSION['policy_view_max_page'] ?? 0), $maxPage);
+    $_SESSION['policy_view_total']    = $total;
+    header('Content-Type: application/json');
+    echo json_encode(['ok' => true, 'view_secs' => time() - (int)$_SESSION['policy_view_start']]);
+}
+
+// Stream the PDF file. Auth: must be in scope OR a policy admin OR superadmin.
+function pagePolicyPdf(): void {
+    if (!isLoggedIn()) { http_response_code(403); echo 'Forbidden'; return; }
+    $empCode = myCode(); // empty string for the keyword 'superadmin' login
+    $vid = (int)($_GET['id'] ?? 0);
+    if ($vid < 1) { http_response_code(400); echo 'Bad request'; return; }
+    try {
+        $st = getDb()->prepare(
+            'SELECT v.*, p.category, p.is_active AS policy_active
+             FROM   policy_versions v JOIN policies p ON p.id = v.policy_id
+             WHERE  v.id = ?'
+        );
+        $st->execute([$vid]);
+        $v = $st->fetch(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { http_response_code(500); echo 'DB error'; return; }
+    if (!$v) { http_response_code(404); echo 'Not found'; return; }
+
+    if (!policyCanAdmin()) {
+        $emp = getDb()->prepare('SELECT department_id, location_id, staff_type FROM employees WHERE employee_code = ? AND is_active = 1');
+        $emp->execute([$empCode]);
+        $eRow = $emp->fetch(PDO::FETCH_ASSOC);
+        if (!$eRow || !policyEmployeeInScope($eRow, $v)) {
+            http_response_code(403); echo 'Forbidden'; return;
+        }
+    }
+    $path = policyAttachmentPath((string)$v['published_at'], (string)$v['pdf_stored_name'], false);
+    if (!is_file($path)) { http_response_code(404); echo 'File missing'; return; }
+
+    // Download branch: caller passed &download=1 expecting a saved file.
+    // Employees need allow_download=1 on the version; admins always pass.
+    $wantDownload = !empty($_GET['download']);
+    if ($wantDownload && !policyCanAdmin() && empty($v['allow_download'])) {
+        http_response_code(403); echo 'Download not permitted for this policy.'; return;
+    }
+
+    header('Content-Type: application/pdf');
+    header('Content-Length: ' . filesize($path));
+    header('Cache-Control: private, max-age=300');
+    header('X-Content-Type-Options: nosniff');
+    if ($wantDownload) {
+        // Sanitise the original name the same way the upload handler did.
+        $orig = preg_replace('/[^A-Za-z0-9._\- ]/', '_', (string)$v['pdf_original_name']);
+        if ($orig === '' || $orig === null) $orig = 'policy.pdf';
+        header('Content-Disposition: attachment; filename="' . $orig . '"');
+    }
+    readfile($path);
+}
+
+// HR upload form.
+function pagePolicyPublish(): void {
+    if (!policyCanAdmin()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
+    $depts = getDepartments();
+    $locs  = getActiveLocations();
+?>
+<div class="page-header"><h2>Publish Policy</h2></div>
+
+<form method="POST" enctype="multipart/form-data" class="form-card" style="max-width:none">
+    <input type="hidden" name="action" value="publish_policy_version">
+    <div class="form-grid">
+        <div class="form-group">
+            <label>Title <span class="required">*</span></label>
+            <input type="text" name="title" class="form-control" required maxlength="200" placeholder="e.g. Employee Code of Conduct">
+        </div>
+        <div class="form-group">
+            <label>Category <span class="required">*</span></label>
+            <select name="category" class="form-control" required>
+                <option value="hr">HR — applies to Retail + HO + Factory</option>
+                <option value="it">IT — applies to Retail + HO + Factory</option>
+                <option value="store_management">Store Management — Retail only</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Version label <span class="required">*</span></label>
+            <input type="text" name="version_label" class="form-control" required maxlength="40" placeholder="v1, v1.1, Apr-2026" value="v1">
+        </div>
+        <div class="form-group">
+            <label>Effective date <span class="required">*</span></label>
+            <input type="date" name="effective_date" class="form-control" required value="<?= h(date('Y-m-d')) ?>">
+        </div>
+        <div class="form-group">
+            <label>Grace period (days)</label>
+            <input type="number" name="grace_days" class="form-control" min="0" max="60" value="<?= POLICY_DEFAULT_GRACE ?>">
+            <span class="hint">Non-blocking until this many days after publish.</span>
+        </div>
+        <div class="form-group">
+            <label class="checkbox-label">
+                <input type="checkbox" name="is_major_update" value="1">
+                Major update (forces re-consent)
+            </label>
+        </div>
+        <div class="form-group">
+            <label class="checkbox-label">
+                <input type="checkbox" name="allow_download" value="1">
+                Allow employee to download PDF
+            </label>
+            <span class="hint">Off = view-only in the in-page viewer. Policy admins can always download.</span>
+        </div>
+    </div>
+    <div class="form-group" style="margin-top:14px">
+        <label>What changed <span class="hint">(optional summary, shown on the consent page)</span></label>
+        <textarea name="what_changed" class="form-control" rows="3" maxlength="2000" placeholder="Brief summary of changes since the last version"></textarea>
+    </div>
+    <div class="form-group" style="margin-top:14px">
+        <label>PDF file <span class="required">*</span></label>
+        <input type="file" name="pdf" accept="application/pdf" class="form-control" required>
+        <span class="hint">Max <?= (int)(POLICY_MAX_BYTES / 1024 / 1024) ?> MB.</span>
+    </div>
+
+    <div class="form-section-title" style="margin-top:22px">Audience filter <span class="hint" style="text-transform:none;letter-spacing:0">— combined with the category's staff-type</span></div>
+    <div class="form-grid">
+        <div class="form-group">
+            <label>Limit to specific departments</label>
+            <select name="department_ids[]" class="form-control" multiple size="6">
+                <?php foreach ($depts as $d): ?>
+                    <option value="<?= (int)$d['id'] ?>"><?= h($d['department_name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+            <span class="hint">Hold Ctrl/Cmd to select multiple. Leave empty for all departments allowed by category.</span>
+        </div>
+        <div class="form-group">
+            <label>Limit to specific locations</label>
+            <select name="location_ids[]" class="form-control" multiple size="6">
+                <?php foreach ($locs as $l): ?>
+                    <option value="<?= (int)$l['location_id'] ?>"><?= h($l['location_name']) ?></option>
+                <?php endforeach; ?>
+            </select>
+            <span class="hint">Leave empty for all locations.</span>
+        </div>
+    </div>
+
+    <div class="form-actions">
+        <button type="submit" class="btn btn-primary">Publish</button>
+        <a href="?page=policy_admin_list" class="btn btn-ghost">Cancel</a>
+    </div>
+</form>
+<?php
+}
+
+// Admin list — every policy + its version history + audience editor.
+function pagePolicyAdminList(): void {
+    if (!policyCanAdmin()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
+    try {
+        $rows = getDb()->query(
+            "SELECT p.id, p.title, p.category, p.is_active,
+                    (SELECT COUNT(*) FROM policy_versions v WHERE v.policy_id = p.id) AS ver_count,
+                    (SELECT MAX(published_at) FROM policy_versions v WHERE v.policy_id = p.id) AS last_published_at
+             FROM   policies p
+             ORDER  BY p.is_active DESC, last_published_at DESC, p.id DESC"
+        )->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { $rows = []; }
+?>
+<div class="page-header" style="display:flex;align-items:center;gap:12px">
+    <h2 style="margin:0">Policy Admin</h2>
+    <a href="?page=policy_publish" class="btn btn-primary" style="margin-left:auto">+ Publish Policy</a>
+</div>
+
+<?php if (empty($rows)): ?>
+<div class="rpt-prompt">No policies yet.</div>
+<?php else: ?>
+<div class="table-wrap" data-stack>
+    <table class="table">
+        <thead>
+            <tr>
+                <th>Title</th>
+                <th style="width:130px">Category</th>
+                <th style="width:90px">Versions</th>
+                <th style="width:130px">Last published</th>
+                <th style="width:90px">Status</th>
+                <th style="width:80px"></th>
+            </tr>
+        </thead>
+        <tbody>
+        <?php foreach ($rows as $r):
+            $catLabel = ['hr'=>'HR','it'=>'IT','store_management'=>'Store Mgmt'][$r['category']] ?? $r['category'];
+        ?>
+            <tr>
+                <td><strong><?= h($r['title']) ?></strong></td>
+                <td><span class="badge badge-grey"><?= h($catLabel) ?></span></td>
+                <td><?= (int)$r['ver_count'] ?></td>
+                <td class="text-muted" style="font-size:11px"><?= $r['last_published_at'] ? h(date('d M Y', strtotime($r['last_published_at']))) : '—' ?></td>
+                <td>
+                    <?php if (!empty($r['is_active'])): ?>
+                        <span class="badge badge-green">Active</span>
+                    <?php else: ?>
+                        <span class="badge badge-grey">Retired</span>
+                    <?php endif; ?>
+                </td>
+                <td><a href="?page=policy_admin_versions&id=<?= (int)$r['id'] ?>" class="btn btn-sm btn-secondary">Versions</a></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+</div>
+<?php endif; ?>
+<?php
+}
+
+// Per-policy version history.
+function pagePolicyAdminVersions(): void {
+    if (!policyCanAdmin()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
+    $pid = (int)($_GET['id'] ?? 0);
+    if ($pid < 1) { echo '<div class="alert alert-error">Invalid policy.</div>'; return; }
+    try {
+        $p = getDb()->prepare('SELECT * FROM policies WHERE id = ?');
+        $p->execute([$pid]);
+        $policy = $p->fetch(PDO::FETCH_ASSOC);
+        if (!$policy) { echo '<div class="alert alert-error">Not found.</div>'; return; }
+        $vs = getDb()->prepare(
+            'SELECT id, version_label, effective_date, published_at, superseded_at, grace_days, is_major_update,
+                    allow_download,
+                    pdf_original_name, pdf_size_bytes,
+                    (SELECT COUNT(*) FROM policy_consents c WHERE c.policy_version_id = policy_versions.id) AS consent_count
+             FROM policy_versions
+             WHERE policy_id = ? ORDER BY published_at DESC'
+        );
+        $vs->execute([$pid]);
+        $versions = $vs->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { echo '<div class="alert alert-error">DB: ' . h($e->getMessage()) . '</div>'; return; }
+?>
+<div class="page-header" style="display:flex;align-items:center;gap:12px">
+    <a href="?page=policy_admin_list" class="btn btn-sm btn-ghost">← Back</a>
+    <h2 style="margin:0"><?= h($policy['title']) ?></h2>
+    <a href="?page=policy_publish" class="btn btn-primary" style="margin-left:auto">+ New Version</a>
+</div>
+
+<?php if (empty($versions)): ?>
+<div class="rpt-prompt">No versions yet.</div>
+<?php else: ?>
+<div class="table-wrap" data-stack>
+    <table class="table">
+        <thead>
+            <tr>
+                <th style="width:100px">Version</th>
+                <th style="width:120px">Effective</th>
+                <th style="width:140px">Published</th>
+                <th>File</th>
+                <th style="width:90px">Consents</th>
+                <th style="width:120px">Download</th>
+                <th style="width:90px">Status</th>
+                <th style="width:80px"></th>
+            </tr>
+        </thead>
+        <tbody>
+        <?php foreach ($versions as $v): ?>
+            <tr>
+                <td><code><?= h($v['version_label']) ?></code><?= !empty($v['is_major_update']) ? ' <span class="badge badge-yellow">major</span>' : '' ?></td>
+                <td><?= h(date('d M Y', strtotime($v['effective_date']))) ?></td>
+                <td class="text-muted" style="font-size:11px"><?= h(date('d M Y H:i', strtotime($v['published_at']))) ?></td>
+                <td><?= h($v['pdf_original_name']) ?> <span class="text-muted" style="font-size:11px">(<?= number_format($v['pdf_size_bytes']/1024, 0) ?> KB)</span></td>
+                <td><?= (int)$v['consent_count'] ?></td>
+                <td>
+                    <form method="POST" style="margin:0">
+                        <input type="hidden" name="action"     value="toggle_policy_download">
+                        <input type="hidden" name="version_id" value="<?= (int)$v['id'] ?>">
+                        <button type="submit"
+                                class="btn btn-sm <?= !empty($v['allow_download']) ? 'btn-success' : 'btn-ghost' ?>"
+                                title="<?= !empty($v['allow_download']) ? 'Click to deny download' : 'Click to allow download' ?>">
+                            <?= !empty($v['allow_download']) ? '✓ Downloadable' : '✗ View only' ?>
+                        </button>
+                    </form>
+                </td>
+                <td>
+                    <?php if (empty($v['superseded_at'])): ?>
+                        <span class="badge badge-green">Current</span>
+                    <?php else: ?>
+                        <span class="badge badge-grey">Superseded</span>
+                    <?php endif; ?>
+                </td>
+                <td><a href="?page=policy_view&id=<?= (int)$v['id'] ?>" class="btn btn-sm btn-secondary">View</a></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+</div>
+<?php endif; ?>
+<?php
+}
+
+// Manager / HR consent dashboard.
+function pagePolicyConsentDashboard(): void {
+    if (!policyCanViewDashboard()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
+
+    // Filters
+    $fPolicy = (int)($_GET['policy_id']    ?? 0);
+    $fStaff  = $_GET['staff_type'] ?? '';
+    $fDept   = (int)($_GET['department_id'] ?? 0);
+    $fLoc    = (int)($_GET['location_id']   ?? 0);
+    $fStatus = $_GET['status'] ?? '';   // '' | 'accepted' | 'pending'
+    $viewClicked = !empty($_GET['view']);
+
+    try {
+        $policies = getDb()->query(
+            "SELECT p.id, p.title, p.category,
+                    (SELECT id FROM policy_versions v WHERE v.policy_id = p.id AND v.superseded_at IS NULL
+                     ORDER BY v.published_at DESC LIMIT 1) AS current_version_id
+             FROM   policies p
+             WHERE  p.is_active = 1
+             ORDER  BY p.title"
+        )->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { $policies = []; }
+    $depts = getDepartments();
+    $locs  = getActiveLocations();
+
+    $rows = [];
+    if ($viewClicked && $fPolicy > 0) {
+        $cur = null;
+        foreach ($policies as $p) if ((int)$p['id'] === $fPolicy) { $cur = $p; break; }
+        if ($cur && $cur['current_version_id']) {
+            $vid = (int)$cur['current_version_id'];
+            $allowedTypes = policyStaffTypesForCategory($cur['category']);
+            $aud = policyAudienceForVersion($vid);
+            $sql = 'SELECT e.employee_code, e.full_name, e.staff_type, e.department_id, e.location_id,
+                           d.department_name, l.location_name,
+                           c.consented_at
+                    FROM   employees e
+                    LEFT JOIN departments d ON d.id = e.department_id
+                    LEFT JOIN locations  l ON l.location_id = e.location_id
+                    LEFT JOIN policy_consents c ON c.policy_version_id = ? AND c.employee_code = e.employee_code
+                    WHERE  e.is_active = 1';
+            $params = [$vid];
+            $typesForFilter = $fStaff && in_array($fStaff, $allowedTypes, true) ? [$fStaff] : $allowedTypes;
+            $sql .= ' AND e.staff_type IN (' . implode(',', array_fill(0, count($typesForFilter), '?')) . ')';
+            $params = array_merge($params, $typesForFilter);
+            if (!empty($aud['departments'])) {
+                $sql .= ' AND e.department_id IN (' . implode(',', array_fill(0, count($aud['departments']), '?')) . ')';
+                $params = array_merge($params, $aud['departments']);
+            }
+            if (!empty($aud['locations'])) {
+                $sql .= ' AND e.location_id IN (' . implode(',', array_fill(0, count($aud['locations']), '?')) . ')';
+                $params = array_merge($params, $aud['locations']);
+            }
+            if ($fDept > 0)  { $sql .= ' AND e.department_id = ?'; $params[] = $fDept; }
+            if ($fLoc  > 0)  { $sql .= ' AND e.location_id = ?';   $params[] = $fLoc; }
+            if ($fStatus === 'accepted') $sql .= ' AND c.consented_at IS NOT NULL';
+            if ($fStatus === 'pending')  $sql .= ' AND c.consented_at IS NULL';
+            $sql .= ' ORDER BY e.full_name';
+            try {
+                $st = getDb()->prepare($sql);
+                $st->execute($params);
+                $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+            } catch (Exception $e) { $rows = []; }
+        }
+    }
+?>
+<div class="page-header"><h2>Policy Consent Dashboard</h2></div>
+
+<form method="GET" class="form-card" style="max-width:none;margin-bottom:14px">
+    <input type="hidden" name="page" value="policy_consent_dashboard">
+    <input type="hidden" name="view" value="1">
+    <div class="form-grid" style="grid-template-columns:repeat(5,1fr)">
+        <div class="form-group">
+            <label>Policy <span class="required">*</span></label>
+            <select name="policy_id" class="form-control" required>
+                <option value="">— Select —</option>
+                <?php foreach ($policies as $p): ?>
+                <option value="<?= (int)$p['id'] ?>" <?= $fPolicy === (int)$p['id'] ? 'selected' : '' ?>>
+                    <?= h($p['title']) ?>
+                </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Staff Type</label>
+            <select name="staff_type" class="form-control">
+                <option value="">All</option>
+                <option value="retail"  <?= $fStaff==='retail'?'selected':'' ?>>Retail</option>
+                <option value="ho"      <?= $fStaff==='ho'?'selected':'' ?>>HO</option>
+                <option value="factory" <?= $fStaff==='factory'?'selected':'' ?>>Factory</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Department</label>
+            <select name="department_id" class="form-control">
+                <option value="0">All</option>
+                <?php foreach ($depts as $d): ?>
+                <option value="<?= (int)$d['id'] ?>" <?= $fDept === (int)$d['id'] ? 'selected' : '' ?>>
+                    <?= h($d['department_name']) ?>
+                </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Location</label>
+            <select name="location_id" class="form-control">
+                <option value="0">All</option>
+                <?php foreach ($locs as $l): ?>
+                <option value="<?= (int)$l['location_id'] ?>" <?= $fLoc === (int)$l['location_id'] ? 'selected' : '' ?>>
+                    <?= h($l['location_name']) ?>
+                </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Status</label>
+            <select name="status" class="form-control">
+                <option value="">All</option>
+                <option value="accepted" <?= $fStatus==='accepted'?'selected':'' ?>>Accepted</option>
+                <option value="pending"  <?= $fStatus==='pending'?'selected':'' ?>>Pending</option>
+            </select>
+        </div>
+    </div>
+    <div class="form-actions">
+        <button class="btn btn-primary">View</button>
+        <a href="?page=policy_consent_dashboard" class="btn btn-ghost">Reset</a>
+    </div>
+</form>
+
+<?php if (!$viewClicked || $fPolicy < 1): ?>
+<div class="rpt-prompt">Pick a policy and click <strong>View</strong>.</div>
+<?php else:
+    $accepted = 0; $pending = 0;
+    foreach ($rows as $r) { if (!empty($r['consented_at'])) $accepted++; else $pending++; }
+?>
+<div class="text-muted" style="margin-bottom:8px">
+    Showing <strong><?= count($rows) ?></strong> applicable employees —
+    <span style="color:var(--green)"><?= $accepted ?> accepted</span>,
+    <span style="color:var(--yellow)"><?= $pending ?> pending</span>.
+</div>
+<div class="table-wrap" data-stack>
+    <table class="table">
+        <thead>
+            <tr>
+                <th>Employee</th>
+                <th style="width:80px">Type</th>
+                <th>Department</th>
+                <th>Location</th>
+                <th style="width:160px">Status</th>
+            </tr>
+        </thead>
+        <tbody>
+        <?php if (empty($rows)): ?>
+            <tr><td colspan="5" class="empty-row">No employees match the filter.</td></tr>
+        <?php else: foreach ($rows as $r): ?>
+            <tr>
+                <td><strong><?= h($r['full_name']) ?></strong> <span class="text-muted">(<?= h($r['employee_code']) ?>)</span></td>
+                <td><span class="badge badge-grey"><?= h(mb_strtoupper($r['staff_type'])) ?></span></td>
+                <td><?= h($r['department_name'] ?? '—') ?></td>
+                <td><?= h($r['location_name']   ?? '—') ?></td>
+                <td>
+                    <?php if (!empty($r['consented_at'])): ?>
+                        <span class="badge badge-green">Accepted</span>
+                        <span class="text-muted" style="font-size:11px"> · <?= h(date('d M Y', strtotime($r['consented_at']))) ?></span>
+                    <?php else: ?>
+                        <span class="badge badge-yellow">Pending</span>
+                    <?php endif; ?>
+                </td>
+            </tr>
+        <?php endforeach; endif; ?>
+        </tbody>
+    </table>
+</div>
+<?php endif; ?>
+<?php
+}
+
+// Drill-down used by the violation module: full consent history for one employee.
+function pagePolicyConsentHistory(): void {
+    $empCode = trim($_GET['emp'] ?? '');
+    if ($empCode === '' || (!policyCanViewDashboard() && myCode() !== $empCode)) {
+        echo '<div class="alert alert-error">Access denied.</div>'; return;
+    }
+    try {
+        $emp = getDb()->prepare('SELECT employee_code, full_name FROM employees WHERE employee_code = ?');
+        $emp->execute([$empCode]);
+        $eRow = $emp->fetch(PDO::FETCH_ASSOC);
+        if (!$eRow) { echo '<div class="alert alert-error">Employee not found.</div>'; return; }
+
+        $st = getDb()->prepare(
+            "SELECT p.title, p.category, v.version_label, v.effective_date, v.published_at,
+                    c.consented_at, c.ip_address, c.user_agent, c.pdf_sha256_at_consent
+             FROM   policy_consents c
+             JOIN   policy_versions v ON v.id = c.policy_version_id
+             JOIN   policies p ON p.id = v.policy_id
+             WHERE  c.employee_code = ?
+             ORDER  BY c.consented_at DESC"
+        );
+        $st->execute([$empCode]);
+        $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { $rows = []; }
+?>
+<div class="page-header" style="display:flex;align-items:center;gap:10px">
+    <a href="javascript:history.back()" class="btn btn-sm btn-ghost">← Back</a>
+    <h2 style="margin:0">Consent History — <?= h($eRow['full_name']) ?> <span class="text-muted">(<?= h($empCode) ?>)</span></h2>
+</div>
+
+<?php if (empty($rows)): ?>
+<div class="rpt-prompt">No policy acceptances on record for this employee.</div>
+<?php else: ?>
+<div class="table-wrap" data-stack>
+    <table class="table">
+        <thead>
+            <tr>
+                <th>Policy</th>
+                <th style="width:90px">Category</th>
+                <th style="width:110px">Version</th>
+                <th style="width:140px">Accepted</th>
+                <th>IP / Device</th>
+                <th style="width:100px">PDF SHA-256</th>
+            </tr>
+        </thead>
+        <tbody>
+        <?php foreach ($rows as $r):
+            $catLabel = ['hr'=>'HR','it'=>'IT','store_management'=>'Store Mgmt'][$r['category']] ?? $r['category'];
+        ?>
+            <tr>
+                <td><strong><?= h($r['title']) ?></strong></td>
+                <td><span class="badge badge-grey"><?= h($catLabel) ?></span></td>
+                <td><code><?= h($r['version_label']) ?></code></td>
+                <td><?= h(date('d M Y H:i', strtotime($r['consented_at']))) ?></td>
+                <td><span class="text-muted" style="font-size:11px"><?= h($r['ip_address'] ?? '—') ?><br><?= h(mb_substr($r['user_agent'] ?? '', 0, 80)) ?></span></td>
+                <td><code style="font-size:10px"><?= h(mb_substr($r['pdf_sha256_at_consent'], 0, 12)) ?>…</code></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+</div>
+<?php endif; ?>
+<?php
+}
+
+// ── POST handlers ────────────────────────────────────────
+
+function doPublishPolicyVersion(): void {
+    if (!policyCanAdmin()) { flash('error', 'Access denied.'); header('Location: index.php?page=policies'); exit; }
+
+    $title         = trim($_POST['title']         ?? '');
+    $category      = $_POST['category']           ?? '';
+    $versionLabel  = trim($_POST['version_label'] ?? '');
+    $effective     = trim($_POST['effective_date']?? '');
+    $graceDays     = max(0, min(60, (int)($_POST['grace_days'] ?? POLICY_DEFAULT_GRACE)));
+    $isMajor       = !empty($_POST['is_major_update']) ? 1 : 0;
+    $allowDownload = !empty($_POST['allow_download']) ? 1 : 0;
+    $whatChanged   = trim($_POST['what_changed']  ?? '');
+    $deptIds       = array_map('intval', (array)($_POST['department_ids'] ?? []));
+    $locIds        = array_map('intval', (array)($_POST['location_ids']   ?? []));
+
+    if ($title === '' || !in_array($category, ['hr','it','store_management'], true)
+        || $versionLabel === '' || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $effective)) {
+        flash('error', 'Title, category, version label and effective date are required.');
+        header('Location: index.php?page=policy_publish'); exit;
+    }
+    if (empty($_FILES['pdf']) || !is_uploaded_file($_FILES['pdf']['tmp_name'] ?? '')) {
+        flash('error', 'PDF upload required.');
+        header('Location: index.php?page=policy_publish'); exit;
+    }
+    if ($_FILES['pdf']['size'] > POLICY_MAX_BYTES) {
+        flash('error', 'PDF exceeds maximum size.');
+        header('Location: index.php?page=policy_publish'); exit;
+    }
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $mime  = $finfo->file($_FILES['pdf']['tmp_name']);
+    if ($mime !== 'application/pdf') {
+        flash('error', 'File must be a PDF (got ' . h($mime) . ').');
+        header('Location: index.php?page=policy_publish'); exit;
+    }
+
+    $db = getDb();
+    try {
+        $db->beginTransaction();
+
+        // Find or create the policies row keyed on (title, category) — same
+        // policy gets new versions across time. Simple-enough for v1.
+        $find = $db->prepare('SELECT id FROM policies WHERE title = ? AND category = ? LIMIT 1');
+        $find->execute([$title, $category]);
+        $policyId = $find->fetchColumn();
+        if (!$policyId) {
+            $db->prepare('INSERT INTO policies (title, category, is_active, created_by) VALUES (?,?,1,?)')
+               ->execute([$title, $category, myCode()]);
+            $policyId = (int)$db->lastInsertId();
+        } else {
+            $policyId = (int)$policyId;
+            // Mark previous versions as superseded (the new one supersedes all earlier active ones).
+            $db->prepare('UPDATE policy_versions SET superseded_at = NOW() WHERE policy_id = ? AND superseded_at IS NULL')
+               ->execute([$policyId]);
+        }
+
+        // Move the file into bucketed storage.
+        $sha256       = hash_file('sha256', $_FILES['pdf']['tmp_name']);
+        $size         = (int)$_FILES['pdf']['size'];
+        $original     = preg_replace('/[^A-Za-z0-9._\- ]/', '_', $_FILES['pdf']['name']);
+        $stored       = 'pol_' . uniqid('', true) . '.pdf';
+        $bucket       = policyMonthBucket(date('Y-m-d H:i:s'));
+        $bucketDir    = POLICY_UPLOAD_DIR . $bucket . '/';
+        if (!is_dir($bucketDir) && !mkdir($bucketDir, 0775, true) && !is_dir($bucketDir)) {
+            throw new Exception('Failed to create upload bucket dir.');
+        }
+        $destPath = $bucketDir . $stored;
+        if (!move_uploaded_file($_FILES['pdf']['tmp_name'], $destPath)) {
+            throw new Exception('Failed to save uploaded file.');
+        }
+
+        // Insert the version row.
+        $db->prepare(
+            'INSERT INTO policy_versions
+                (policy_id, version_label, effective_date,
+                 pdf_original_name, pdf_stored_name, pdf_sha256, pdf_size_bytes,
+                 is_major_update, allow_download, what_changed, grace_days, published_by)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
+        )->execute([
+            $policyId, $versionLabel, $effective,
+            $original, $stored, $sha256, $size,
+            $isMajor, $allowDownload,
+            $whatChanged !== '' ? $whatChanged : null,
+            $graceDays, myCode(),
+        ]);
+        $versionId = (int)$db->lastInsertId();
+
+        // Audience filter rows
+        $audSt = $db->prepare(
+            'INSERT INTO policy_audience (policy_version_id, department_id, location_id) VALUES (?,?,?)'
+        );
+        foreach ($deptIds as $d) if ($d > 0) $audSt->execute([$versionId, $d, null]);
+        foreach ($locIds  as $l) if ($l > 0) $audSt->execute([$versionId, null, $l]);
+
+        $db->commit();
+        flash('success', 'Policy published — ' . count($deptIds) . ' dept filter(s), ' . count($locIds) . ' location filter(s).');
+        header('Location: index.php?page=policy_admin_versions&id=' . $policyId); exit;
+    } catch (Exception $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        flash('error', 'Publish failed: ' . $e->getMessage());
+        header('Location: index.php?page=policy_publish'); exit;
+    }
+}
+
+// Flip the allow_download bit on a specific version. Policy admin only.
+function doTogglePolicyDownload(): void {
+    if (!policyCanAdmin()) {
+        flash('error', 'Access denied.');
+        header('Location: index.php?page=policy_admin_list'); exit;
+    }
+    $vid = (int)($_POST['version_id'] ?? 0);
+    if ($vid < 1) {
+        flash('error', 'Invalid version.');
+        header('Location: index.php?page=policy_admin_list'); exit;
+    }
+    try {
+        getDb()->prepare('UPDATE policy_versions SET allow_download = 1 - allow_download WHERE id = ?')
+            ->execute([$vid]);
+
+        // Redirect back to the same versions page.
+        $pidSt = getDb()->prepare('SELECT policy_id FROM policy_versions WHERE id = ?');
+        $pidSt->execute([$vid]);
+        $pid = (int)$pidSt->fetchColumn();
+        flash('success', 'Download permission updated.');
+        header('Location: index.php?page=policy_admin_versions&id=' . $pid); exit;
+    } catch (Exception $e) {
+        flash('error', 'Update failed: ' . $e->getMessage());
+        header('Location: index.php?page=policy_admin_list'); exit;
+    }
+}
+
+function doConsentPolicy(): void {
+    $empCode = myCode();
+    if ($empCode === '') { flash('error', 'Not logged in.'); header('Location: index.php?page=policies'); exit; }
+    $vid = (int)($_POST['policy_version_id'] ?? 0);
+    if ($vid < 1) { flash('error', 'Invalid policy.'); header('Location: index.php?page=policies'); exit; }
+
+    // Server-side gate: scroll-progress + view-time, both anchored in $_SESSION.
+    $gate = policyViewGateOk($vid);
+    if (!$gate['ok']) {
+        flash('error', $gate['error']);
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+
+    // OTP gate — must have a live OTP for this exact vid in session.
+    $otpInput = preg_replace('/\D+/', '', (string)($_POST['otp'] ?? ''));
+    if (!isset($_SESSION['policy_otp']) || (int)($_SESSION['policy_otp_vid'] ?? 0) !== $vid) {
+        flash('error', 'Request an OTP first, then enter it to accept.');
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+    if (time() > (int)($_SESSION['policy_otp_expires'] ?? 0)) {
+        unset($_SESSION['policy_otp'], $_SESSION['policy_otp_vid'], $_SESSION['policy_otp_phone'],
+              $_SESSION['policy_otp_phone_mask'], $_SESSION['policy_otp_expires'],
+              $_SESSION['policy_otp_last_sent'], $_SESSION['policy_otp_attempts']);
+        flash('error', 'OTP expired. Please request a new one.');
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+    if ((int)($_SESSION['policy_otp_attempts'] ?? 0) >= POLICY_OTP_MAX_ATTEMPTS) {
+        unset($_SESSION['policy_otp'], $_SESSION['policy_otp_vid'], $_SESSION['policy_otp_phone'],
+              $_SESSION['policy_otp_phone_mask'], $_SESSION['policy_otp_expires'],
+              $_SESSION['policy_otp_last_sent'], $_SESSION['policy_otp_attempts']);
+        flash('error', 'Too many wrong attempts. Please request a new OTP.');
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+    if ($otpInput === '' || !hash_equals((string)$_SESSION['policy_otp'], $otpInput)) {
+        $_SESSION['policy_otp_attempts'] = (int)($_SESSION['policy_otp_attempts'] ?? 0) + 1;
+        $left = POLICY_OTP_MAX_ATTEMPTS - (int)$_SESSION['policy_otp_attempts'];
+        flash('error', 'Invalid OTP.' . ($left > 0 ? " You have $left attempt(s) left." : ' Please request a new one.'));
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+
+    try {
+        $st = getDb()->prepare('SELECT * FROM policy_versions WHERE id = ?');
+        $st->execute([$vid]);
+        $v = $st->fetch(PDO::FETCH_ASSOC);
+        if (!$v) { flash('error', 'Policy not found.'); header('Location: index.php?page=policies'); exit; }
+
+        // INSERT — UNIQUE KEY prevents duplicates (first one wins).
+        $ip = $_SERVER['REMOTE_ADDR']      ?? null;
+        $ua = $_SERVER['HTTP_USER_AGENT']  ?? null;
+        try {
+            getDb()->prepare(
+                'INSERT INTO policy_consents
+                    (policy_version_id, employee_code, pdf_sha256_at_consent, ip_address, user_agent)
+                 VALUES (?,?,?,?,?)'
+            )->execute([$vid, $empCode, $v['pdf_sha256'], $ip, $ua ? mb_substr($ua, 0, 500) : null]);
+        } catch (PDOException $e) {
+            // Duplicate-key — already accepted. Treat as success.
+            if ((int)$e->errorInfo[1] !== 1062) throw $e;
+        }
+        unset($_SESSION['policy_view_start'], $_SESSION['policy_view_start_id'],
+              $_SESSION['policy_view_max_page'], $_SESSION['policy_view_total'],
+              $_SESSION['policy_otp'], $_SESSION['policy_otp_vid'], $_SESSION['policy_otp_phone'],
+              $_SESSION['policy_otp_phone_mask'], $_SESSION['policy_otp_expires'],
+              $_SESSION['policy_otp_last_sent'], $_SESSION['policy_otp_attempts']);
+        flash('success', 'Policy accepted. Thank you.');
+        header('Location: index.php?page=policies'); exit;
+    } catch (Exception $e) {
+        flash('error', 'Consent failed: ' . $e->getMessage());
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+}
+
+// ── Policy OTP handlers ───────────────────────────────────
+function doRequestPolicyOtp(): void {
+    $empCode = myCode();
+    if ($empCode === '') { flash('error', 'Not logged in.'); header('Location: index.php?page=policies'); exit; }
+    $vid = (int)($_POST['policy_version_id'] ?? 0);
+    if ($vid < 1) { flash('error', 'Invalid policy.'); header('Location: index.php?page=policies'); exit; }
+
+    // Same scroll/time gate as the final accept — can't shortcut by requesting OTP early.
+    $gate = policyViewGateOk($vid);
+    if (!$gate['ok']) {
+        flash('error', $gate['error']);
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+
+    // Resend cooldown — only if this OTP request is for the same vid as a live in-flight OTP.
+    if ((int)($_SESSION['policy_otp_vid'] ?? 0) === $vid && !empty($_SESSION['policy_otp_last_sent'])) {
+        $waitedFor = time() - (int)$_SESSION['policy_otp_last_sent'];
+        if ($waitedFor < POLICY_OTP_RESEND_SECS) {
+            $left = POLICY_OTP_RESEND_SECS - $waitedFor;
+            flash('error', "Please wait {$left}s before requesting another OTP.");
+            header('Location: index.php?page=policy_view&id=' . $vid); exit;
+        }
+    }
+
+    // Get employee phone
+    try {
+        $st = getDb()->prepare('SELECT phone, full_name FROM employees WHERE employee_code = ? AND is_active = 1 LIMIT 1');
+        $st->execute([$empCode]);
+        $emp = $st->fetch(PDO::FETCH_ASSOC);
+    } catch (Exception $e) {
+        flash('error', 'Database error: ' . $e->getMessage());
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+    if (!$emp) { flash('error', 'Employee record not found.'); header('Location: index.php?page=policy_view&id=' . $vid); exit; }
+
+    $phone = preg_replace('/\D+/', '', (string)($emp['phone'] ?? ''));
+    if (strlen($phone) < 10) {
+        flash('error', 'No mobile number on file. Ask HR to update your mobile in your employee profile before accepting policies.');
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+    // Normalise to 10-digit (drop +91 / 91 prefix if present).
+    if (strlen($phone) > 10 && substr($phone, 0, 2) === '91') $phone = substr($phone, -10);
+
+    // Generate 6-digit OTP
+    $otp = str_pad((string)random_int(0, 999999), 6, '0', STR_PAD_LEFT);
+    $_SESSION['policy_otp']            = $otp;
+    $_SESSION['policy_otp_vid']        = $vid;
+    $_SESSION['policy_otp_phone']      = $phone;
+    $_SESSION['policy_otp_phone_mask'] = policyMaskPhone($phone);
+    $_SESSION['policy_otp_expires']    = time() + POLICY_OTP_TTL_SECS;
+    $_SESSION['policy_otp_last_sent']  = time();
+    $_SESSION['policy_otp_attempts']   = 0;
+
+    // Build message — substitute {OTP} into the configured template. If the
+    // template isn't set, fall back to the wording the DLT submission was
+    // approved for so the SMS still passes the operator's regex check.
+    $template = getSetting(
+        'sms_policy_otp_template',
+        'Your OTP is {OTP}. Valid for 10 minutes. By using this OTP, you agree to DD Internal Employee policies. Don\'t share with anyone. Dangee Dums Ltd'
+    );
+    $message  = str_replace('{OTP}', $otp, $template);
+    $dltId    = getSetting('sms_policy_otp_dlt_id', '1707177847730015071');
+
+    $resp = SmsService::send('91' . $phone, $message, $dltId);
+    // MSG91 returns a request-id on success; treat curl errors / empty as failure.
+    if ($resp === '' || stripos($resp, 'error') !== false) {
+        // Clear partial state so the user can retry without hitting the cooldown.
+        unset($_SESSION['policy_otp'], $_SESSION['policy_otp_vid'], $_SESSION['policy_otp_phone'],
+              $_SESSION['policy_otp_phone_mask'], $_SESSION['policy_otp_expires'],
+              $_SESSION['policy_otp_last_sent'], $_SESSION['policy_otp_attempts']);
+        flash('error', 'Failed to send OTP. Please try again or contact HR.');
+        header('Location: index.php?page=policy_view&id=' . $vid); exit;
+    }
+
+    flash('success', 'OTP sent to ' . $_SESSION['policy_otp_phone_mask'] . '. Enter it below to accept the policy.');
+    header('Location: index.php?page=policy_view&id=' . $vid); exit;
+}
+
+function doCancelPolicyOtp(): void {
+    $vid = (int)($_POST['policy_version_id'] ?? 0);
+    unset($_SESSION['policy_otp'], $_SESSION['policy_otp_vid'], $_SESSION['policy_otp_phone'],
+          $_SESSION['policy_otp_phone_mask'], $_SESSION['policy_otp_expires'],
+          $_SESSION['policy_otp_last_sent'], $_SESSION['policy_otp_attempts']);
+    flash('success', 'OTP request cancelled.');
+    if ($vid > 0) { header('Location: index.php?page=policy_view&id=' . $vid); }
+    else          { header('Location: index.php?page=policies'); }
+    exit;
+}

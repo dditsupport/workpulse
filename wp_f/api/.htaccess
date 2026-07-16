@@ -1,0 +1,20 @@
+# Disable ModSecurity for API endpoints (biometric app needs direct access)
+<IfModule mod_security2.c>
+    SecRuleEngine Off
+</IfModule>
+
+# Disable directory listing — never expose the api/ folder index.
+Options -Indexes
+
+# Deny direct access to backups, swap files, dotfiles, SQL, includes, logs.
+<FilesMatch "\.(bak|swp|swo|local\.php|sql|inc|log|md|sqlite|sqlite3)$">
+    Require all denied
+</FilesMatch>
+
+# Block the logs/ subdirectory entirely.
+RedirectMatch 404 ^/api/logs(/|$)
+
+# Disallow access to the bootstrap and other internal includes (leading underscore).
+<FilesMatch "^_">
+    Require all denied
+</FilesMatch>

@@ -1,0 +1,17 @@
+# Real config lives outside the web root; this is the local dev fallback
+wp_f/config.local.php
+
+# Database migrations (applied out-of-band, not tracked)
+migration/
+
+# .NET build output
+biometric_2.2.4/App/bin/
+biometric_2.2.4/App/obj/
+biometric_2.2.4/packages/
+*.user
+*.suo
+
+# Logs / temp
+*.log
+Thumbs.db
+.DS_Store

@@ -1,0 +1,27 @@
+# Build artefacts
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio local files
+.vs/
+*.user
+*.suo
+*.userprefs
+
+# Resharper / Rider
+_ReSharper*/
+*.DotSettings.user
+
+# NuGet — track packages.config / .csproj refs, not the cache
+packages/
+
+# Local logs
+Logs/
+*.log
+
+# Local config overrides (real config travels via App.config + DB)
+App.local.config
+*.local.config
+
+# VS-generated temporary signing key (private key — never commit)
+*_TemporaryKey.pfx
