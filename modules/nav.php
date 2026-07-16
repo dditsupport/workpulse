@@ -47,11 +47,12 @@ function buildNav(): array {
             ['page' => 'generate_vouchers', 'icon' => navIcon('voucher'),     'label' => 'Generate Vouchers'],
         ]],
         ['group' => 'Task Management', 'items' => [
-            ['page' => 'checklist',          'icon' => navIcon('checklist'),   'label' => 'Store Checklist'],
-            ['page' => 'manage_tasks',       'icon' => navIcon('tasks'),       'label' => 'Manage Tasks'],
+            ['page' => 'checklist',          'icon' => navIcon('checklist'),   'label' => 'Checklists'],
+            ['page' => 'manage_tasks',       'icon' => navIcon('tasks'),       'label' => 'Manage Checklists'],
             ['page' => 'checklist_report',   'icon' => navIcon('report'),      'label' => 'Checklist Report'],
             ['page' => 'checklist_overview', 'icon' => navIcon('dashboard'),   'label' => 'Checklist Overview'],
             ['page' => 'checklist_audit',    'icon' => navIcon('task_check'),  'label' => 'Checklist Audit'],
+            ['page' => 'checklist_validate', 'icon' => navIcon('task_check'),  'label' => 'Validate Checklist'],
         ]],
         ['group' => 'Audits', 'items' => [
             ['page' => 'audit_list',        'icon' => navIcon('audit_list'),   'label' => 'Audit List'],
@@ -140,12 +141,15 @@ function buildNav(): array {
     if (hasTxn('generate_vouchers')) $discount[] = ['page' => 'generate_vouchers', 'icon' => navIcon('voucher'),     'label' => 'Generate Vouchers'];
 
     $tasks = [];
-    if (hasTxn('checklist'))        $tasks[] = ['page' => 'checklist',        'icon' => navIcon('checklist'),  'label' => 'Store Checklist'];
-    if (hasTxn('manage_tasks'))     $tasks[] = ['page' => 'manage_tasks',     'icon' => navIcon('tasks'),      'label' => 'Manage Tasks'];
+    $myChkCode = function_exists('myCode') ? myCode() : '';
+    $canSeeHub = hasTxn('checklist') || (function_exists('chkUserHasAssignment') && chkUserHasAssignment($myChkCode));
+    $canValidate = hasTxn('checklist_validate') || (function_exists('chkUserHasValidation') && chkUserHasValidation($myChkCode));
+    if ($canSeeHub)                 $tasks[] = ['page' => 'checklist',        'icon' => navIcon('checklist'),  'label' => 'Checklists'];
+    if (canManageAnyChecklist()) $tasks[] = ['page' => 'manage_tasks',     'icon' => navIcon('tasks'),      'label' => 'Manage Checklists'];
     if (hasTxn('checklist_report')) $tasks[] = ['page' => 'checklist_report', 'icon' => navIcon('report'),     'label' => 'Checklist Report'];
     if (hasTxn('checklist_report')) $tasks[] = ['page' => 'checklist_overview','icon' => navIcon('dashboard'),  'label' => 'Checklist Overview'];
     if (hasTxn('checklist_audit'))  $tasks[] = ['page' => 'checklist_audit',  'icon' => navIcon('task_check'), 'label' => 'Checklist Audit'];
-    if (hasTxn('checklist_validate')) $tasks[] = ['page' => 'checklist_validate', 'icon' => navIcon('task_check'), 'label' => 'Validate Checklist'];
+    if ($canValidate)               $tasks[] = ['page' => 'checklist_validate', 'icon' => navIcon('task_check'), 'label' => 'Validate Checklist'];
 
     // Audits — role-gated. Location owners (employees with a location_id but
     // no audit_* flag) still get audit_list to see their store's submitted
@@ -220,7 +224,7 @@ function buildNav(): array {
     if ($hrms)     $groups[] = ['group' => 'HRMS',              'items' => $hrms];
     if ($issues)   $groups[] = ['group' => 'Tickets',           'items' => $issues];
     if ($discount) $groups[] = ['group' => 'Discount',          'items' => $discount];
-    if ($tasks)    $groups[] = ['group' => 'Store Checklist',   'items' => $tasks];
+    if ($tasks)    $groups[] = ['group' => 'Checklists',   'items' => $tasks];
     if ($audit)    $groups[] = ['group' => 'Audits',            'items' => $audit];
     if ($store)    $groups[] = ['group' => 'Store Operations',  'items' => $store];
     if ($violations) $groups[] = ['group' => 'Policy & Violation', 'items' => $violations];

@@ -218,12 +218,20 @@ function pendingForMe_checklist(int $locId): array {
     $rows = [];
     try {
         $today = date('Y-m-d');
-        $totalQ = (int)getDb()->query("SELECT COUNT(*) FROM chk_items WHERE is_active = 1")->fetchColumn();
+        // Scope the reminder to the location-assigned "Store Checklist" so the
+        // tile keeps its original meaning after the multi-checklist merge.
+        $storeId = (int)(getDb()->query(
+            "SELECT id FROM chk_checklists WHERE is_active = 1 AND assign_type = 'location' ORDER BY sort_order, id LIMIT 1"
+        )->fetchColumn() ?: 0);
+        if ($storeId <= 0) return [];
+        $tq = getDb()->prepare("SELECT COUNT(*) FROM chk_items WHERE is_active = 1 AND checklist_id = ?");
+        $tq->execute([$storeId]);
+        $totalQ = (int)$tq->fetchColumn();
         if ($totalQ === 0) return [];
         $st = getDb()->prepare(
-            "SELECT COUNT(*) FROM chk_daily_responses WHERE location_id = ? AND log_date = ?"
+            "SELECT COUNT(DISTINCT item_id) FROM chk_daily_responses WHERE checklist_id = ? AND location_id = ? AND log_date = ?"
         );
-        $st->execute([$locId, $today]);
+        $st->execute([$storeId, $locId, $today]);
         $done = (int)$st->fetchColumn();
         if ($done < $totalQ) {
             $rows[] = [

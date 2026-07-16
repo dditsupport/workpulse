@@ -66,7 +66,13 @@ function hasTxn(string $txn): bool {
 // ── Permission helpers ──────────────────────────────────
 function canManageEmployees(): bool { return isSuperadmin() || hasTxn('employees'); }
 function canManageIssues(): bool    { return isSuperadmin() || hasTxn('edit_issue'); }
+// Checklist management is split by assign_type: manage_tasks governs the
+// location-assigned (Store) checklists, manage_dept_tasks the employee-assigned
+// (factory department) ones. chkCanManageChecklist() in checklist.php decides
+// per checklist; these are the coarse page/route gates.
 function canManageTasks(): bool     { return isSuperadmin() || hasTxn('manage_tasks'); }
+function canManageDeptTasks(): bool { return isSuperadmin() || hasTxn('manage_dept_tasks'); }
+function canManageAnyChecklist(): bool { return canManageTasks() || canManageDeptTasks(); }
 function canViewAttendance(): bool  { return isSuperadmin() || hasTxn('attendance'); }
 
 function defaultPage(): string {
@@ -94,7 +100,7 @@ function doLogin(): void {
             'txn_locations' => 1, 'txn_attendance' => 1, 'txn_approve_punches' => 1,
             'txn_failed_punches' => 1, 'txn_issues' => 1, 'txn_create_issue' => 1,
             'txn_edit_issue' => 1, 'txn_issue_summary' => 1, 'txn_issue_comments' => 1,
-            'txn_checklist' => 1, 'txn_manage_tasks' => 1,
+            'txn_checklist' => 1, 'txn_manage_tasks' => 1, 'txn_manage_dept_tasks' => 1,
             'txn_checklist_report' => 1, 'txn_checklist_audit' => 1,
             'txn_offer' => 1, 'txn_coupon_redeemed' => 1,
             'txn_devices' => 1, 'txn_manage_categories' => 1,
@@ -164,6 +170,7 @@ function doLogin(): void {
                 'txn_edit_issue'       => (int)($emp['txn_edit_issue'] ?? 0),
                 'txn_checklist'        => (int)($emp['txn_checklist'] ?? 0),
                 'txn_manage_tasks'     => (int)($emp['txn_manage_tasks'] ?? 0),
+                'txn_manage_dept_tasks' => (int)($emp['txn_manage_dept_tasks'] ?? 0),
                 'txn_checklist_report' => (int)($emp['txn_checklist_report'] ?? 0),
                 'txn_checklist_audit'  => (int)($emp['txn_checklist_audit'] ?? 0),
                 'txn_offer'            => (int)($emp['txn_offer'] ?? 0),
