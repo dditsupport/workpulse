@@ -81,6 +81,9 @@ function buildNav(): array {
             ['page' => 'price_variations', 'icon' => navIcon('summary'), 'label' => 'Variations'],
             ['page' => 'price_list',       'icon' => navIcon('tag'),     'label' => 'Master Price List'],
         ]],
+        ['group' => 'Gallery', 'items' => [
+            ['page' => 'event_photos',     'icon' => navIcon('photos'),  'label' => 'Event Photos'],
+        ]],
     ];
 
     // ── Transaction-level nav for employees ──
@@ -106,6 +109,11 @@ function buildNav(): array {
 
     // Time Tracking — its own module. My Time + Tasks are personal (every
     // employee), the cross-employee report is gated by txn_time_report.
+    // Company photo wall — deliberately open to everyone, no txn gate.
+    $gallery = [
+        ['page' => 'event_photos', 'icon' => navIcon('photos'), 'label' => 'Event Photos'],
+    ];
+
     $timeTrack = [
         ['page' => 'my_time',    'icon' => navIcon('clock'),  'label' => 'My Time'],
         ['page' => 'time_tasks', 'icon' => navIcon('tasks'),  'label' => 'Tasks'],
@@ -229,6 +237,7 @@ function buildNav(): array {
     if ($store)    $groups[] = ['group' => 'Store Operations',  'items' => $store];
     if ($violations) $groups[] = ['group' => 'Policy & Violation', 'items' => $violations];
     if ($priceVar)   $groups[] = ['group' => 'Price Variation', 'items' => $priceVar];
+    if ($gallery)  $groups[] = ['group' => 'Gallery',           'items' => $gallery];
 
     return $groups;
 }
@@ -306,6 +315,8 @@ function allowedPages(): array {
     // Checklist attachments — anyone who can see the checklist can open
     // its files. Permission re-checked server-side in the handler.
     $pages[] = 'download_checklist_attachment';
+    // Event photo stream — the gallery itself is open to every logged-in user.
+    $pages[] = 'event_photo';
     if (isSuperadmin() || hasTxn('dependencies')) {
         $pages[] = 'download_dependency';
     }
@@ -793,6 +804,8 @@ function dispatchPage(string $page): void {
         case 'coupon_redeemed': pageCouponRedeemed(); break;
         case 'generate_vouchers': if (function_exists('pageGenerateVouchers')) pageGenerateVouchers(); break;
         // Checklist
+        case 'event_photos':    if (function_exists('pageEventPhotos'))  pageEventPhotos();  break;
+        case 'event_photo':     if (function_exists('serveEventPhoto'))  serveEventPhoto();  break;
         case 'checklist':       pageChecklist();  break;
         case 'manage_tasks':    pageManageTasks(); break;
         case 'checklist_report': pageChecklistReport(); break;
