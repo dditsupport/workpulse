@@ -28,6 +28,7 @@ $txnGroups = [
                            'txn_manage_dept_tasks' => 'Manage Department Checklists',
                            'txn_checklist_report' => 'Checklist Report', 'txn_checklist_audit' => 'Checklist Audit',
                            'txn_checklist_validate' => 'Validate Checklist'],
+    'Gallery'          => ['txn_event_photo_upload' => 'Upload Event Photos'],
     'Audits'           => ['txn_audit_create' => 'Create Audit', 'txn_audit_approve' => 'Approve Audit',
                            'txn_audit_operation' => 'Operation Review',
                            'txn_audit_management' => 'Management Approve',

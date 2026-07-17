@@ -20,7 +20,7 @@ require_once __DIR__ . '/modules/attendance.php';
 require_once __DIR__ . '/modules/settings.php';
 
 // Conditionally load modules (graceful if not yet created)
-foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers'] as $mod) {
+foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos'] as $mod) {
     $f = __DIR__ . '/modules/' . $mod . '.php';
     if (file_exists($f)) require_once $f;
 }
@@ -43,7 +43,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','policy_heartbeat','audit_annotation_serve','audit_annotation_thread','export_time_report'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','policy_heartbeat','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
@@ -139,6 +139,10 @@ function routePost(string $a): void {
         case 'del_validator':   if (function_exists('doDelValidator') && canManageAnyChecklist()) doDelValidator(); break;
         case 'delete_checklist_month': if (function_exists('doDeleteChecklistMonth') && isSuperadmin()) doDeleteChecklistMonth(); break;
         case 'save_checklist_validation': if (function_exists('doSaveChecklistValidation')) doSaveChecklistValidation(); break;
+        // Event photos — open to every logged-in user; delete is superadmin-only
+        // (enforced inside doDeleteEventPhoto, not here).
+        case 'upload_event_photos': if (function_exists('doUploadEventPhotos')) doUploadEventPhotos(); break;
+        case 'delete_event_photo':  if (function_exists('doDeleteEventPhoto'))  doDeleteEventPhoto();  break;
         // Punch requests
         case 'submit_punch_request': if (function_exists('doSubmitPunchRequest')) doSubmitPunchRequest(); break;
         case 'review_punch_request': if (function_exists('doReviewPunchRequest') && canManageEmployees()) doReviewPunchRequest(); break;
