@@ -493,21 +493,33 @@ function pageChecklistAudit(): void {
         ));
 
         // Active items for this checklist, restricted to selected sections.
-        $itemSql = "SELECT id, task_description, section_name FROM chk_items WHERE is_active = 1 AND checklist_id = ?";
+        // Group by the section's CURRENT name (resolved via section_id) rather
+        // than the denormalized chk_items.section_name, which goes stale when a
+        // section is renamed (chk_sections.name updates but the copy on the item
+        // does not). Grouping by the live name keeps items aligned with the
+        // section rows this report renders; fall back to the stored name for
+        // items with no section_id (legacy / unassigned).
+        $itemSql = "SELECT i.id, i.task_description,
+                           COALESCE(sec.name, i.section_name) AS section_name
+                    FROM chk_items i
+                    LEFT JOIN chk_sections sec ON sec.id = i.section_id
+                    WHERE i.is_active = 1 AND i.checklist_id = ?";
         $itemParams = [$checklistId];
         if ($sectionFilterActive) {
             $ph = implode(',', array_fill(0, count($sections), '?'));
-            $itemSql .= " AND section_name IN ($ph)";
+            $itemSql .= " AND COALESCE(sec.name, i.section_name) IN ($ph)";
             $itemParams = array_merge($itemParams, $sections);
         }
-        $itemSql .= " ORDER BY section_name, id ASC";
+        $itemSql .= " ORDER BY section_name, i.id ASC";
         $itemSt = $db->prepare($itemSql);
         $itemSt->execute($itemParams);
         $allItems = $itemSt->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($sections as $s) $itemsBySection[$s] = [];
         foreach ($allItems as $it) {
-            $itemsBySection[$it['section_name']][] = $it;
+            $sec = $it['section_name'];
+            if (!isset($itemsBySection[$sec])) $itemsBySection[$sec] = [];
+            $itemsBySection[$sec][] = $it;
         }
 
         // Responses for the chosen day, indexed by [locId][itemId].
