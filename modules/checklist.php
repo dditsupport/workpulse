@@ -679,6 +679,11 @@ function doSaveSection(): void {
     if ($sectionId > 0) {
         $db->prepare("UPDATE chk_sections SET name=?, start_min=?, end_min=?, sort_order=? WHERE id=? AND checklist_id=?")
            ->execute([$name, $startMin, $endMin, $sort, $sectionId, $checklistId]);
+        // Keep the denormalized copy on chk_items in sync so reports that group
+        // by section_name (audit, overview filters, exports) stay aligned with
+        // the section's new name instead of drifting to the old label.
+        $db->prepare("UPDATE chk_items SET section_name=? WHERE section_id=? AND checklist_id=?")
+           ->execute([$name, $sectionId, $checklistId]);
     } else {
         $db->prepare("INSERT INTO chk_sections (checklist_id, name, start_min, end_min, sort_order) VALUES (?,?,?,?,?)")
            ->execute([$checklistId, $name, $startMin, $endMin, $sort]);
