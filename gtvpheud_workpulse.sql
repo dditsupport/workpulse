@@ -3,9 +3,9 @@
 -- https://www.phpmyadmin.net/
 --
 -- Host: localhost:3306
--- Generation Time: Jun 25, 2026 at 10:08 AM
+-- Generation Time: Jul 22, 2026 at 11:42 AM
 -- Server version: 10.11.18-MariaDB-cll-lve
--- PHP Version: 8.4.21
+-- PHP Version: 8.4.22
 
 SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
 START TRANSACTION;
@@ -273,12 +273,42 @@ CREATE TABLE `audit_view_logs` (
 -- --------------------------------------------------------
 
 --
+-- Table structure for table `chk_assignees`
+--
+
+CREATE TABLE `chk_assignees` (
+  `id` int(10) UNSIGNED NOT NULL,
+  `checklist_id` int(10) UNSIGNED NOT NULL,
+  `employee_code` varchar(20) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `chk_checklists`
+--
+
+CREATE TABLE `chk_checklists` (
+  `id` int(10) UNSIGNED NOT NULL,
+  `name` varchar(120) NOT NULL,
+  `assign_type` enum('location','employee') NOT NULL DEFAULT 'location',
+  `time_gated` tinyint(1) NOT NULL DEFAULT 1,
+  `rollover_min` int(11) NOT NULL DEFAULT 0,
+  `sort_order` int(11) NOT NULL DEFAULT 0,
+  `is_active` tinyint(1) NOT NULL DEFAULT 1,
+  `created_at` datetime NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
 -- Table structure for table `chk_daily_responses`
 --
 
 CREATE TABLE `chk_daily_responses` (
   `id` int(10) UNSIGNED NOT NULL,
   `location_id` int(11) NOT NULL,
+  `checklist_id` int(10) UNSIGNED DEFAULT NULL,
   `item_id` int(10) UNSIGNED NOT NULL,
   `employee_code` varchar(20) NOT NULL,
   `log_date` date NOT NULL,
@@ -294,9 +324,12 @@ CREATE TABLE `chk_daily_responses` (
 
 CREATE TABLE `chk_items` (
   `id` int(10) UNSIGNED NOT NULL,
+  `checklist_id` int(10) UNSIGNED DEFAULT NULL,
   `task_description` varchar(500) NOT NULL,
   `section_name` varchar(100) DEFAULT NULL,
+  `section_id` int(10) UNSIGNED DEFAULT NULL,
   `input_type` enum('yes_no','time','text','number') NOT NULL DEFAULT 'yes_no',
+  `est_minutes` int(11) NOT NULL DEFAULT 0,
   `is_active` tinyint(1) NOT NULL DEFAULT 1,
   `created_at` datetime DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
@@ -321,12 +354,28 @@ CREATE TABLE `chk_response_attachments` (
 -- --------------------------------------------------------
 
 --
+-- Table structure for table `chk_sections`
+--
+
+CREATE TABLE `chk_sections` (
+  `id` int(10) UNSIGNED NOT NULL,
+  `checklist_id` int(10) UNSIGNED NOT NULL,
+  `name` varchar(100) NOT NULL,
+  `start_min` int(11) NOT NULL DEFAULT 0,
+  `end_min` int(11) NOT NULL DEFAULT 1440,
+  `sort_order` int(11) NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
 -- Table structure for table `chk_validations`
 --
 
 CREATE TABLE `chk_validations` (
   `id` int(10) UNSIGNED NOT NULL,
   `location_id` int(11) NOT NULL,
+  `checklist_id` int(10) UNSIGNED DEFAULT NULL,
   `item_id` int(10) UNSIGNED NOT NULL,
   `log_date` date NOT NULL,
   `status` enum('done','not_done') NOT NULL,
@@ -334,6 +383,18 @@ CREATE TABLE `chk_validations` (
   `validated_by` varchar(20) NOT NULL,
   `validated_at` datetime NOT NULL DEFAULT current_timestamp(),
   `updated_at` datetime DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `chk_validators`
+--
+
+CREATE TABLE `chk_validators` (
+  `id` int(10) UNSIGNED NOT NULL,
+  `checklist_id` int(10) UNSIGNED NOT NULL,
+  `employee_code` varchar(20) NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- --------------------------------------------------------
@@ -369,6 +430,134 @@ CREATE TABLE `devices` (
   `app_version` varchar(20) DEFAULT NULL COMMENT 'Last reported app version, e.g. 2.1.0',
   `version_updated_at` datetime DEFAULT NULL COMMENT 'Timestamp when app_version was last changed (NULL = never reported)'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_unicode_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `ed_device_meta`
+--
+
+CREATE TABLE `ed_device_meta` (
+  `device_id` varchar(32) NOT NULL,
+  `fw_version` varchar(16) DEFAULT NULL,
+  `last_sync_at` timestamp NULL DEFAULT NULL,
+  `last_seq` bigint(20) UNSIGNED NOT NULL DEFAULT 0,
+  `last_boot_id` int(10) UNSIGNED NOT NULL DEFAULT 0,
+  `total_readings` bigint(20) UNSIGNED NOT NULL DEFAULT 0,
+  `log_interval_sec` int(10) UNSIGNED NOT NULL DEFAULT 900,
+  `relay_on` tinyint(1) DEFAULT NULL,
+  `relay_mode` varchar(8) DEFAULT NULL,
+  `relay_reported_at` timestamp NULL DEFAULT NULL,
+  `rtc_drift_sec` int(11) DEFAULT NULL,
+  `rtc_drift_at` datetime DEFAULT NULL,
+  `wifi_rssi` smallint(6) DEFAULT NULL,
+  `coincell_mv` smallint(5) UNSIGNED DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `ed_device_relay_schedule`
+--
+
+CREATE TABLE `ed_device_relay_schedule` (
+  `device_id` varchar(32) NOT NULL,
+  `schedule_json` text NOT NULL DEFAULT '[]',
+  `compressor_watts` int(10) UNSIGNED NOT NULL DEFAULT 800,
+  `grace_min` int(10) UNSIGNED NOT NULL DEFAULT 60,
+  `version` int(10) UNSIGNED NOT NULL DEFAULT 1,
+  `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `ed_energy_devices`
+--
+
+CREATE TABLE `ed_energy_devices` (
+  `device_id` varchar(32) NOT NULL,
+  `friendly_name` varchar(64) NOT NULL,
+  `location` int(11) DEFAULT NULL,
+  `installed_at` date DEFAULT NULL,
+  `capacity_kw` decimal(12,2) DEFAULT NULL,
+  `notes` text DEFAULT NULL,
+  `owner_user_id` int(10) UNSIGNED DEFAULT NULL,
+  `ble_pin` varchar(12) DEFAULT NULL,
+  `first_seen_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `ed_energy_readings`
+--
+
+CREATE TABLE `ed_energy_readings` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `device_id` varchar(32) NOT NULL,
+  `seq` bigint(20) UNSIGNED NOT NULL,
+  `wall_time` datetime NOT NULL,
+  `time_confidence` enum('exact','approx') NOT NULL DEFAULT 'exact',
+  `boot_id` int(10) UNSIGNED NOT NULL,
+  `sec_since_boot` int(10) UNSIGNED NOT NULL,
+  `voltage` decimal(6,2) NOT NULL,
+  `current_a` decimal(8,3) NOT NULL,
+  `power_w` decimal(10,2) NOT NULL,
+  `energy_wh` decimal(14,2) NOT NULL,
+  `power_factor` decimal(4,3) NOT NULL,
+  `frequency_hz` decimal(5,2) DEFAULT NULL,
+  `ingested_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `ed_ingest_log`
+--
+
+CREATE TABLE `ed_ingest_log` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `device_id` varchar(32) DEFAULT NULL,
+  `received_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `rows_in_payload` int(11) DEFAULT NULL,
+  `rows_inserted` int(11) DEFAULT NULL,
+  `status` varchar(32) NOT NULL,
+  `client_ip` varchar(45) DEFAULT NULL,
+  `notes` text DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `ed_rtc_drift_log`
+--
+
+CREATE TABLE `ed_rtc_drift_log` (
+  `id` bigint(20) UNSIGNED NOT NULL,
+  `device_id` varchar(32) NOT NULL,
+  `measured_at` datetime NOT NULL,
+  `drift_sec` int(11) NOT NULL,
+  `rssi_dbm` smallint(6) DEFAULT NULL,
+  `coincell_mv` smallint(5) UNSIGNED DEFAULT NULL,
+  `received_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `ed_users`
+--
+
+CREATE TABLE `ed_users` (
+  `id` int(10) UNSIGNED NOT NULL,
+  `username` varchar(32) NOT NULL,
+  `password_hash` varchar(255) NOT NULL,
+  `email` varchar(128) DEFAULT NULL,
+  `is_admin` tinyint(1) NOT NULL DEFAULT 0,
+  `created_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `last_login_at` timestamp NULL DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- --------------------------------------------------------
 
@@ -413,6 +602,24 @@ CREATE TABLE `employee_location_logs` (
   `old_location_id` int(11) DEFAULT NULL,
   `new_location_id` int(11) NOT NULL,
   `changed_at` datetime DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `event_photos`
+--
+
+CREATE TABLE `event_photos` (
+  `id` int(10) UNSIGNED NOT NULL,
+  `caption` varchar(200) DEFAULT NULL,
+  `event_date` date NOT NULL,
+  `filename` varchar(255) NOT NULL,
+  `stored_name` varchar(255) NOT NULL,
+  `mime_type` varchar(100) NOT NULL,
+  `file_size` int(10) UNSIGNED NOT NULL DEFAULT 0,
+  `uploaded_by` varchar(20) NOT NULL,
+  `uploaded_at` datetime NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- --------------------------------------------------------
@@ -874,6 +1081,7 @@ CREATE TABLE `roles` (
   `txn_issue_comments` tinyint(1) NOT NULL DEFAULT 0,
   `txn_checklist` tinyint(1) NOT NULL DEFAULT 0,
   `txn_manage_tasks` tinyint(1) NOT NULL DEFAULT 0,
+  `txn_manage_dept_tasks` tinyint(1) NOT NULL DEFAULT 0,
   `txn_checklist_report` tinyint(1) NOT NULL DEFAULT 0,
   `txn_checklist_audit` tinyint(1) NOT NULL DEFAULT 0,
   `txn_offer` tinyint(1) NOT NULL DEFAULT 0,
@@ -915,7 +1123,8 @@ CREATE TABLE `roles` (
   `txn_policy_admin` tinyint(1) NOT NULL DEFAULT 0,
   `txn_checklist_validate` tinyint(1) NOT NULL DEFAULT 0,
   `txn_time_report` tinyint(1) NOT NULL DEFAULT 0,
-  `txn_ticket_scheduler` tinyint(1) NOT NULL DEFAULT 0
+  `txn_ticket_scheduler` tinyint(1) NOT NULL DEFAULT 0,
+  `txn_event_photo_upload` tinyint(1) NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- --------------------------------------------------------
@@ -995,6 +1204,7 @@ CREATE TABLE `time_entries` (
   `employee_code` varchar(20) NOT NULL,
   `issue_id` int(10) UNSIGNED DEFAULT NULL,
   `task_id` int(10) UNSIGNED DEFAULT NULL,
+  `checklist_id` int(10) UNSIGNED DEFAULT NULL,
   `task_label` varchar(200) DEFAULT NULL,
   `entry_date` date NOT NULL,
   `minutes` int(10) UNSIGNED NOT NULL,
@@ -1267,6 +1477,20 @@ ALTER TABLE `audit_view_logs`
   ADD KEY `idx_audit_view_emp` (`employee_code`,`viewed_at`);
 
 --
+-- Indexes for table `chk_assignees`
+--
+ALTER TABLE `chk_assignees`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_assignee` (`checklist_id`,`employee_code`),
+  ADD KEY `idx_assignee_emp` (`employee_code`);
+
+--
+-- Indexes for table `chk_checklists`
+--
+ALTER TABLE `chk_checklists`
+  ADD PRIMARY KEY (`id`);
+
+--
 -- Indexes for table `chk_daily_responses`
 --
 ALTER TABLE `chk_daily_responses`
@@ -1275,13 +1499,15 @@ ALTER TABLE `chk_daily_responses`
   ADD KEY `idx_location_date` (`location_id`,`log_date`),
   ADD KEY `idx_employee_code` (`employee_code`),
   ADD KEY `item_id` (`item_id`),
-  ADD KEY `idx_checklist_loc_date` (`location_id`,`log_date`);
+  ADD KEY `idx_checklist_loc_date` (`location_id`,`log_date`),
+  ADD KEY `idx_resp_checklist` (`checklist_id`,`log_date`);
 
 --
 -- Indexes for table `chk_items`
 --
 ALTER TABLE `chk_items`
-  ADD PRIMARY KEY (`id`);
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_items_checklist` (`checklist_id`,`is_active`);
 
 --
 -- Indexes for table `chk_response_attachments`
@@ -1291,12 +1517,28 @@ ALTER TABLE `chk_response_attachments`
   ADD KEY `idx_chk_att_response` (`response_id`);
 
 --
+-- Indexes for table `chk_sections`
+--
+ALTER TABLE `chk_sections`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_sec_checklist` (`checklist_id`,`sort_order`);
+
+--
 -- Indexes for table `chk_validations`
 --
 ALTER TABLE `chk_validations`
   ADD PRIMARY KEY (`id`),
   ADD UNIQUE KEY `uniq_val` (`location_id`,`item_id`,`log_date`),
-  ADD KEY `idx_val_loc_date` (`location_id`,`log_date`);
+  ADD KEY `idx_val_loc_date` (`location_id`,`log_date`),
+  ADD KEY `idx_val_checklist` (`checklist_id`,`log_date`);
+
+--
+-- Indexes for table `chk_validators`
+--
+ALTER TABLE `chk_validators`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_validator` (`checklist_id`,`employee_code`),
+  ADD KEY `idx_validator_emp` (`employee_code`);
 
 --
 -- Indexes for table `departments`
@@ -1315,6 +1557,57 @@ ALTER TABLE `devices`
   ADD KEY `idx_devices_active` (`is_active`);
 
 --
+-- Indexes for table `ed_device_meta`
+--
+ALTER TABLE `ed_device_meta`
+  ADD PRIMARY KEY (`device_id`);
+
+--
+-- Indexes for table `ed_device_relay_schedule`
+--
+ALTER TABLE `ed_device_relay_schedule`
+  ADD PRIMARY KEY (`device_id`);
+
+--
+-- Indexes for table `ed_energy_devices`
+--
+ALTER TABLE `ed_energy_devices`
+  ADD PRIMARY KEY (`device_id`),
+  ADD KEY `idx_owner` (`owner_user_id`),
+  ADD KEY `idx_location` (`location`);
+
+--
+-- Indexes for table `ed_energy_readings`
+--
+ALTER TABLE `ed_energy_readings`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_device_seq` (`device_id`,`seq`),
+  ADD KEY `idx_device_time` (`device_id`,`wall_time`),
+  ADD KEY `idx_device_date_energy` (`device_id`,`wall_time`,`energy_wh`);
+
+--
+-- Indexes for table `ed_ingest_log`
+--
+ALTER TABLE `ed_ingest_log`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_device_time` (`device_id`,`received_at`);
+
+--
+-- Indexes for table `ed_rtc_drift_log`
+--
+ALTER TABLE `ed_rtc_drift_log`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_dev_measured` (`device_id`,`measured_at`),
+  ADD KEY `idx_dev_time` (`device_id`,`measured_at`);
+
+--
+-- Indexes for table `ed_users`
+--
+ALTER TABLE `ed_users`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `username` (`username`);
+
+--
 -- Indexes for table `employees`
 --
 ALTER TABLE `employees`
@@ -1329,6 +1622,15 @@ ALTER TABLE `employees`
 --
 ALTER TABLE `employee_location_logs`
   ADD PRIMARY KEY (`id`);
+
+--
+-- Indexes for table `event_photos`
+--
+ALTER TABLE `event_photos`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_ep_event_date` (`event_date`),
+  ADD KEY `idx_ep_uploaded_by` (`uploaded_by`),
+  ADD KEY `idx_ep_stored` (`stored_name`);
 
 --
 -- Indexes for table `failed_punch_logs`
@@ -1549,7 +1851,8 @@ ALTER TABLE `ticket_schedule_depts`
 ALTER TABLE `time_entries`
   ADD PRIMARY KEY (`id`),
   ADD KEY `idx_te_emp_date` (`employee_code`,`entry_date`),
-  ADD KEY `idx_te_issue` (`issue_id`);
+  ADD KEY `idx_te_issue` (`issue_id`),
+  ADD KEY `idx_te_checklist` (`checklist_id`,`entry_date`);
 
 --
 -- Indexes for table `time_tasks`
@@ -1696,6 +1999,18 @@ ALTER TABLE `audit_view_logs`
   MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
 
 --
+-- AUTO_INCREMENT for table `chk_assignees`
+--
+ALTER TABLE `chk_assignees`
+  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `chk_checklists`
+--
+ALTER TABLE `chk_checklists`
+  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
 -- AUTO_INCREMENT for table `chk_daily_responses`
 --
 ALTER TABLE `chk_daily_responses`
@@ -1714,9 +2029,21 @@ ALTER TABLE `chk_response_attachments`
   MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
 
 --
+-- AUTO_INCREMENT for table `chk_sections`
+--
+ALTER TABLE `chk_sections`
+  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
 -- AUTO_INCREMENT for table `chk_validations`
 --
 ALTER TABLE `chk_validations`
+  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `chk_validators`
+--
+ALTER TABLE `chk_validators`
   MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
 
 --
@@ -1732,6 +2059,30 @@ ALTER TABLE `devices`
   MODIFY `device_id` int(11) NOT NULL AUTO_INCREMENT;
 
 --
+-- AUTO_INCREMENT for table `ed_energy_readings`
+--
+ALTER TABLE `ed_energy_readings`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `ed_ingest_log`
+--
+ALTER TABLE `ed_ingest_log`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `ed_rtc_drift_log`
+--
+ALTER TABLE `ed_rtc_drift_log`
+  MODIFY `id` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `ed_users`
+--
+ALTER TABLE `ed_users`
+  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
 -- AUTO_INCREMENT for table `employees`
 --
 ALTER TABLE `employees`
@@ -1741,6 +2092,12 @@ ALTER TABLE `employees`
 -- AUTO_INCREMENT for table `employee_location_logs`
 --
 ALTER TABLE `employee_location_logs`
+  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `event_photos`
+--
+ALTER TABLE `event_photos`
   MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
 
 --
@@ -2012,7 +2369,6 @@ ALTER TABLE `audit_response_attachments`
 -- Constraints for table `chk_daily_responses`
 --
 ALTER TABLE `chk_daily_responses`
-  ADD CONSTRAINT `chk_daily_responses_ibfk_1` FOREIGN KEY (`location_id`) REFERENCES `locations` (`location_id`),
   ADD CONSTRAINT `chk_daily_responses_ibfk_2` FOREIGN KEY (`item_id`) REFERENCES `chk_items` (`id`);
 
 --
@@ -2026,6 +2382,37 @@ ALTER TABLE `chk_response_attachments`
 --
 ALTER TABLE `devices`
   ADD CONSTRAINT `fk_device_location` FOREIGN KEY (`location_id`) REFERENCES `locations` (`location_id`) ON UPDATE CASCADE;
+
+--
+-- Constraints for table `ed_device_meta`
+--
+ALTER TABLE `ed_device_meta`
+  ADD CONSTRAINT `ed_device_meta_ibfk_1` FOREIGN KEY (`device_id`) REFERENCES `ed_energy_devices` (`device_id`) ON DELETE CASCADE;
+
+--
+-- Constraints for table `ed_device_relay_schedule`
+--
+ALTER TABLE `ed_device_relay_schedule`
+  ADD CONSTRAINT `ed_device_relay_schedule_ibfk_1` FOREIGN KEY (`device_id`) REFERENCES `ed_energy_devices` (`device_id`) ON DELETE CASCADE;
+
+--
+-- Constraints for table `ed_energy_devices`
+--
+ALTER TABLE `ed_energy_devices`
+  ADD CONSTRAINT `fk_ed_dev_location` FOREIGN KEY (`location`) REFERENCES `locations` (`location_id`) ON DELETE SET NULL,
+  ADD CONSTRAINT `fk_ed_dev_owner` FOREIGN KEY (`owner_user_id`) REFERENCES `ed_users` (`id`) ON DELETE SET NULL;
+
+--
+-- Constraints for table `ed_energy_readings`
+--
+ALTER TABLE `ed_energy_readings`
+  ADD CONSTRAINT `ed_energy_readings_ibfk_1` FOREIGN KEY (`device_id`) REFERENCES `ed_energy_devices` (`device_id`) ON DELETE CASCADE;
+
+--
+-- Constraints for table `ed_rtc_drift_log`
+--
+ALTER TABLE `ed_rtc_drift_log`
+  ADD CONSTRAINT `ed_rtc_drift_log_ibfk_1` FOREIGN KEY (`device_id`) REFERENCES `ed_energy_devices` (`device_id`) ON DELETE CASCADE;
 
 --
 -- Constraints for table `image_annotations`
