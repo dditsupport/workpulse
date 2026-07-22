@@ -374,7 +374,7 @@ function pagePriceTagsApp(): void {
     <table class="items" id="items-table">
       <thead>
         <tr>
-          <th class="use">Use</th>
+          <th class="use"><label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;font:inherit"><input type="checkbox" id="check-all" title="Select / unselect all"> Use</label></th>
           <th>Item name</th>
           <th style="width:110px">Basic (Rs.)</th>
           <th style="width:90px">Tax (%)</th>
@@ -679,10 +679,28 @@ function renderTable(){
               e.target.value;
       state.items[i][k] = v;
       persist(); render();
-      if(k !== 'enabled') saveItemToDb(i);
+      if(k === 'enabled') syncCheckAll(); else saveItemToDb(i);
     });
   });
+  syncCheckAll();
 }
+
+// Reflect the collective "Use" state on the header master checkbox:
+// checked when all on, unchecked when none, indeterminate when mixed.
+function syncCheckAll(){
+  const master = document.getElementById('check-all');
+  if(!master) return;
+  const total = state.items.length;
+  const on = state.items.filter(it => it.enabled).length;
+  master.checked = total > 0 && on === total;
+  master.indeterminate = on > 0 && on < total;
+}
+
+document.getElementById('check-all').addEventListener('change', e => {
+  const on = e.target.checked;
+  state.items.forEach(it => { it.enabled = on; });
+  persist(); render(); renderTable();
+});
 
 document.addEventListener('keydown', e => {
   if((e.key === 'e' || e.key === 'E') && !e.metaKey && !e.ctrlKey && !e.target.matches('input,textarea')){
