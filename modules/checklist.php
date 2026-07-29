@@ -518,6 +518,17 @@ function doSaveChecklist(): void {
 define('CHK_TIME_NOTE_ENTERED', 'Checklist time (per task)');
 define('CHK_TIME_NOTE_AUTO',    'Checklist auto-logged');
 
+// Clock glyph for the per-task time boxes. Same drawing as navIcon('clock'),
+// sized down for 11–12px labels — an inline SVG rather than the ⏱ emoji so it
+// inherits the surrounding text colour instead of rendering in whatever the
+// device's emoji font paints.
+function chkClockIcon(int $px = 13): string {
+    return '<svg width="' . $px . '" height="' . $px . '" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+         . ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"'
+         . ' style="vertical-align:-2px;flex:none"><circle cx="12" cy="12" r="10"/>'
+         . '<polyline points="12 6 12 12 16 14"/></svg>';
+}
+
 // Is chk_daily_responses.time_minutes there? Per-task time entry is hidden
 // until the column is added, so the module keeps working on a database
 // that has not run the migration.
@@ -1220,12 +1231,12 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
 ?>
 <?php if ($timeUi && $loggedMins > 0): ?>
 <div class="alert" style="margin-bottom:10px;background:rgba(99,102,241,.10);color:var(--text);border:1px solid rgba(99,102,241,.30)">
-    &#9201; <strong><?= h(fmtMinutes($loggedMins)) ?></strong> logged for this day in
+    <?= chkClockIcon(14) ?> <strong><?= h(fmtMinutes($loggedMins)) ?></strong> logged for this day in
     <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a><?= $timeEntered ? '' : ' (estimated from the tasks you completed)' ?>.
 </div>
 <?php elseif ($timeUi && !$readOnly): ?>
 <div class="text-muted" style="font-size:12px;margin-bottom:10px">
-    &#9201; Enter the minutes you spent next to each task — they add up into one
+    <?= chkClockIcon(13) ?> Enter the minutes you spent next to each task — they add up into one
     <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a> entry for this day.
 </div>
 <?php endif; ?>
@@ -1308,7 +1319,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                         $myMin = (int)($t['my_minutes'] ?? 0);
                         if ($timeUi && $cellEditable): ?>
                             <div style="margin-top:6px;display:flex;align-items:center;gap:5px">
-                                <span class="text-muted" style="font-size:11px">&#9201;</span>
+                                <span class="text-muted" style="display:inline-flex"><?= chkClockIcon(13) ?></span>
                                 <input type="number" name="task_time[<?= (int)$t['id'] ?>]" class="form-control chk-task-time"
                                        min="0" max="480" step="5" inputmode="numeric" placeholder="0"
                                        value="<?= $myMin > 0 ? $myMin : '' ?>"
@@ -1317,7 +1328,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                                 <span class="text-muted" style="font-size:11px">min</span>
                             </div>
                         <?php elseif ($timeUi && $myMin > 0): ?>
-                            <div class="text-muted" style="margin-top:4px;font-size:11px">&#9201; <?= h(fmtMinutes($myMin)) ?></div>
+                            <div class="text-muted" style="margin-top:4px;font-size:11px"><?= chkClockIcon(12) ?> <?= h(fmtMinutes($myMin)) ?></div>
                         <?php endif; ?>
                         <?php
                         $attList    = $itemAttachments[(int)$t['id']] ?? [];
