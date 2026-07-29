@@ -120,8 +120,11 @@ function doSaveTimeEntry(): void {
     }
 
     // An entry references either a ticket OR a pre-created task; a ticket wins.
-    $issueId    = null;
-    $taskIdSave = null;
+    // Rows logged from a checklist reference neither — they keep their
+    // checklist link so the owner can still fix the date/duration/notes here.
+    $issueId       = null;
+    $taskIdSave    = null;
+    $keepChecklist = 0;
     if ($ticketRaw !== '') {
         if (preg_match('/^WP-?(\d+)$/i', $ticketRaw, $m)) $issueId = (int)$m[1];
         elseif (ctype_digit($ticketRaw))                  $issueId = (int)$ticketRaw;
@@ -144,6 +147,13 @@ function doSaveTimeEntry(): void {
             header("Location: $back"); exit;
         }
         $taskIdSave = $taskId;
+    } elseif ($id) {
+        $cs = $db->prepare('SELECT checklist_id FROM time_entries WHERE id = ?');
+        try { $cs->execute([$id]); $keepChecklist = (int)($cs->fetchColumn() ?: 0); } catch (Exception $e) { $keepChecklist = 0; }
+        if ($keepChecklist <= 0) {
+            flash('error', 'Choose a task or enter a ticket number. Create tasks under Tasks first.');
+            header("Location: $back"); exit;
+        }
     } else {
         flash('error', 'Choose a task or enter a ticket number. Create tasks under Tasks first.');
         header("Location: $back"); exit;
@@ -159,9 +169,11 @@ function doSaveTimeEntry(): void {
                 flash('error', 'Entry not found or access denied.');
                 header("Location: $back"); exit;
             }
+            // Pointing a checklist row at a ticket/task drops the checklist
+            // link, so the next checklist sync can't delete it underneath.
             $db->prepare(
-                'UPDATE time_entries SET issue_id=?, task_id=?, task_label=NULL, entry_date=?, minutes=?, notes=? WHERE id=?'
-            )->execute([$issueId, $taskIdSave, $entryDate, $minutes, ($notes !== '' ? $notes : null), $id]);
+                'UPDATE time_entries SET issue_id=?, task_id=?, checklist_id=?, task_label=NULL, entry_date=?, minutes=?, notes=? WHERE id=?'
+            )->execute([$issueId, $taskIdSave, ($keepChecklist > 0 ? $keepChecklist : null), $entryDate, $minutes, ($notes !== '' ? $notes : null), $id]);
             flash('success', 'Time entry updated.');
         } else {
             $db->prepare(

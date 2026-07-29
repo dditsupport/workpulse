@@ -186,13 +186,29 @@ function pageEventPhotos(): void {
     foreach ($photos as $p) { $byMonth[date('F Y', strtotime((string)$p['event_date']))][] = $p; }
 ?>
 <style>
-.ep-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center}
+.ep-modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:9999;align-items:center;justify-content:center;padding:16px}
 .ep-modal.active{display:flex}
 .ep-modal-content{background:var(--surface);border-radius:10px;padding:16px;max-width:min(560px,92vw);max-height:90vh;overflow:auto;position:relative;border:1px solid var(--border)}
 .ep-modal-close{position:absolute;top:8px;right:14px;font-size:24px;color:var(--muted);cursor:pointer;z-index:1}
 .ep-modal-close:hover{color:var(--text)}
 .ep-modal-title{font-size:14px;margin-bottom:10px;padding-right:24px;color:var(--text)}
-.ep-lightbox-img{display:block;max-width:92vw;max-height:80vh;border-radius:6px;object-fit:contain}
+/* Lightbox: no surface panel around the photo. The shared 560px-wide box
+   squeezed a tall photo into a narrow column, so on a short landscape
+   screen the image ran past the viewport and could only be scrolled to.
+   Here the photo sizes itself against BOTH viewport axes and the chrome
+   floats over the backdrop, so it always fits whatever the screen shape. */
+.ep-lightbox .ep-modal-content{background:none;border:0;border-radius:0;padding:0;max-width:none;max-height:none;overflow:visible;display:flex;flex-direction:column;align-items:center;gap:8px}
+.ep-lightbox .ep-modal-close{position:fixed;top:6px;right:14px;font-size:30px;line-height:1;color:#e5e7eb;text-shadow:0 1px 4px rgba(0,0,0,.9)}
+.ep-lightbox .ep-modal-close:hover{color:#fff}
+.ep-lightbox .ep-modal-title{margin:0;padding:0 32px;max-width:96vw;text-align:center;color:#e5e7eb;text-shadow:0 1px 4px rgba(0,0,0,.9)}
+.ep-lightbox-img{display:block;width:auto;height:auto;max-width:96vw;max-height:calc(100vh - 88px);max-height:calc(100dvh - 88px);border-radius:6px;object-fit:contain}
+/* Short/landscape viewports (phone turned sideways, laptop in a small
+   window): claw back the vertical space the caption row costs. */
+@media (max-height:640px){
+    .ep-modal{padding:8px}
+    .ep-lightbox .ep-modal-title{font-size:12px}
+    .ep-lightbox-img{max-height:calc(100vh - 56px);max-height:calc(100dvh - 56px)}
+}
 </style>
 <script>
 // One Escape handler for every ep-modal on the page. Lives here rather than
@@ -318,7 +334,7 @@ function epCloseUpload(e){
 <div class="table-count"><?= $total ?> photo(s)</div>
 
 <!-- Lightbox -->
-<div id="epLightbox" class="ep-modal" onclick="epClose(event)">
+<div id="epLightbox" class="ep-modal ep-lightbox" onclick="epClose(event)">
     <div class="ep-modal-content">
         <span class="ep-modal-close" onclick="epClose()">&times;</span>
         <h4 id="epLightboxCap" class="ep-modal-title"></h4>
@@ -327,13 +343,17 @@ function epCloseUpload(e){
 </div>
 <script>
 function epOpen(id, cap) {
+    var capEl = document.getElementById('epLightboxCap');
     document.getElementById('epLightboxImg').src = '?page=event_photo&id=' + id;
-    document.getElementById('epLightboxCap').textContent = cap || '';
+    capEl.textContent = cap || '';
+    // An empty caption would still eat a row of height on a short screen.
+    capEl.style.display = cap ? '' : 'none';
     document.getElementById('epLightbox').classList.add('active');
 }
 function epClose(e) {
-    if (e && e.target !== document.getElementById('epLightbox')
-          && !e.target.classList.contains('ep-modal-close')) return;
+    // The content box is transparent now, so anything but the photo itself
+    // counts as clicking the backdrop.
+    if (e && e.target && e.target.id === 'epLightboxImg') return;
     document.getElementById('epLightbox').classList.remove('active');
     document.getElementById('epLightboxImg').src = '';
 }
