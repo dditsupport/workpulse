@@ -1255,7 +1255,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
     <div class="table-wrap">
         <table class="table chk-table">
             <thead>
-                <tr><th style="width:48px;text-align:center">#</th><th>Particular</th><th style="width:260px">Status / Answer</th></tr>
+                <tr><th style="width:48px;text-align:center">#</th><th>Particular</th><th style="width:<?= $timeUi ? 320 : 260 ?>px">Status / Answer</th></tr>
             </thead>
             <tbody>
             <?php
@@ -1284,6 +1284,13 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                     <td class="chk-num" style="text-align:center;color:var(--muted);font-size:12px"><?= $sr++ ?></td>
                     <td class="chk-particular"><?= h($t['task_description']) ?></td>
                     <td class="chk-answer">
+                        <?php
+                        // Answer control and the minutes box share one row —
+                        // the cell stays two lines tall (answer + files).
+                        $myMin = (int)($t['my_minutes'] ?? 0);
+                        ?>
+                        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                        <div>
                         <?php if (!empty($t['response_value'])): ?>
                             <span class="badge badge-green">&#10003; <?= h($t['response_value']) ?></span>
                             <div class="text-muted" style="margin-top:2px">By: <?= h($t['submitted_by'] ?? 'Unknown') ?></div>
@@ -1311,25 +1318,26 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                                 <input type="text" name="ans[<?= $t['id'] ?>]" class="form-control" placeholder="Enter details">
                             <?php endif; ?>
                         <?php endif; ?>
+                        </div>
                         <?php
-                        // Per-task time. Editable while the section is open —
-                        // including on an already-answered task, so the minutes
-                        // can be filled in after the fact. It rolls up into the
-                        // day's My Time entry.
-                        $myMin = (int)($t['my_minutes'] ?? 0);
+                        // Per-task time, sitting beside the answer. Editable
+                        // while the section is open — including on an already
+                        // answered task, so the minutes can be filled in after
+                        // the fact. It rolls up into the day's My Time entry.
                         if ($timeUi && $cellEditable): ?>
-                            <div style="margin-top:6px;display:flex;align-items:center;gap:5px">
-                                <span class="text-muted" style="display:inline-flex"><?= chkClockIcon(13) ?></span>
+                            <span style="display:inline-flex;align-items:center;gap:4px">
+                                <span class="text-muted" style="display:inline-flex" title="Minutes you spent on this task"><?= chkClockIcon(13) ?></span>
                                 <input type="number" name="task_time[<?= (int)$t['id'] ?>]" class="form-control chk-task-time"
                                        min="0" max="480" step="5" inputmode="numeric" placeholder="0"
                                        value="<?= $myMin > 0 ? $myMin : '' ?>"
-                                       title="Minutes you spent on this task"
-                                       style="width:70px;padding:3px 6px;font-size:12px">
+                                       aria-label="Minutes spent on this task"
+                                       style="width:58px;padding:3px 6px;font-size:12px">
                                 <span class="text-muted" style="font-size:11px">min</span>
-                            </div>
+                            </span>
                         <?php elseif ($timeUi && $myMin > 0): ?>
-                            <div class="text-muted" style="margin-top:4px;font-size:11px"><?= chkClockIcon(12) ?> <?= h(fmtMinutes($myMin)) ?></div>
+                            <span class="text-muted" style="font-size:11px;white-space:nowrap"><?= chkClockIcon(12) ?> <?= h(fmtMinutes($myMin)) ?></span>
                         <?php endif; ?>
+                        </div>
                         <?php
                         $attList    = $itemAttachments[(int)$t['id']] ?? [];
                         $hasAnswer  = !empty($t['response_value']);
