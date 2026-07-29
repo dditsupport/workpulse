@@ -372,10 +372,13 @@ function doSaveChecklist(): void {
     // Attach-only submits (no fresh answers, only files) are legitimate
     // once the response row already exists — let those through. So is a
     // time-only submit: the day's tasks may already be filled and the
-    // employee is just recording how long it took.
+    // employee is just recording how long each took.
     $hasUploads = !empty($_FILES['attachments']['name']) && is_array($_FILES['attachments']['name']);
-    $timeSpent  = chkNormalizeTimeSpent($_POST['time_spent'] ?? null);
-    if (($isLocMode && $locationId <= 0) || (empty($answers) && !$hasUploads && $timeSpent === null)) {
+    $times      = chkNormalizeTaskTimes($_POST['task_time'] ?? null);   // itemId => minutes
+    // Every editable cell posts an ans[] key, blank or not — "did they
+    // actually answer something" is a different question from "was ans[] sent".
+    $hasRealAnswers = (bool)array_filter($answers, fn($v) => trim((string)$v) !== '');
+    if (($isLocMode && $locationId <= 0) || (empty($answers) && !$hasUploads && empty($times))) {
         flash('error', 'No data submitted.');
         header("Location: {$back}"); exit;
     }
@@ -385,31 +388,31 @@ function doSaveChecklist(): void {
 
     // Look up each answered item's section so we can enforce per-section
     // deadlines server-side, and confirm the item belongs to this checklist.
-    $itemIds = array_values(array_filter(array_map('intval', array_keys($answers)), fn($i) => $i > 0));
     $secByItem = [];   // itemId => section row (or null)
     $ownItems  = [];   // itemIds that belong to this checklist
-    if ($itemIds) {
-        $ph = implode(',', array_fill(0, count($itemIds), '?'));
-        $sst = $db->prepare("SELECT id, section_id FROM chk_items WHERE checklist_id = ? AND id IN ($ph)");
-        $sst->execute(array_merge([$checklistId], $itemIds));
-        foreach ($sst->fetchAll(PDO::FETCH_ASSOC) as $r) {
-            $iid = (int)$r['id'];
-            $ownItems[$iid] = true;
-            $secByItem[$iid] = $r['section_id'] ? ($allSections[(int)$r['section_id']] ?? null) : null;
-        }
-    }
+    chkLoadItemMeta($checklistId, array_keys($answers), $allSections, $ownItems, $secByItem);
 
-    $st = $db->prepare(
-        "INSERT INTO chk_daily_responses (checklist_id, location_id, item_id, employee_code, log_date, response_value, submitted_at)
-         VALUES (?, ?, ?, ?, ?, ?, NOW())
-         ON DUPLICATE KEY UPDATE
-           response_value = VALUES(response_value),
-           checklist_id   = VALUES(checklist_id),
-           employee_code  = VALUES(employee_code),
-           submitted_at   = NOW()"
+    $hasTaskTime = chkHasTaskTime();
+    $st = $db->prepare($hasTaskTime
+        ? "INSERT INTO chk_daily_responses (checklist_id, location_id, item_id, employee_code, log_date, response_value, time_minutes, submitted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+           ON DUPLICATE KEY UPDATE
+             response_value = VALUES(response_value),
+             checklist_id   = VALUES(checklist_id),
+             employee_code  = VALUES(employee_code),
+             time_minutes   = VALUES(time_minutes),
+             submitted_at   = NOW()"
+        : "INSERT INTO chk_daily_responses (checklist_id, location_id, item_id, employee_code, log_date, response_value, submitted_at)
+           VALUES (?, ?, ?, ?, ?, ?, NOW())
+           ON DUPLICATE KEY UPDATE
+             response_value = VALUES(response_value),
+             checklist_id   = VALUES(checklist_id),
+             employee_code  = VALUES(employee_code),
+             submitted_at   = NOW()"
     );
 
     $saved = 0; $skippedClosed = 0;
+    $timedItems = [];   // itemIds whose minutes the answer upsert already wrote
     try {
         $db->beginTransaction();
         foreach ($answers as $itemId => $val) {
@@ -419,15 +422,42 @@ function doSaveChecklist(): void {
                 $skippedClosed++;
                 continue;
             }
-            $st->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $val]);
+            if ($hasTaskTime) {
+                $st->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $val, $times[$itemId] ?? null]);
+                $timedItems[$itemId] = true;
+            } else {
+                $st->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $val]);
+            }
             $saved++;
+        }
+
+        // Minutes typed against a task that carries no answer in this submit
+        // (answered earlier today, or timed before being ticked off) have no
+        // upsert to ride along with. Insert-or-update the minutes alone —
+        // response_value is deliberately absent from the UPDATE list so an
+        // existing answer survives untouched.
+        if ($hasTaskTime && $times) {
+            chkLoadItemMeta($checklistId, array_keys($times), $allSections, $ownItems, $secByItem);
+            $tu = $db->prepare(
+                "INSERT INTO chk_daily_responses (checklist_id, location_id, item_id, employee_code, log_date, time_minutes, submitted_at)
+                 VALUES (?, ?, ?, ?, ?, ?, NOW())
+                 ON DUPLICATE KEY UPDATE time_minutes = VALUES(time_minutes), checklist_id = VALUES(checklist_id)");
+            $tc = $db->prepare(
+                "UPDATE chk_daily_responses SET time_minutes = NULL
+                 WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND log_date = ? AND employee_code = ?");
+            foreach ($times as $itemId => $mins) {
+                if (isset($timedItems[$itemId]) || empty($ownItems[$itemId])) continue;
+                if (!checklistSectionEditable($secByItem[$itemId] ?? null, $logDate, $cl)) continue;
+                if ($mins > 0) $tu->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $mins]);
+                else           $tc->execute([$checklistId, $locationId, $itemId, $logDate, $empCode]);
+            }
         }
         $db->commit();
         if ($skippedClosed > 0) {
             flash('success', "Saved {$saved} task(s). {$skippedClosed} task(s) skipped — section is outside its allowed time window.");
         } elseif ($saved > 0) {
             flash('success', 'Checklist submitted successfully.');
-        } elseif (!empty($answers)) {
+        } elseif ($hasRealAnswers) {
             // Had answers in the POST but none applied → outside window.
             flash('error', 'Nothing saved — all submitted tasks are outside their allowed time window.');
         }
@@ -449,17 +479,7 @@ function doSaveChecklist(): void {
             if (is_array($names) && count($names) > 0) $attachItemIds[] = (int)$iid;
         }
         $attachItemIds = array_values(array_filter($attachItemIds, fn($i) => $i > 0));
-        $missingSec = array_values(array_filter($attachItemIds, fn($i) => !isset($ownItems[$i])));
-        if ($missingSec) {
-            $ph = implode(',', array_fill(0, count($missingSec), '?'));
-            $sst = $db->prepare("SELECT id, section_id FROM chk_items WHERE checklist_id = ? AND id IN ($ph)");
-            $sst->execute(array_merge([$checklistId], $missingSec));
-            foreach ($sst->fetchAll(PDO::FETCH_ASSOC) as $r) {
-                $iid = (int)$r['id'];
-                $ownItems[$iid] = true;
-                $secByItem[$iid] = $r['section_id'] ? ($allSections[(int)$r['section_id']] ?? null) : null;
-            }
-        }
+        chkLoadItemMeta($checklistId, $attachItemIds, $allSections, $ownItems, $secByItem);
         $attSaved = 0;
         foreach ($attachItemIds as $itemId) {
             if (empty($ownItems[$itemId])) continue;
@@ -475,13 +495,13 @@ function doSaveChecklist(): void {
         }
     }
 
-    // Mirror this user's time into page=my_time — the duration entered on
-    // the form when there is one, else the completed tasks' estimate.
-    chkSyncTimeEntry($checklistId, $empCode, $logDate, $timeSpent);
-    if ($timeSpent !== null && empty($_SESSION['flash'])) {
+    // Mirror this user's time into page=my_time — the per-task minutes they
+    // entered when there are any, else the completed tasks' estimate.
+    $logged = chkSyncTimeEntry($checklistId, $empCode, $logDate);
+    if ($times && empty($_SESSION['flash'])) {
         // Time-only submit — say so, otherwise the redirect looks like a no-op.
-        flash('success', $timeSpent > 0
-            ? ('Time logged: ' . (function_exists('fmtMinutes') ? fmtMinutes($timeSpent) : $timeSpent . 'm') . '.')
+        flash('success', $logged > 0
+            ? ('Time logged: ' . (function_exists('fmtMinutes') ? fmtMinutes($logged) : $logged . 'm') . '.')
             : 'Time entry cleared.');
     }
 
@@ -489,17 +509,32 @@ function doSaveChecklist(): void {
 }
 
 // ── Map checklist time into the timesheet ─────────────────
-// Two ways time reaches page=my_time for a (checklist, employee, date):
-//   1. the employee picks a duration in the "Time spent" box on the fill
-//      form — that entered value wins and is never overwritten by (2);
-//   2. otherwise the est_minutes of the items they completed are summed.
-// The notes column marks which of the two produced the row.
-define('CHK_TIME_NOTE_MANUAL', 'Checklist time (entered)');
-define('CHK_TIME_NOTE_AUTO',   'Checklist auto-logged');
+// Time is recorded per task, in chk_daily_responses.time_minutes, next to
+// the answer it belongs to. The day's rows are then summed into the single
+// checklist-linked time_entries row that page=my_time shows. When no task
+// carries a typed duration the est_minutes of the completed items stand in,
+// which is how this worked before per-task entry existed; the notes column
+// says which of the two produced the row.
+define('CHK_TIME_NOTE_ENTERED', 'Checklist time (per task)');
+define('CHK_TIME_NOTE_AUTO',    'Checklist auto-logged');
+
+// Is chk_daily_responses.time_minutes there? Per-task time entry is hidden
+// until the column is added, so the module keeps working on a database
+// that has not run the migration.
+function chkHasTaskTime(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    try {
+        $r = getDb()->query('SELECT time_minutes FROM chk_daily_responses LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
 
 // The single checklist-linked time entry for one employee+checklist+day,
 // or null. Fails open (returns null) when time_entries.checklist_id is not
-// there yet, so the column stays optional.
+// there yet, so that column stays optional too.
 function chkTimeEntryRow(int $checklistId, string $empCode, string $logDate): ?array {
     if ($checklistId <= 0 || $empCode === '') return null;
     try {
@@ -514,34 +549,63 @@ function chkTimeEntryRow(int $checklistId, string $empCode, string $logDate): ?a
     }
 }
 
-// Normalise the posted "Time spent" duration. Blank ⇒ null (no manual
-// time on this submit); 0 ⇒ clear the entry; anything else is snapped to
-// the same 15-minute / 8-hour envelope the My Time form allows.
-function chkNormalizeTimeSpent($raw): ?int {
-    if ($raw === null || !is_numeric(trim((string)$raw))) return null;
-    $m = (int)$raw;
-    if ($m <= 0) return 0;
-    $m = (int)round($m / 15) * 15;
-    return max(15, min(8 * 60, $m));
+// Normalise the posted task_time[ITEM_ID] map to itemId => minutes. Blank
+// boxes are dropped; a 0 is kept (it clears that task's time); anything
+// else is clamped to a sane 0–8h per task.
+function chkNormalizeTaskTimes($raw): array {
+    if (!is_array($raw)) return [];
+    $out = [];
+    foreach ($raw as $itemId => $val) {
+        $itemId = (int)$itemId;
+        if ($itemId <= 0 || !is_numeric(trim((string)$val))) continue;
+        $out[$itemId] = max(0, min(8 * 60, (int)$val));
+    }
+    return $out;
 }
 
-// Keeps that single time_entries row in sync (delete-then-insert, keyed by
-// employee+checklist+date). $manualMinutes is the normalised "Time spent"
-// value: null to leave it to the est_minutes sum. Fails open so a missing
+// Resolve section + ownership metadata for item ids not looked up yet.
+// $ownItems / $secByItem are filled in place, so a caller can hand it a
+// second batch (files, times) without re-reading what it already has.
+function chkLoadItemMeta(int $checklistId, array $itemIds, array $allSections, array &$ownItems, array &$secByItem): void {
+    $missing = array_values(array_unique(array_filter(
+        array_map('intval', $itemIds), fn($i) => $i > 0 && !isset($ownItems[$i]))));
+    if (!$missing) return;
+    $ph  = implode(',', array_fill(0, count($missing), '?'));
+    $sst = getDb()->prepare("SELECT id, section_id FROM chk_items WHERE checklist_id = ? AND id IN ($ph)");
+    $sst->execute(array_merge([$checklistId], $missing));
+    foreach ($sst->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $iid = (int)$r['id'];
+        $ownItems[$iid]  = true;
+        $secByItem[$iid] = $r['section_id'] ? ($allSections[(int)$r['section_id']] ?? null) : null;
+    }
+}
+
+// Minutes this employee typed against the tasks of one checklist+day.
+function chkTaskTimeTotal(int $checklistId, string $empCode, string $logDate): int {
+    if (!chkHasTaskTime()) return 0;
+    try {
+        $st = getDb()->prepare(
+            "SELECT COALESCE(SUM(time_minutes),0) FROM chk_daily_responses
+             WHERE checklist_id = ? AND employee_code = ? AND log_date = ?");
+        $st->execute([$checklistId, $empCode, $logDate]);
+        return (int)$st->fetchColumn();
+    } catch (Exception $e) {
+        return 0;
+    }
+}
+
+// Recomputes that single time_entries row from the day's responses
+// (delete-then-insert, keyed by employee+checklist+date) and returns the
+// minutes logged. Fails open — returns 0 — so a missing
 // time_entries.checklist_id column never blocks a checklist save.
-function chkSyncTimeEntry(int $checklistId, string $empCode, string $logDate, ?int $manualMinutes = null): void {
-    if ($empCode === '') return;
+function chkSyncTimeEntry(int $checklistId, string $empCode, string $logDate): int {
+    if ($empCode === '') return 0;
     $db = getDb();
     try {
-        if ($manualMinutes !== null) {
-            $mins  = $manualMinutes;
-            $notes = CHK_TIME_NOTE_MANUAL;
-        } else {
-            // Nothing entered on this submit — a duration the employee typed
-            // earlier today must survive later section saves.
-            $existing = chkTimeEntryRow($checklistId, $empCode, $logDate);
-            if ($existing && (string)($existing['notes'] ?? '') === CHK_TIME_NOTE_MANUAL) return;
-
+        $mins  = chkTaskTimeTotal($checklistId, $empCode, $logDate);
+        $notes = CHK_TIME_NOTE_ENTERED;
+        if ($mins <= 0) {
+            // Nothing typed for any task — fall back to the estimates.
             $sumSt = $db->prepare(
                 "SELECT COALESCE(SUM(i.est_minutes),0)
                  FROM chk_daily_responses r
@@ -561,8 +625,10 @@ function chkSyncTimeEntry(int $checklistId, string $empCode, string $logDate, ?i
                  VALUES (?, ?, ?, ?, ?)")
                ->execute([$empCode, $checklistId, $logDate, $mins, $notes]);
         }
+        return $mins;
     } catch (Exception $e) {
         // time_entries.checklist_id not present yet — ignore.
+        return 0;
     }
 }
 
@@ -1004,9 +1070,19 @@ function pageChecklistFill(int $checklistId): void {
         $existingCounts = $st->fetchAll(PDO::FETCH_KEY_PAIR);
 
         // Tasks + this scope's latest answer per item (one row per item).
+        // Per-task minutes come off *this* user's own response row (`mine`),
+        // never the latest one: on a shared location checklist the boxes must
+        // show what I logged, not what a colleague did.
+        $hasTaskTime = chkHasTaskTime();
+        $mineSel  = $hasTaskTime ? 'mine.time_minutes AS my_minutes, ' : '';
+        $mineJoin = $hasTaskTime
+            ? "LEFT JOIN chk_daily_responses mine
+                      ON mine.item_id = q.id AND mine.checklist_id = ? AND mine.location_id = ?
+                     AND mine.log_date = ? AND mine.employee_code = ?"
+            : '';
         $st = $db->prepare(
             "SELECT q.id, q.task_description, q.input_type, q.section_id, q.section_name, q.est_minutes,
-                    a.response_value, e.full_name AS submitted_by
+                    a.response_value, {$mineSel}e.full_name AS submitted_by
              FROM chk_items q
              LEFT JOIN chk_sections sec ON sec.id = q.section_id
              LEFT JOIN (
@@ -1015,11 +1091,16 @@ function pageChecklistFill(int $checklistId): void {
                  GROUP BY item_id
              ) latest ON latest.item_id = q.id
              LEFT JOIN chk_daily_responses a ON a.id = latest.rid
+             {$mineJoin}
              LEFT JOIN employees e ON a.employee_code = e.employee_code
              WHERE q.checklist_id = ? AND q.is_active = 1
              ORDER BY COALESCE(sec.sort_order, 9999), q.id ASC"
         );
-        $st->execute([$checklistId, $locationId, $displayDate, $checklistId]);
+        $st->execute(array_merge(
+            [$checklistId, $locationId, $displayDate],
+            $hasTaskTime ? [$checklistId, $locationId, $displayDate, $me] : [],
+            [$checklistId]
+        ));
         $tasks = $st->fetchAll(PDO::FETCH_ASSOC);
     }
     $itemAttachments = $haveScope
@@ -1128,19 +1209,24 @@ foreach ($sectionStatus as $info) {
 }
 $readOnly = $isPast || !$anyOpenSection;
 
-// Time already mirrored into page=my_time for this day, and whether it came
-// from the "Time spent" box (so the box can show it back) or from the
-// est_minutes fallback. durationSelect()/fmtMinutes() live in the time
-// tracking module; without it the whole time block simply doesn't render.
-$timeUi     = function_exists('durationSelect') && function_exists('fmtMinutes');
-$timeRow    = $timeUi ? chkTimeEntryRow($checklistId, $me, $displayDate) : null;
-$loggedMins = (int)($timeRow['minutes'] ?? 0);
-$timeEntered = $timeRow && (string)($timeRow['notes'] ?? '') === CHK_TIME_NOTE_MANUAL;
-$myTimeUrl  = '?page=my_time&week=' . urlencode(function_exists('weekStartSunday') ? weekStartSunday($displayDate) : $displayDate);
+// Per-task time entry needs the chk_daily_responses.time_minutes column and
+// fmtMinutes() from the time tracking module; without either, the time boxes
+// simply don't render and the est_minutes fallback carries on as before.
+$timeUi      = chkHasTaskTime() && function_exists('fmtMinutes');
+$timeRow     = $timeUi ? chkTimeEntryRow($checklistId, $me, $displayDate) : null;
+$loggedMins  = (int)($timeRow['minutes'] ?? 0);
+$timeEntered = $timeRow && (string)($timeRow['notes'] ?? '') === CHK_TIME_NOTE_ENTERED;
+$myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunday') ? weekStartSunday($displayDate) : $displayDate);
 ?>
-<?php if ($timeUi && $readOnly && $loggedMins > 0): ?>
+<?php if ($timeUi && $loggedMins > 0): ?>
 <div class="alert" style="margin-bottom:10px;background:rgba(99,102,241,.10);color:var(--text);border:1px solid rgba(99,102,241,.30)">
-    ⏱ <?= h(fmtMinutes($loggedMins)) ?> logged for this day in <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a>.
+    &#9201; <strong><?= h(fmtMinutes($loggedMins)) ?></strong> logged for this day in
+    <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a><?= $timeEntered ? '' : ' (estimated from the tasks you completed)' ?>.
+</div>
+<?php elseif ($timeUi && !$readOnly): ?>
+<div class="text-muted" style="font-size:12px;margin-bottom:10px">
+    &#9201; Enter the minutes you spent next to each task — they add up into one
+    <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a> entry for this day.
 </div>
 <?php endif; ?>
 <?php if ($isPast): ?>
@@ -1215,6 +1301,25 @@ $myTimeUrl  = '?page=my_time&week=' . urlencode(function_exists('weekStartSunday
                             <?php endif; ?>
                         <?php endif; ?>
                         <?php
+                        // Per-task time. Editable while the section is open —
+                        // including on an already-answered task, so the minutes
+                        // can be filled in after the fact. It rolls up into the
+                        // day's My Time entry.
+                        $myMin = (int)($t['my_minutes'] ?? 0);
+                        if ($timeUi && $cellEditable): ?>
+                            <div style="margin-top:6px;display:flex;align-items:center;gap:5px">
+                                <span class="text-muted" style="font-size:11px">&#9201;</span>
+                                <input type="number" name="task_time[<?= (int)$t['id'] ?>]" class="form-control chk-task-time"
+                                       min="0" max="480" step="5" inputmode="numeric" placeholder="0"
+                                       value="<?= $myMin > 0 ? $myMin : '' ?>"
+                                       title="Minutes you spent on this task"
+                                       style="width:70px;padding:3px 6px;font-size:12px">
+                                <span class="text-muted" style="font-size:11px">min</span>
+                            </div>
+                        <?php elseif ($timeUi && $myMin > 0): ?>
+                            <div class="text-muted" style="margin-top:4px;font-size:11px">&#9201; <?= h(fmtMinutes($myMin)) ?></div>
+                        <?php endif; ?>
+                        <?php
                         $attList    = $itemAttachments[(int)$t['id']] ?? [];
                         $hasAnswer  = !empty($t['response_value']);
                         // Allow file input alongside an unanswered editable
@@ -1271,32 +1376,43 @@ $myTimeUrl  = '?page=my_time&week=' . urlencode(function_exists('weekStartSunday
     }
     if ($hasFillable || $hasAttachable): ?>
     <div class="form-actions" style="position:sticky;bottom:0;margin-top:10px;padding:10px 0;background:var(--bg);border-top:1px solid var(--border);z-index:20">
-        <div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
-            <?php if ($timeUi): ?>
-            <div class="form-group" style="margin:0;min-width:150px">
-                <label style="display:block">Time spent <span class="text-muted">(optional)</span></label>
-                <?= durationSelect('time_spent', $timeEntered ? $loggedMins : 0) ?>
-            </div>
-            <?php endif; ?>
-            <button type="submit" class="btn btn-success">
-                <?= $hasFillable ? 'Submit Daily Progress' : 'Save Attachments' ?>
-            </button>
-        </div>
+        <button type="submit" class="btn btn-success">
+            <?= $hasFillable ? 'Submit Daily Progress' : 'Save Attachments' ?>
+        </button>
         <?php if ($timeUi): ?>
-        <p class="text-muted" style="font-size:12px;margin:6px 0 0">
-            Goes to <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a> as one entry for
-            <?= h(date('d M Y', strtotime($displayDate))) ?> — pick the total for the whole day; a later save with
-            the box left blank keeps it. Blank falls back to the estimated time of the tasks you completed.
-            <?php if ($loggedMins > 0): ?>
-            Currently logged: <strong><?= h(fmtMinutes($loggedMins)) ?></strong><?= $timeEntered ? '' : ' (estimated)' ?>.
-            <?php endif; ?>
-        </p>
+        <span class="text-muted" style="font-size:12px;margin-left:10px">
+            Time this submit: <strong id="chkTimeSum">—</strong>
+        </span>
         <?php endif; ?>
     </div>
     <?php elseif (!$readOnly): ?>
     <div class="alert alert-success" style="margin-top:10px">All open-section tasks have been completed.</div>
     <?php endif; ?>
 </form>
+<script>
+// Live total of the per-task minute boxes, so the day's My Time entry is
+// no surprise after submitting.
+(function () {
+    var out = document.getElementById('chkTimeSum');
+    if (!out) return;
+    var boxes = document.querySelectorAll('.chk-task-time');
+    function fmt(m) {
+        if (!m) return '—';
+        var h = Math.floor(m / 60), mm = m % 60;
+        return h && mm ? h + 'h ' + mm + 'm' : (h ? h + 'h' : mm + 'm');
+    }
+    function sum() {
+        var t = 0;
+        Array.prototype.forEach.call(boxes, function (b) {
+            var v = parseInt(b.value, 10);
+            if (!isNaN(v) && v > 0) t += v;
+        });
+        out.textContent = fmt(t);
+    }
+    Array.prototype.forEach.call(boxes, function (b) { b.addEventListener('input', sum); });
+    sum();
+})();
+</script>
 <!-- Hidden form for attachment delete (one form, item-id-less by design — uses att_id only) -->
 <form id="chkAttDelForm" method="POST" style="display:none">
     <input type="hidden" name="action" value="delete_checklist_attachment">
