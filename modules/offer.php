@@ -47,8 +47,8 @@ function doSubmitOffer(): void {
     if (!preg_match('/^\d{10}$/', $mobno))          $errors[] = 'Mobile must be 10 digits.';
     if (!preg_match('/^\d+$/', $bill))               $errors[] = 'Bill amount must be numeric.';
     if ((int)$bill > $maxBill)                       $errors[] = 'Bill amount exceeds limit.';
-    if ($remark !== '' && (strlen($remark) > 50 || !preg_match('/^[a-zA-Z0-9\s]+$/', $remark)))
-                                                      $errors[] = 'Invalid remark (alphanumeric, max 50 chars).';
+    if ($remark !== '' && (strlen($remark) > 30 || !preg_match('/^[a-zA-Z0-9\s]+$/', $remark)))
+                                                      $errors[] = 'Invalid remark (alphanumeric, max 30 chars).';
     if (!in_array($approve, $approverNames))         $errors[] = 'Invalid approver.';
     if (!$offer)                                      $errors[] = 'Select an offer type.';
 
@@ -388,7 +388,7 @@ function pageOffer(): void {
             </div>
             <div class="form-group" style="grid-column:1/-1">
                 <label>Remark</label>
-                <input type="text" name="remark" class="form-control" maxlength="50" placeholder="Optional (max 50 chars)">
+                <input type="text" name="remark" class="form-control" maxlength="30" placeholder="Optional (max 30 chars)">
             </div>
         </div>
         <div class="form-actions">
