@@ -315,6 +315,9 @@ function allowedPages(): array {
     // Checklist attachments — anyone who can see the checklist can open
     // its files. Permission re-checked server-side in the handler.
     $pages[] = 'download_checklist_attachment';
+    // Per-task file history (all dates for one question). Same rule: the
+    // page itself re-checks who may see which checklist and scope.
+    $pages[] = 'checklist_files';
     // Event photo stream — the gallery itself is open to every logged-in user.
     $pages[] = 'event_photo';
     if (isSuperadmin() || hasTxn('dependencies')) {
@@ -811,6 +814,8 @@ function dispatchPage(string $page): void {
         case 'checklist_report': pageChecklistReport(); break;
         case 'download_checklist_attachment':
             if (function_exists('downloadChecklistAttachment')) downloadChecklistAttachment(); break;
+        case 'checklist_files':
+            if (function_exists('pageChecklistItemFiles')) pageChecklistItemFiles(); break;
         case 'checklist_overview': if (function_exists('pageChecklistOverview')) pageChecklistOverview(); break;
         case 'checklist_audit': pageChecklistAudit(); break;
         case 'checklist_validate': if (function_exists('pageChecklistValidate')) pageChecklistValidate(); break;

@@ -184,6 +184,19 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 
 .btn-ghost-x{background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:12px;padding:0 4px}
 .btn-ghost-x:hover{color:var(--red)}
+/* Checklist: per-task all-time file badge + the files page gallery */
+.chk-file-badge{display:inline-flex;align-items:center;gap:3px;margin-left:6px;padding:1px 7px;border:1px solid var(--border);border-radius:999px;font-size:10px;font-weight:600;color:var(--muted);text-decoration:none;white-space:nowrap;vertical-align:middle}
+.chk-file-badge:hover{border-color:var(--accent);color:var(--accent)}
+.chk-file-badge.has-files{background:rgba(26,143,227,.14);border-color:rgba(26,143,227,.45);color:#9ed1f6}
+.chk-file-badge.has-files:hover{background:rgba(26,143,227,.24);color:#cbe7ff;border-color:var(--accent)}
+.chk-file-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
+.chk-file-card{display:block;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--bg);text-decoration:none;color:var(--text)}
+.chk-file-card:hover{border-color:var(--accent)}
+.chk-file-card .thumb{display:flex;align-items:center;justify-content:center;height:120px;background:rgba(140,140,160,.10);overflow:hidden}
+.chk-file-card .thumb img{width:100%;height:100%;object-fit:cover}
+.chk-file-card .thumb .doc-glyph{font-size:34px}
+.chk-file-card .meta{padding:6px 8px;font-size:11px;line-height:1.4}
+.chk-file-card .meta .name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 /* Searchable combobox (audit form pickers) */
 .combo-wrap{position:relative}
 .combo-input{padding-right:32px}
