@@ -180,6 +180,7 @@ function pageChecklistReport(): void {
 
     $responses = [];
     $valByItemDay = [];   // [item_id][day] => 'done' | 'not_done' (operation validation)
+    $attByItemDay = [];   // [item_id][day] => ['n','img'] (files the filler attached)
     $openByDay = []; $closeByDay = []; $bankingByDay = [];
     if ($haveScope) {
         $st = $db->prepare(
@@ -205,9 +206,15 @@ function pageChecklistReport(): void {
             }
         } catch (Exception $e) { /* table not migrated yet — no borders */ }
 
-        // Store opening/closing times from first IN / last OUT, 4AM shift cutoff
+        // Files attached against each answer — the marker in the cell corner
+        // and the per-task badge answer "did the manager attach a photo?".
         $monthStart = sprintf('%04d-%02d-01', $selectedYear, $selectedMonth);
         $monthEnd   = date('Y-m-t', strtotime($monthStart));
+        if (function_exists('checklistAttachmentCountsByItemDay')) {
+            $attByItemDay = checklistAttachmentCountsByItemDay($checklistId, $locationId, $monthStart, $monthEnd);
+        }
+
+        // Store opening/closing times from first IN / last OUT, 4AM shift cutoff
         $hours      = getStoreHoursData($locationId, $monthStart, $monthEnd);
         $days       = $hours[$locationId]['days'] ?? [];
         foreach ($days as $shiftDate => $info) {
@@ -351,6 +358,17 @@ function pageChecklistReport(): void {
                 <td style="text-align:left;white-space:normal;word-break:break-word">
                     <?= h($q['task_description']) ?>
                     <?= !$q['is_active'] ? '<span class="text-muted"> (Retired)</span>' : '' ?>
+                    <?php
+                    // Month total for this task, so the row itself says whether
+                    // anything was ever attached against this question.
+                    $rowAtt = $attByItemDay[(int)$q['id']] ?? [];
+                    $rowN = 0; $rowImg = 0;
+                    foreach ($rowAtt as $c) { $rowN += (int)$c['n']; $rowImg += (int)$c['img']; }
+                    if (function_exists('chkFileBadge')):
+                        echo chkFileBadge($checklistId, (int)$q['id'], $rowN, $rowImg, null,
+                                          $empMode ? null : $locationId,
+                                          sprintf('%04d-%02d-01', $selectedYear, $selectedMonth));
+                    endif; ?>
                 </td>
                 <?php for ($d = 1; $d <= $daysInMonth; $d++):
                     $val = $responses[$q['id']][$d] ?? '';
@@ -364,8 +382,24 @@ function pageChecklistReport(): void {
                     $vtitle = '';
                     if ($vstat === 'done')         { $style .= ';box-shadow:inset 0 0 0 2px var(--green)'; $vtitle = 'Validated: Done'; }
                     elseif ($vstat === 'not_done') { $style .= ';box-shadow:inset 0 0 0 2px var(--red)';   $vtitle = 'Validated: Not done'; }
+                    // A file attached on this day puts a dot in the cell corner
+                    // and turns the cell into a link to that day's files.
+                    $att     = $attByItemDay[(int)$q['id']][$d] ?? null;
+                    $attN    = (int)($att['n']   ?? 0);
+                    $attImg  = (int)($att['img'] ?? 0);
+                    $logDate = sprintf('%04d-%02d-%02d', $selectedYear, $selectedMonth, $d);
+                    if ($attN > 0) {
+                        $attTitle = ($attImg > 0
+                            ? $attImg . ' image(s)' . ($attN > $attImg ? ' + ' . ($attN - $attImg) . ' other file(s)' : '')
+                            : $attN . ' file(s)') . ' attached on ' . $logDate;
+                        $vtitle   = $vtitle ? $vtitle . ' · ' . $attTitle : $attTitle;
+                    }
                 ?>
-                    <td style="<?= $style ?>"<?= $vtitle ? ' title="' . h($vtitle) . '"' : '' ?>><?= h($val) ?></td>
+                    <td class="<?= $attN > 0 ? 'rpt-has-att' : '' ?>" style="<?= $style ?>"<?= $vtitle ? ' title="' . h($vtitle) . '"' : '' ?>>
+                        <?php if ($attN > 0): ?>
+                        <a class="rpt-att-link" href="?page=checklist_files&amp;id=<?= $checklistId ?>&amp;item_id=<?= (int)$q['id'] ?>&amp;on=<?= h($logDate) ?>&amp;date=<?= h($logDate) ?><?= $empMode ? '' : '&amp;location_id=' . (int)$locationId ?>"><?= h($val) ?></a>
+                        <?php else: ?><?= h($val) ?><?php endif; ?>
+                    </td>
                 <?php endfor; ?>
             </tr>
         <?php endforeach; ?>
@@ -485,6 +519,7 @@ function pageChecklistAudit(): void {
     $locFilterActive = count($selectedLocs) < count($allLocations);
 
     $locations = []; $itemsBySection = []; $responsesByLoc = []; $locTree = []; $valByLoc = [];
+    $attByLoc  = [];   // [location_id][item_id] => ['n','img'] for the chosen day
     if ($viewClicked) {
         $selSet    = array_flip($selectedLocs);
         $locations = array_values(array_filter(
@@ -549,6 +584,12 @@ function pageChecklistAudit(): void {
                 $valByLoc[(int)$row['location_id']][(int)$row['item_id']] = $row;
             }
         } catch (Exception $e) { /* table not migrated yet */ }
+
+        // Files attached to each answer on the chosen day — lets the auditor
+        // see at a glance which tasks came with a photo.
+        if (function_exists('checklistAttachmentCountsForDate')) {
+            $attByLoc = checklistAttachmentCountsForDate($checklistId, $filterDate);
+        }
 
         // Build the per-location tree (apply status filter at location level).
         foreach ($locations as $loc) {
@@ -811,7 +852,11 @@ function pageChecklistAudit(): void {
         ?>
         <tr>
             <td style="text-align:center;color:var(--muted)"><?= $sr++ ?></td>
-            <td style="white-space:normal;word-break:break-word"><?= h($it['task_description']) ?></td>
+            <td style="white-space:normal;word-break:break-word"><?= h($it['task_description']) ?>
+                <?php $at = $attByLoc[0][$iid] ?? null;
+                      if (function_exists('chkFileBadge'))
+                          echo chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, null, $filterDate); ?>
+            </td>
             <td><?php if ($r): ?><span style="font-weight:700;color:<?= $isNo ? 'var(--red)' : 'var(--green)' ?>"><?= h($r['response_value']) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
             <td style="color:var(--muted);font-size:12px">
                 <?php if ($r): ?><?= h($r['staff_member'] ?? $r['staff_code'] ?? '—') ?> · <?= h(date('H:i', strtotime($r['submitted_at']))) ?><?php else: ?>—<?php endif; ?>
@@ -881,6 +926,9 @@ function pageChecklistAudit(): void {
                     <div class="name" style="padding-left:74px">
                         <span class="diamond" aria-hidden="true">◆</span>
                         <span class="lbl"><?= h($it['task_description']) ?></span>
+                        <?php $at = $attByLoc[$locId][(int)$it['id']] ?? null;
+                              if (function_exists('chkFileBadge'))
+                                  echo chkFileBadge($checklistId, (int)$it['id'], (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, $locId, $filterDate); ?>
                     </div>
                     <div class="num">
                         <?php if ($r): ?>
@@ -1507,7 +1555,7 @@ function pageChecklistValidate(): void {
 
     $viewClicked = !empty($_GET['view']) || (!$empMode && $locationId > 0);
     $locationName = '';
-    $items = []; $responses = []; $vals = [];
+    $items = []; $responses = []; $vals = []; $atts = [];
     if ($viewClicked) {
         foreach ($locations as $loc) {
             if ((int)$loc['location_id'] === $locationId) { $locationName = $loc['location_name']; break; }
@@ -1523,6 +1571,13 @@ function pageChecklistValidate(): void {
         $vs = $db->prepare("SELECT item_id, status, remarks FROM chk_validations WHERE checklist_id = ? AND location_id = ? AND log_date = ?");
         $vs->execute([$checklistId, $locationId, $logDate]);
         foreach ($vs->fetchAll(PDO::FETCH_ASSOC) as $v) $vals[(int)$v['item_id']] = $v;
+
+        // What the filler attached against each task that day — the evidence
+        // the validator is being asked to sign off on.
+        if (function_exists('checklistAttachmentCountsForDate')) {
+            $byLoc = checklistAttachmentCountsForDate($checklistId, $logDate, $locationId);
+            $atts  = $byLoc[$locationId] ?? [];
+        }
     }
 ?>
 <div class="page-header"><h2>✔️ Validate Checklist</h2></div>
@@ -1594,7 +1649,11 @@ function pageChecklistValidate(): void {
             ?>
                 <tr>
                     <td style="text-align:center;color:var(--muted);font-size:12px"><?= $sr++ ?></td>
-                    <td style="white-space:normal;word-break:break-word"><?= h($it['task_description']) ?></td>
+                    <td style="white-space:normal;word-break:break-word"><?= h($it['task_description']) ?>
+                        <?php $at = $atts[$iid] ?? null;
+                              if (function_exists('chkFileBadge'))
+                                  echo chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $logDate, $empMode ? null : $locationId, $logDate); ?>
+                    </td>
                     <td>
                         <?php if ($resp !== ''): ?>
                         <span class="badge <?= mb_strtolower($resp) === 'no' ? 'badge-red' : 'badge-green' ?>"><?= h($resp) ?></span>
