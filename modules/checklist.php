@@ -356,7 +356,9 @@ function checklistItemFileCounts(int $checklistId, ?int $locationId): array {
 
 // Every file ever attached to one task, newest day first, carrying the day
 // and the answer it was filed against. Same optional scope rule as above.
-function checklistItemFiles(int $checklistId, ?int $locationId, int $itemId, int $limit = 200): array {
+// $onDate narrows to a single checklist day — what a report cell links to
+// when the viewer clicked the marker on one specific date.
+function checklistItemFiles(int $checklistId, ?int $locationId, int $itemId, int $limit = 200, ?string $onDate = null): array {
     $sql = 'SELECT a.id, a.filename, a.mime_type, a.file_size, a.uploaded_by, a.uploaded_at,
                    r.log_date, r.location_id, r.response_value, r.employee_code,
                    e.full_name AS uploader_name
@@ -366,6 +368,7 @@ function checklistItemFiles(int $checklistId, ?int $locationId, int $itemId, int
             WHERE r.checklist_id = ? AND r.item_id = ?';
     $args = [$checklistId, $itemId];
     if ($locationId !== null) { $sql .= ' AND r.location_id = ?'; $args[] = $locationId; }
+    if ($onDate !== null)     { $sql .= ' AND r.log_date = ?';    $args[] = $onDate; }
     $sql .= ' ORDER BY r.log_date DESC, a.uploaded_at DESC, a.id DESC LIMIT ' . max(1, $limit);
     try {
         $st = getDb()->prepare($sql);
@@ -376,6 +379,84 @@ function checklistItemFiles(int $checklistId, ?int $locationId, int $itemId, int
     $rows = $st->fetchAll(PDO::FETCH_ASSOC);
     foreach ($rows as &$r) $r['is_image'] = stripos((string)$r['mime_type'], 'image/') === 0;
     return $rows;
+}
+
+// ── Attachment markers for the report views ───────────────
+// Reports ask a narrower question than the fill view: "did the store
+// manager attach anything against THIS task on THIS day?" Both helpers
+// count files and images separately, so a report can say "photo" rather
+// than the vaguer "file".
+
+// One day, every location: [location_id][item_id] => ['n' => int, 'img' => int].
+// Used by the audit report (a day across outlets) and the validate page
+// (pass $locationId to narrow it to one).
+function checklistAttachmentCountsForDate(int $checklistId, string $logDate, ?int $locationId = null): array {
+    $sql = "SELECT r.location_id, r.item_id, COUNT(*) AS n,
+                   SUM(CASE WHEN a.mime_type LIKE 'image/%' THEN 1 ELSE 0 END) AS img
+            FROM chk_response_attachments a
+            JOIN chk_daily_responses r ON r.id = a.response_id
+            WHERE r.checklist_id = ? AND r.log_date = ?";
+    $args = [$checklistId, $logDate];
+    if ($locationId !== null) { $sql .= ' AND r.location_id = ?'; $args[] = $locationId; }
+    $sql .= ' GROUP BY r.location_id, r.item_id';
+    try {
+        $st = getDb()->prepare($sql);
+        $st->execute($args);
+    } catch (Exception $e) {
+        return [];
+    }
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $out[(int)$r['location_id']][(int)$r['item_id']] = ['n' => (int)$r['n'], 'img' => (int)$r['img']];
+    }
+    return $out;
+}
+
+// One month, one location: [item_id][day-of-month] => ['n' => int, 'img' => int].
+// Feeds the marker in each cell of the monthly report grid.
+function checklistAttachmentCountsByItemDay(int $checklistId, int $locationId, string $from, string $to): array {
+    $sql = "SELECT r.item_id, r.log_date, COUNT(*) AS n,
+                   SUM(CASE WHEN a.mime_type LIKE 'image/%' THEN 1 ELSE 0 END) AS img
+            FROM chk_response_attachments a
+            JOIN chk_daily_responses r ON r.id = a.response_id
+            WHERE r.checklist_id = ? AND r.location_id = ? AND r.log_date BETWEEN ? AND ?
+            GROUP BY r.item_id, r.log_date";
+    try {
+        $st = getDb()->prepare($sql);
+        $st->execute([$checklistId, $locationId, $from, $to]);
+    } catch (Exception $e) {
+        return [];
+    }
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $day = (int)date('j', strtotime((string)$r['log_date']));
+        $out[(int)$r['item_id']][$day] = ['n' => (int)$r['n'], 'img' => (int)$r['img']];
+    }
+    return $out;
+}
+
+// The shared badge the reports (and the fill view) put next to a task.
+// $n = 0 renders a muted "none" — a report must answer "or not", so the
+// badge is always drawn and always clickable.
+// $onDate opens the files page filtered to that single day; $locationId is
+// passed through for viewers looking at an outlet other than their own.
+function chkFileBadge(int $checklistId, int $itemId, int $n, int $img = 0,
+                      ?string $onDate = null, ?int $locationId = null, string $backDate = ''): string {
+    $url = '?page=checklist_files&amp;id=' . $checklistId . '&amp;item_id=' . $itemId;
+    if ($backDate !== '')      $url .= '&amp;date=' . h($backDate);
+    if ($onDate !== null)      $url .= '&amp;on=' . h($onDate);
+    if ($locationId !== null)  $url .= '&amp;location_id=' . (int)$locationId;
+    if ($n <= 0) {
+        $title = 'No file attached' . ($onDate !== null ? ' on this day' : '');
+        return '<a class="chk-file-badge" href="' . $url . '" title="' . h($title) . '">'
+             . chkClipIcon(11) . 'none</a>';
+    }
+    $title = $img > 0
+        ? ($img . ' image(s)' . ($n > $img ? ' + ' . ($n - $img) . ' other file(s)' : '') . ' attached')
+        : ($n . ' file(s) attached');
+    $icon = $img > 0 ? chkImageIcon(11) : chkClipIcon(11);
+    return '<a class="chk-file-badge has-files" href="' . $url . '" title="' . h($title) . '">'
+         . $icon . $n . '</a>';
 }
 
 // Human file size for the attachment cards.
@@ -1374,9 +1455,9 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                     <td class="chk-particular">
                         <?= h($t['task_description']) ?>
                         <?php
-                        // 📎 badge — all-time file count for this task in the
-                        // current scope. Always a link, so "no files" is an
-                        // answer you can click through to and confirm.
+                        // Paperclip badge — all-time file count for this task
+                        // in the current scope. Always a link, so "no files"
+                        // is an answer you can click through to and confirm.
                         $fc      = $itemFileCounts[(int)$t['id']] ?? null;
                         $fcN     = (int)($fc['n'] ?? 0);
                         $fcLast  = (string)($fc['last_date'] ?? '');
@@ -1664,11 +1745,13 @@ function pageChecklistItemFiles(): void {
         flash('error', 'Checklist not found.');
         header('Location: index.php?page=checklist'); exit;
     }
-    // Same visibility rule as a single attachment: report/manage roles see
-    // everything, everyone else must be able to fill (or validate) this
-    // checklist — and then only within their own scope, below.
-    $canSeeAll = isSuperadmin() || hasTxn('checklist_report') || chkCanManageChecklist($cl);
-    if (!$canSeeAll && !chkCanFill($cl, $me) && !chkIsValidator($checklistId, $me)) {
+    // Same visibility rule as a single attachment: report / manage roles and
+    // this checklist's designated validators see every outlet (the validate
+    // page lets them pick any), everyone else must be able to fill it — and
+    // then only within their own scope, below.
+    $canSeeAll = isSuperadmin() || hasTxn('checklist_report')
+              || chkCanManageChecklist($cl) || chkIsValidator($checklistId, $me);
+    if (!$canSeeAll && !chkCanFill($cl, $me)) {
         flash('error', 'You are not assigned to this checklist.');
         header('Location: index.php?page=checklist'); exit;
     }
@@ -1702,8 +1785,19 @@ function pageChecklistItemFiles(): void {
     }
     $noLocation = $isLoc && !$canSeeAll && $myLoc <= 0;
 
+    // ?on=YYYY-MM-DD narrows to one checklist day — where a report marker
+    // for a specific date lands. Without it the whole history is listed.
+    $onDate = trim((string)($_GET['on'] ?? ''));
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $onDate)) $onDate = null;
+
     $LIMIT = 200;
-    $files = $noLocation ? [] : checklistItemFiles($checklistId, $scopeLoc, $itemId, $LIMIT);
+    $files = $noLocation ? [] : checklistItemFiles($checklistId, $scopeLoc, $itemId, $LIMIT, $onDate);
+    // A day marker that leads to an empty page is worse than useless — when
+    // the scope hides that day's files, fall back to the full history.
+    if ($onDate !== null && !$files) {
+        $files  = $noLocation ? [] : checklistItemFiles($checklistId, $scopeLoc, $itemId, $LIMIT);
+        $onDate = null;
+    }
 
     // Group by the checklist day the file was filed against.
     $byDate = [];
@@ -1711,11 +1805,30 @@ function pageChecklistItemFiles(): void {
 
     $backDate = (string)($_GET['date'] ?? '');
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $backDate)) $backDate = checklistEffectiveDate($cl);
-    $backUrl  = '?page=checklist&id=' . $checklistId . '&date=' . h($backDate);
-    $scopeUrl = function (string $loc) use ($checklistId, $itemId, $backDate): string {
+    $backUrl   = '?page=checklist&id=' . $checklistId . '&date=' . h($backDate);
+    $backLabel = 'Back to checklist';
+    // Arriving from a report? Send them back to the report they were reading
+    // rather than to the fill view. Same-origin index.php query strings only.
+    $ref = (string)($_SERVER['HTTP_REFERER'] ?? '');
+    if ($ref !== '') {
+        $p = parse_url($ref);
+        $sameHost = empty($p['host']) || strcasecmp((string)$p['host'], (string)($_SERVER['HTTP_HOST'] ?? '')) === 0;
+        parse_str((string)($p['query'] ?? ''), $rq);
+        $refPage = (string)($rq['page'] ?? '');
+        if ($sameHost && in_array($refPage, ['checklist_report', 'checklist_audit', 'checklist_validate'], true)) {
+            $backUrl   = '?' . http_build_query($rq);
+            $backLabel = 'Back to report';
+        }
+    }
+    $scopeUrl = function (string $loc) use ($checklistId, $itemId, $backDate, $onDate): string {
         return '?page=checklist_files&id=' . $checklistId . '&item_id=' . $itemId
-             . '&date=' . h($backDate) . '&location_id=' . h($loc);
+             . '&date=' . h($backDate) . ($onDate !== null ? '&on=' . h($onDate) : '')
+             . '&location_id=' . h($loc);
     };
+    // Same page without the single-day filter.
+    $allDatesUrl = '?page=checklist_files&id=' . $checklistId . '&item_id=' . $itemId
+                 . '&date=' . h($backDate)
+                 . ($isLoc && $canSeeAll ? '&location_id=' . ($scopeAll ? 'all' : (int)$scopeLoc) : '');
     // Outlet names, resolved once each — the all-outlets view labels every card.
     $nameCache = [];
     $locName = function (int $id) use (&$nameCache): string {
@@ -1728,7 +1841,7 @@ function pageChecklistItemFiles(): void {
     };
 ?>
 <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-    <a href="<?= $backUrl ?>" class="btn btn-ghost btn-sm">&lsaquo; Back to checklist</a>
+    <a href="<?= h($backUrl) ?>" class="btn btn-ghost btn-sm">&lsaquo; <?= h($backLabel) ?></a>
     <h2 style="margin:0;display:inline-flex;align-items:center;gap:8px"><?= chkClipIcon(18) ?> Task files</h2>
 </div>
 
@@ -1744,7 +1857,13 @@ function pageChecklistItemFiles(): void {
         <?php endif; ?>
         <span><?= $isLoc ? ($scopeAll ? 'All outlets' : h($locName((int)$scopeLoc))) : 'Department checklist' ?></span>
         <span>·</span>
+        <?php if ($onDate !== null): ?>
+        <span><strong><?= count($files) ?></strong> file(s) on <strong><?= h(date('d M Y', strtotime($onDate))) ?></strong></span>
+        <span>·</span>
+        <a href="<?= $allDatesUrl ?>" style="color:var(--accent)">Show all dates</a>
+        <?php else: ?>
         <span><strong><?= count($files) ?></strong> file(s) across <strong><?= count($byDate) ?></strong> day(s)</span>
+        <?php endif; ?>
     </div>
     <?php if ($isLoc && $canSeeAll): ?>
     <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
@@ -1763,6 +1882,12 @@ function pageChecklistItemFiles(): void {
     No files have been attached to this task<?= $isLoc && !$scopeAll ? ' for this outlet' : '' ?> yet.
 </div>
 <?php else: ?>
+<?php if ($onDate !== null): ?>
+<div class="alert" style="margin-bottom:12px;background:rgba(26,143,227,.10);color:var(--text);border:1px solid rgba(26,143,227,.30)">
+    Showing <strong><?= h(date('d M Y', strtotime($onDate))) ?></strong> only —
+    <a href="<?= $allDatesUrl ?>" style="color:var(--accent)">see every day this task has files</a>.
+</div>
+<?php endif; ?>
 <?php if (count($files) >= $LIMIT): ?>
 <div class="alert" style="background:rgba(201,168,0,.10);color:var(--yellow);border:1px solid rgba(201,168,0,.30)">
     Showing the most recent <?= $LIMIT ?> files only.

@@ -185,10 +185,16 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 .btn-ghost-x{background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:12px;padding:0 4px}
 .btn-ghost-x:hover{color:var(--red)}
 /* Checklist: per-task all-time file badge + the files page gallery */
-.chk-file-badge{display:inline-flex;align-items:center;gap:3px;margin-left:6px;padding:1px 7px;border:1px solid var(--border);border-radius:999px;font-size:10px;font-weight:600;color:var(--muted);text-decoration:none;white-space:nowrap;vertical-align:middle}
+.chk-file-badge{display:inline-flex;align-items:center;gap:3px;flex:0 0 auto;margin-left:6px;padding:1px 7px;border:1px solid var(--border);border-radius:999px;font-size:10px;font-weight:600;color:var(--muted);text-decoration:none;white-space:nowrap;vertical-align:middle}
 .chk-file-badge:hover{border-color:var(--accent);color:var(--accent)}
 .chk-file-badge.has-files{background:rgba(26,143,227,.14);border-color:rgba(26,143,227,.45);color:#9ed1f6}
 .chk-file-badge.has-files:hover{background:rgba(26,143,227,.24);color:#cbe7ff;border-color:var(--accent)}
+/* Monthly report cell that carries an attachment: dot in the corner, whole
+   cell links through to that day's files. */
+.rpt-has-att{position:relative}
+.rpt-has-att::after{content:'';position:absolute;top:2px;right:2px;width:5px;height:5px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 1px rgba(0,0,0,.35)}
+.rpt-att-link{display:block;min-height:13px;color:inherit;text-decoration:none}
+.rpt-att-link:hover{text-decoration:underline}
 .chk-file-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px}
 .chk-file-card{display:block;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--bg);text-decoration:none;color:var(--text)}
 .chk-file-card:hover{border-color:var(--accent)}
