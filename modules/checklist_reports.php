@@ -520,6 +520,11 @@ function pageChecklistAudit(): void {
 
     $locations = []; $itemsBySection = []; $responsesByLoc = []; $locTree = []; $valByLoc = [];
     $attByLoc  = [];   // [location_id][item_id] => ['n','img'] for the chosen day
+    $minsByLoc = [];   // [location_id][item_id] => minutes noted against the task
+    // Per-task time is optional: it needs chk_daily_responses.time_minutes and
+    // fmtMinutes() from the time-tracking module. Without both, the report
+    // renders exactly as it did before.
+    $timeUi = function_exists('chkHasTaskTime') && chkHasTaskTime() && function_exists('fmtMinutes');
     if ($viewClicked) {
         $selSet    = array_flip($selectedLocs);
         $locations = array_values(array_filter(
@@ -570,6 +575,24 @@ function pageChecklistAudit(): void {
             $responsesByLoc[(int)$row['location_id']][(int)$row['item_id']] = $row;
         }
 
+        // Minutes noted against each task that day. Several people can answer
+        // one outlet's day (the unique key includes employee_code), so the
+        // time for a task is the sum of what each of them logged.
+        if ($timeUi) {
+            try {
+                $tst = $db->prepare(
+                    "SELECT location_id, item_id, SUM(time_minutes) AS mins
+                     FROM chk_daily_responses
+                     WHERE checklist_id = ? AND log_date = ? AND time_minutes IS NOT NULL
+                     GROUP BY location_id, item_id"
+                );
+                $tst->execute([$checklistId, $filterDate]);
+                foreach ($tst->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                    $minsByLoc[(int)$row['location_id']][(int)$row['item_id']] = (int)$row['mins'];
+                }
+            } catch (Exception $e) { /* column not migrated — no time column */ }
+        }
+
         // Operation-team validations for the chosen day, indexed by [locId][itemId].
         try {
             $valSt = $db->prepare(
@@ -596,21 +619,25 @@ function pageChecklistAudit(): void {
             $locId = (int)$loc['location_id'];
             $resps = $responsesByLoc[$locId] ?? [];
 
+            $mins  = $minsByLoc[$locId] ?? [];
+
             $secStats = [];
-            $locTotal = 0; $locDone = 0;
+            $locTotal = 0; $locDone = 0; $locMins = 0;
             foreach ($sections as $sec) {
                 $items = $itemsBySection[$sec] ?? [];
                 $total = count($items);
-                $done  = 0;
+                $done  = 0; $secMins = 0;
                 foreach ($items as $it) {
                     if (isset($resps[(int)$it['id']])) $done++;
+                    $secMins += (int)($mins[(int)$it['id']] ?? 0);
                 }
                 $locTotal += $total;
                 $locDone  += $done;
+                $locMins  += $secMins;
                 if    ($total > 0 && $done >= $total) { $st = 'complete'; }
                 elseif ($done > 0)                     { $st = 'partial';  }
                 else                                   { $st = 'pending';  }
-                $secStats[$sec] = ['total' => $total, 'done' => $done, 'status' => $st];
+                $secStats[$sec] = ['total' => $total, 'done' => $done, 'status' => $st, 'mins' => $secMins];
             }
 
             if    ($locTotal > 0 && $locDone >= $locTotal) { $locStatus = 'complete'; }
@@ -623,6 +650,7 @@ function pageChecklistAudit(): void {
                 'loc'      => $loc,
                 'total'    => $locTotal,
                 'done'     => $locDone,
+                'mins'     => $locMins,
                 'status'   => $locStatus,
                 'sections' => $secStats,
             ];
@@ -729,6 +757,11 @@ function pageChecklistAudit(): void {
 .chk-tree-cat{border-bottom:1px solid var(--border)}
 .chk-tree-cat:last-child{border-bottom:none}
 .chk-tree-row{display:grid;grid-template-columns:1fr 120px 220px;gap:6px;align-items:center;padding:9px 14px;color:var(--text)}
+/* With per-task time on, a Time column sits between Status and Filled. */
+.chk-tree.with-time .chk-tree-head,
+.chk-tree.with-time .chk-tree-row{grid-template-columns:1fr 120px 84px 220px}
+.chk-tree-row .mins{display:inline-flex;align-items:center;gap:4px;justify-content:flex-end;white-space:nowrap}
+.chk-tree-row .mins.none{color:var(--muted)}
 .chk-tree-row .name{display:flex;align-items:center;gap:8px;min-width:0;color:var(--text)}
 .chk-tree-row .name .lbl{overflow:hidden;text-overflow:ellipsis;color:var(--text)}
 .chk-tree-row .num{text-align:right;font-variant-numeric:tabular-nums;font-size:13px;color:var(--text)}
@@ -748,6 +781,8 @@ function pageChecklistAudit(): void {
 .status-pill.pending{background:rgba(220,64,64,.20);color:var(--red)}
 @media (max-width: 720px){
     .chk-tree-head,.chk-tree-row{grid-template-columns:1fr 90px 140px;gap:4px;padding:8px 10px}
+    .chk-tree.with-time .chk-tree-head,
+    .chk-tree.with-time .chk-tree-row{grid-template-columns:1fr 82px 62px 120px}
 }
 </style>
 
@@ -829,22 +864,30 @@ function pageChecklistAudit(): void {
     // shown as a flat section → task list rather than a location tree.
     $resps0 = $responsesByLoc[0] ?? [];
     $vals0  = $valByLoc[0] ?? [];
-    $aDone = 0; $aTotal = 0;
-    foreach ($sections as $sec) foreach (($itemsBySection[$sec] ?? []) as $it) { $aTotal++; if (isset($resps0[(int)$it['id']])) $aDone++; }
+    $mins0  = $minsByLoc[0] ?? [];
+    $aDone = 0; $aTotal = 0; $aMins = 0;
+    foreach ($sections as $sec) foreach (($itemsBySection[$sec] ?? []) as $it) {
+        $aTotal++;
+        if (isset($resps0[(int)$it['id']])) $aDone++;
+        $aMins += (int)($mins0[(int)$it['id']] ?? 0);
+    }
+    $colspan = $timeUi ? 5 : 4;
 ?>
 <div class="text-muted" style="margin-bottom:8px">
-    <strong><?= h($checklistName) ?></strong> — <?= h(date('D, d M Y', strtotime($filterDate))) ?> · <?= $aDone ?>/<?= $aTotal ?> filled
+    <strong><?= h($checklistName) ?></strong> — <?= h(date('D, d M Y', strtotime($filterDate))) ?> · <?= $aDone ?>/<?= $aTotal ?> filled<?php
+    if ($timeUi && $aMins > 0): ?> · <?= chkClockIcon(12) ?> <?= h(fmtMinutes($aMins)) ?> noted<?php endif; ?>
 </div>
 <div class="table-wrap"><table class="table" style="font-size:13px">
     <thead><tr>
         <th style="width:48px;text-align:center">#</th>
         <th>Task</th>
         <th style="width:110px">Response</th>
+        <?php if ($timeUi): ?><th style="width:90px">Time</th><?php endif; ?>
         <th style="width:320px">Filled / Validation</th>
     </tr></thead>
     <tbody>
     <?php $sr = 1; foreach ($sections as $sec): $secItems = $itemsBySection[$sec] ?? []; if (!$secItems) continue; ?>
-        <tr><td colspan="4" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px"><?= h($sec) ?></td></tr>
+        <tr><td colspan="<?= $colspan ?>" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px"><?= h($sec) ?></td></tr>
         <?php foreach ($secItems as $it):
             $iid = (int)$it['id']; $r = $resps0[$iid] ?? null;
             $isNo = $r && mb_strtolower($r['response_value']) === 'no';
@@ -858,6 +901,9 @@ function pageChecklistAudit(): void {
                           echo chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, null, $filterDate); ?>
             </td>
             <td><?php if ($r): ?><span style="font-weight:700;color:<?= $isNo ? 'var(--red)' : 'var(--green)' ?>"><?= h($r['response_value']) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
+            <?php if ($timeUi): $im = (int)($mins0[$iid] ?? 0); ?>
+            <td style="white-space:nowrap"><?php if ($im > 0): ?><span style="display:inline-flex;align-items:center;gap:4px"><?= chkClockIcon(12) ?><?= h(fmtMinutes($im)) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
+            <?php endif; ?>
             <td style="color:var(--muted);font-size:12px">
                 <?php if ($r): ?><?= h($r['staff_member'] ?? $r['staff_code'] ?? '—') ?> · <?= h(date('H:i', strtotime($r['submitted_at']))) ?><?php else: ?>—<?php endif; ?>
                 <?php if ($cv): $cvDone = $cv['status'] === 'done'; ?>
@@ -870,17 +916,29 @@ function pageChecklistAudit(): void {
     </tbody>
 </table></div>
 <?php else: ?>
+<?php $treeMins = 0; foreach ($locTree as $n) $treeMins += (int)($n['mins'] ?? 0); ?>
 <div class="text-muted" style="margin-bottom:8px">
-    Tree for <strong><?= h(date('D, d M Y', strtotime($filterDate))) ?></strong> — <?= count($locTree) ?> location<?= count($locTree) === 1 ? '' : 's' ?> shown.
+    Tree for <strong><?= h(date('D, d M Y', strtotime($filterDate))) ?></strong> — <?= count($locTree) ?> location<?= count($locTree) === 1 ? '' : 's' ?> shown<?php
+    if ($timeUi && $treeMins > 0): ?> · <?= chkClockIcon(12) ?> <?= h(fmtMinutes($treeMins)) ?> noted across them<?php endif; ?>.
 </div>
 
 <?php if (!$locTree): ?>
 <div class="rpt-prompt">No locations match the current filters for <strong><?= h(date('d M Y', strtotime($filterDate))) ?></strong>.</div>
 <?php else: ?>
-<div class="chk-tree">
+<?php
+// Renders one cell of the Time column: the minutes noted, or a muted dash.
+$minsCell = function (int $m) use ($timeUi): string {
+    if (!$timeUi) return '';
+    if ($m <= 0) return '<div class="num"><span class="mins none">—</span></div>';
+    return '<div class="num"><span class="mins" title="Time noted: ' . h(fmtMinutes($m)) . '">'
+         . (function_exists('chkClockIcon') ? chkClockIcon(12) : '') . h(fmtMinutes($m)) . '</span></div>';
+};
+?>
+<div class="chk-tree<?= $timeUi ? ' with-time' : '' ?>">
     <div class="chk-tree-head">
         <div>Location / Section / Task</div>
         <div class="num">Status</div>
+        <?php if ($timeUi): ?><div class="num">Time</div><?php endif; ?>
         <div class="num">Filled</div>
     </div>
     <?php foreach ($locTree as $node):
@@ -896,6 +954,7 @@ function pageChecklistAudit(): void {
                 <span class="lbl"><?= h($loc['location_name']) ?></span>
             </div>
             <div class="num"><span class="status-pill <?= h($node['status']) ?>"><?= h(ucfirst($node['status'])) ?></span></div>
+            <?= $minsCell((int)$node['mins']) ?>
             <div class="num"><?= (int)$node['done'] ?>/<?= (int)$node['total'] ?></div>
         </div>
         <div class="chk-tree-children<?= $isOpen ? '' : ' collapsed' ?>">
@@ -910,12 +969,14 @@ function pageChecklistAudit(): void {
                     <span class="lbl"><?= h($sec) ?></span>
                 </div>
                 <div class="num"><span class="status-pill <?= h($stat['status']) ?>"><?= h(ucfirst($stat['status'])) ?></span></div>
+                <?= $minsCell((int)($stat['mins'] ?? 0)) ?>
                 <div class="num"><?= (int)$stat['done'] ?>/<?= (int)$stat['total'] ?></div>
             </div>
             <?php if (!$secItems): ?>
                 <div class="chk-tree-row item-row empty">
                     <div class="name" style="padding-left:74px"><em>No active items in this section.</em></div>
                     <div class="num">—</div>
+                    <?php if ($timeUi): ?><div class="num">—</div><?php endif; ?>
                     <div class="num">—</div>
                 </div>
             <?php else: foreach ($secItems as $it):
@@ -937,6 +998,7 @@ function pageChecklistAudit(): void {
                             <span style="color:var(--muted)">—</span>
                         <?php endif; ?>
                     </div>
+                    <?= $minsCell((int)($minsByLoc[$locId][(int)$it['id']] ?? 0)) ?>
                     <div class="num" style="color:var(--muted)">
                         <?php if ($r): ?>
                             <?= h($r['staff_member'] ?? $r['staff_code'] ?? '—') ?> · <?= h(date('H:i', strtotime($r['submitted_at']))) ?>
