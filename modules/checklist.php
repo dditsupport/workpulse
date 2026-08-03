@@ -588,6 +588,31 @@ function chkClockIcon(int $px = 13): string {
          . '<polyline points="12 6 12 12 16 14"/></svg>';
 }
 
+// Attachment glyphs, same reasoning as the clock above: inline SVG so they
+// take the surrounding text colour instead of whatever the device's emoji
+// font paints (📎 / 🖼 / 📄 render as flat grey boxes on most Windows
+// browsers). Paperclip = "files", picture = an image attachment, sheet =
+// any other document.
+function chkSvgIcon(string $body, int $px, string $extraStyle = ''): string {
+    return '<svg width="' . $px . '" height="' . $px . '" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+         . ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"'
+         . ' style="vertical-align:-2px;flex:none' . ($extraStyle ? ';' . $extraStyle : '') . '">'
+         . $body . '</svg>';
+}
+function chkClipIcon(int $px = 12): string {
+    return chkSvgIcon('<path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66'
+                    . 'l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>', $px);
+}
+function chkImageIcon(int $px = 12): string {
+    return chkSvgIcon('<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>'
+                    . '<circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>', $px);
+}
+function chkDocIcon(int $px = 12): string {
+    return chkSvgIcon('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>'
+                    . '<polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/>'
+                    . '<line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>', $px);
+}
+
 // Is chk_daily_responses.time_minutes there? Per-task time entry is hidden
 // until the column is added, so the module keeps working on a database
 // that has not run the migration.
@@ -1361,7 +1386,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                         ?>
                         <a class="chk-file-badge<?= $fcN > 0 ? ' has-files' : '' ?>"
                            href="?page=checklist_files&amp;id=<?= $checklistId ?>&amp;item_id=<?= (int)$t['id'] ?>&amp;date=<?= h($displayDate) ?>"
-                           title="<?= h($fcTitle) ?>">📎 <?= $fcN > 0 ? (int)$fcN : 'none' ?></a>
+                           title="<?= h($fcTitle) ?>"><?= chkClipIcon(11) ?><?= $fcN > 0 ? (int)$fcN : 'none' ?></a>
                     </td>
                     <td class="chk-answer">
                         <?php
@@ -1434,7 +1459,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                                            href="?page=download_checklist_attachment&att_id=<?= (int)$att['id'] ?>"
                                            title="<?= h($att['uploader_name'] ?? $att['uploaded_by']) . ' · ' . h($att['uploaded_at']) ?>"
                                            style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border:1px solid var(--border);border-radius:999px;font-size:11px;color:var(--text);text-decoration:none;background:rgba(255,255,255,.04)">
-                                            <?= $att['is_image'] ? '🖼' : '📎' ?>
+                                            <?= $att['is_image'] ? chkImageIcon(12) : chkClipIcon(12) ?>
                                             <span style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= h($att['filename']) ?></span>
                                         </a>
                                         <?php if ($cellEditable && (string)$att['uploaded_by'] === myCode()): ?>
@@ -1704,7 +1729,7 @@ function pageChecklistItemFiles(): void {
 ?>
 <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
     <a href="<?= $backUrl ?>" class="btn btn-ghost btn-sm">&lsaquo; Back to checklist</a>
-    <h2 style="margin:0">📎 Task files</h2>
+    <h2 style="margin:0;display:inline-flex;align-items:center;gap:8px"><?= chkClipIcon(18) ?> Task files</h2>
 </div>
 
 <div class="table-wrap" style="padding:14px;margin-bottom:14px">
@@ -1774,7 +1799,7 @@ function pageChecklistItemFiles(): void {
                     <img src="?page=download_checklist_attachment&amp;att_id=<?= (int)$f['id'] ?>"
                          alt="<?= h($f['filename']) ?>" loading="lazy">
                 <?php else: ?>
-                    <span class="doc-glyph">📄</span>
+                    <span class="doc-glyph"><?= chkDocIcon(34) ?></span>
                 <?php endif; ?>
             </span>
             <span class="meta">

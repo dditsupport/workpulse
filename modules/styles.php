@@ -194,7 +194,7 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 .chk-file-card:hover{border-color:var(--accent)}
 .chk-file-card .thumb{display:flex;align-items:center;justify-content:center;height:120px;background:rgba(140,140,160,.10);overflow:hidden}
 .chk-file-card .thumb img{width:100%;height:100%;object-fit:cover}
-.chk-file-card .thumb .doc-glyph{font-size:34px}
+.chk-file-card .thumb .doc-glyph{display:flex;color:var(--muted)}
 .chk-file-card .meta{padding:6px 8px;font-size:11px;line-height:1.4}
 .chk-file-card .meta .name{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
 /* Searchable combobox (audit form pickers) */
