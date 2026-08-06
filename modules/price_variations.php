@@ -1,6 +1,6 @@
 <?php
 // =========================================================
-// Price Variation — aggregator (Swiggy/Zomato) variance reporting
+// Price Variation — aggregator (Swiggy/Zomato/Toing) variance reporting
 //
 // Manager submits an order: partner + N items + the aggregator's
 // reported subtotal/discount/tax/net. The system compares the net
@@ -275,6 +275,43 @@ function pvHas6xCol(): bool {
     return $cached;
 }
 
+// ── Partners ────────────────────────────────────────────
+// Single source of truth for the aggregator list: the submit validator,
+// the New Variation radios, the list filter and the JS all read this, so
+// a partner can't end up offered in one place and rejected in another.
+//
+// Toing is gated on migration_2026_08_06_pv_toing.sql having extended the
+// partner enum. Reading the column type rather than a column's existence
+// is the enum equivalent of pvHas5xCol() — until the migration runs the
+// option stays hidden instead of being offered and then rejected by the
+// column on INSERT. That makes PHP-before-SQL deployment safe.
+function pvHasToingPartner(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        $col = getDb()->query("SHOW COLUMNS FROM price_variations LIKE 'partner'")
+                      ->fetch(PDO::FETCH_ASSOC);
+        $cached = $col !== false && stripos((string)($col['Type'] ?? ''), "'toing'") !== false;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
+// Ordered map of partner key => display label.
+function pvPartners(): array {
+    $p = ['swiggy' => 'Swiggy', 'zomato' => 'Zomato'];
+    if (pvHasToingPartner()) $p['toing'] = 'Toing';
+    return $p;
+}
+
+// Which bill-reference screenshot a partner uses on the New Variation
+// form. Toing's bills are laid out like Swiggy's, so it reuses those
+// assets rather than shipping duplicates.
+function pvRefImageFor(string $partner): string {
+    return $partner === 'zomato' ? 'zomato' : 'swiggy';
+}
+
 // ── Slot activity flag ──────────────────────────────────
 // Admins flip slots on/off via the Slot Activity panel on the Master
 // Price List page. The flag controls DISPLAY only — the DB always
@@ -346,7 +383,7 @@ function pvBuildVariationsFilter(array $f): array {
         $where .= ' AND v.location_id = ?';
         $p[] = (int)$f['location_id'];
     }
-    if (!empty($f['partner']) && in_array($f['partner'], ['swiggy','zomato'], true)) {
+    if (!empty($f['partner']) && array_key_exists($f['partner'], pvPartners())) {
         $where .= ' AND v.partner = ?';
         $p[] = $f['partner'];
     }
@@ -932,9 +969,13 @@ function doSubmitPriceVariation(): void {
     } catch (Exception $e) {}
     if (!$locRow) { flash('error', 'Store not found or inactive.'); header('Location: index.php?page=price_variation_new'); exit; }
 
-    $partner = $_POST['partner'] ?? '';
-    if (!in_array($partner, ['swiggy', 'zomato'], true)) {
-        flash('error', 'Pick Swiggy or Zomato.'); header('Location: index.php?page=price_variation_new'); exit;
+    $partner  = $_POST['partner'] ?? '';
+    $partners = pvPartners();
+    if (!array_key_exists($partner, $partners)) {
+        // Naming the accepted partners keeps the message honest when the
+        // Toing migration hasn't run yet and the option isn't on offer.
+        flash('error', 'Pick ' . implode(' or ', array_values($partners)) . '.');
+        header('Location: index.php?page=price_variation_new'); exit;
     }
 
     $orderId = trim($_POST['order_id'] ?? '');
@@ -2463,9 +2504,10 @@ function pagePriceVariationNew(): void {
     <div class="form-grid" style="grid-template-columns:repeat(2,1fr);max-width:840px">
         <div class="form-group">
             <label>Partner <span class="required">*</span></label>
-            <div style="display:flex;gap:24px;padding:6px 0">
-                <label class="checkbox-label" style="cursor:pointer"><input type="radio" name="partner" value="swiggy" required> Swiggy</label>
-                <label class="checkbox-label" style="cursor:pointer"><input type="radio" name="partner" value="zomato"> Zomato</label>
+            <div style="display:flex;gap:24px;padding:6px 0;flex-wrap:wrap">
+                <?php $pvFirstPartner = true; foreach (pvPartners() as $pKey => $pLabel): ?>
+                <label class="checkbox-label" style="cursor:pointer"><input type="radio" name="partner" value="<?= h($pKey) ?>"<?= $pvFirstPartner ? ' required' : '' ?>> <?= h($pLabel) ?></label>
+                <?php $pvFirstPartner = false; endforeach; ?>
             </div>
         </div>
         <div class="form-group">
@@ -2512,7 +2554,7 @@ function pagePriceVariationNew(): void {
         </div>
         <input type="number" id="pv-entry-qty" min="1" step="1" value="1" title="Quantity">
         <input type="number" id="pv-entry-total" min="0" step="0.01" placeholder="Total ₹ *"
-               title="Line total as shown on the Swiggy/Zomato bill (required)">
+               title="Line total as shown on the partner bill (required)">
         <button type="button" id="pv-entry-add" class="pv-entry-add" disabled>+ Add</button>
     </div>
 
@@ -2686,6 +2728,18 @@ function pagePriceVariationNew(): void {
     const PV_COLSPAN = <?= (int)$itemsColspan ?>;
     const slotOn = (s) => PV_ACTIVE.indexOf(s) !== -1;
     const setText = (id, val) => { const el = $(id); if (el) el.textContent = val; };
+    // Partner labels + the partner → reference-screenshot mapping, both
+    // emitted from PHP (pvPartners / pvRefImageFor) so the form can never
+    // offer a partner the server would reject, or label one it doesn't
+    // know. Toing maps to the Swiggy screenshots — the bills are laid out
+    // the same way — while the caption still reads "Toing". Declared up
+    // here with the other PHP-fed constants so nothing can reference them
+    // before initialisation.
+    const PV_PARTNER_LABELS = <?= json_encode(pvPartners(), JSON_UNESCAPED_SLASHES) ?>;
+    const PV_PARTNER_REF    = <?= json_encode(array_map('pvRefImageFor', array_keys(pvPartners())), JSON_UNESCAPED_SLASHES) ?>;
+    const PV_PARTNER_REF_BY_KEY = Object.fromEntries(
+        Object.keys(PV_PARTNER_LABELS).map((k, i) => [k, PV_PARTNER_REF[i]])
+    );
     const pctSigned = (v) => (v > 0 ? '+' : '') + (Math.round(v * 100) / 100).toFixed(2) + '%';
     const escapeHtml = (s) =>
         String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
@@ -3054,7 +3108,7 @@ function pagePriceVariationNew(): void {
             .filter(Boolean);
 
         const missing = [];
-        if (!partnerPicked)     missing.push('Pick a partner (Swiggy or Zomato).');
+        if (!partnerPicked)     missing.push('Pick a partner (' + Object.values(PV_PARTNER_LABELS).join(' or ') + ').');
         if (lines.length === 0) missing.push('Add at least one item to the bill.');
         if (itemsMissingTotal.length > 0) {
             missing.push('Enter the partner Total (₹) for ' +
@@ -3076,7 +3130,8 @@ function pagePriceVariationNew(): void {
     // currently selected partner. Hidden until a partner is picked.
     function syncRefImage() {
         const sel = document.querySelector('input[name="partner"]:checked');
-        const partnerLbl = sel ? (sel.value === 'swiggy' ? 'Swiggy' : 'Zomato') : '';
+        const partnerLbl = sel ? (PV_PARTNER_LABELS[sel.value] || '') : '';
+        const refKey     = sel ? (PV_PARTNER_REF_BY_KEY[sel.value] || '') : '';
         // Step 3 — aggregator-bill breakdown reference
         const card = document.getElementById('pv-ref-card');
         const sw   = document.getElementById('pv-ref-swiggy');
@@ -3086,8 +3141,8 @@ function pagePriceVariationNew(): void {
             if (!sel) { card.style.display = 'none'; }
             else {
                 card.style.display = '';
-                sw.style.display = sel.value === 'swiggy' ? '' : 'none';
-                zo.style.display = sel.value === 'zomato' ? '' : 'none';
+                sw.style.display = refKey === 'swiggy' ? '' : 'none';
+                zo.style.display = refKey === 'zomato' ? '' : 'none';
                 if (lbl) lbl.textContent = partnerLbl;
             }
         }
@@ -3100,8 +3155,8 @@ function pagePriceVariationNew(): void {
             if (!sel) { iCard.style.display = 'none'; }
             else {
                 iCard.style.display = '';
-                iSw.style.display = sel.value === 'swiggy' ? '' : 'none';
-                iZo.style.display = sel.value === 'zomato' ? '' : 'none';
+                iSw.style.display = refKey === 'swiggy' ? '' : 'none';
+                iZo.style.display = refKey === 'zomato' ? '' : 'none';
                 if (iLbl) iLbl.textContent = partnerLbl;
             }
         }
@@ -3584,8 +3639,9 @@ function pagePriceVariationsList(): void {
             <label>Partner</label>
             <select name="partner" class="form-control">
                 <option value="">All</option>
-                <option value="swiggy" <?= $f['partner']==='swiggy'?'selected':'' ?>>Swiggy</option>
-                <option value="zomato" <?= $f['partner']==='zomato'?'selected':'' ?>>Zomato</option>
+                <?php foreach (pvPartners() as $pKey => $pLabel): ?>
+                <option value="<?= h($pKey) ?>" <?= $f['partner'] === $pKey ? 'selected' : '' ?>><?= h($pLabel) ?></option>
+                <?php endforeach; ?>
             </select>
         </div>
         <?php
@@ -4216,7 +4272,7 @@ $showDecideForm  = $hasConfirmCols
         <input type="hidden" name="id" value="<?= (int)$v['id'] ?>">
         <div class="form-group">
             <label>Confirm Remarks (optional)</label>
-            <textarea name="confirm_remarks" rows="3" maxlength="500" class="form-control" placeholder="Please escalate this to the Swiggy or Zomato partner regarding the discount variance."></textarea>
+            <textarea name="confirm_remarks" rows="3" maxlength="500" class="form-control" placeholder="Please escalate this to the aggregator partner regarding the discount variance."></textarea>
         </div>
         <div class="form-actions">
             <button class="btn btn-primary" type="submit">Confirm Variation</button>

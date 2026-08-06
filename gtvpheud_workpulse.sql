@@ -966,7 +966,7 @@ CREATE TABLE `price_variations` (
   `id` int(10) UNSIGNED NOT NULL,
   `location_id` int(10) UNSIGNED NOT NULL,
   `location_name` varchar(255) NOT NULL,
-  `partner` enum('swiggy','zomato') NOT NULL,
+  `partner` enum('swiggy','zomato','toing') NOT NULL,
   `order_id` varchar(64) NOT NULL,
   `order_date` date DEFAULT NULL,
   `bill_subtotal` decimal(10,2) NOT NULL DEFAULT 0.00,
