@@ -46,7 +46,9 @@ $txnGroups = [
                               'txn_violation_admin' => 'Violation Admin'],
     'Price Variation'  => ['txn_price_variation' => 'Submit Variation',
                            'txn_price_variation_confirm' => 'POC Confirm Variation',
-                           'txn_price_variation_admin' => 'Variation Admin'],
+                           'txn_price_variation_admin' => 'Variation Admin',
+                           'txn_inward_item' => 'Inward Item Entry',
+                           'txn_inward_validate' => 'Inward Barcode Validator'],
     'Time Tracking'    => ['txn_time_report' => 'Time Tracking Report'],
 ];
 

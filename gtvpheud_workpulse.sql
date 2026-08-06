@@ -666,6 +666,32 @@ CREATE TABLE `image_annotations` (
 -- --------------------------------------------------------
 
 --
+-- Table structure for table `inward_items`
+--
+
+CREATE TABLE `inward_items` (
+  `id` int(10) UNSIGNED NOT NULL,
+  `item_code` varchar(64) NOT NULL,
+  `item_name` varchar(255) DEFAULT NULL,
+  `mrp` decimal(10,2) NOT NULL DEFAULT 0.00,
+  `barcode` varchar(64) NOT NULL,
+  `expire_on` date NOT NULL,
+  `status` enum('pending','active','removed') NOT NULL DEFAULT 'pending',
+  `source` enum('form','import') NOT NULL DEFAULT 'form',
+  `created_by` varchar(50) NOT NULL,
+  `created_at` datetime DEFAULT current_timestamp(),
+  `erp_updated_by` varchar(50) DEFAULT NULL,
+  `erp_updated_at` datetime DEFAULT NULL,
+  `erp_update_remarks` varchar(500) DEFAULT NULL,
+  `removed_by` varchar(50) DEFAULT NULL,
+  `removed_at` datetime DEFAULT NULL,
+  `removal_remarks` varchar(500) DEFAULT NULL,
+  `last_alert_date` date DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
 -- Table structure for table `issues`
 --
 
@@ -1125,7 +1151,9 @@ CREATE TABLE `roles` (
   `txn_checklist_validate` tinyint(1) NOT NULL DEFAULT 0,
   `txn_time_report` tinyint(1) NOT NULL DEFAULT 0,
   `txn_ticket_scheduler` tinyint(1) NOT NULL DEFAULT 0,
-  `txn_event_photo_upload` tinyint(1) NOT NULL DEFAULT 0
+  `txn_event_photo_upload` tinyint(1) NOT NULL DEFAULT 0,
+  `txn_inward_item` tinyint(1) NOT NULL DEFAULT 0,
+  `txn_inward_validate` tinyint(1) NOT NULL DEFAULT 0
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- --------------------------------------------------------
@@ -1651,6 +1679,15 @@ ALTER TABLE `image_annotations`
   ADD KEY `idx_status` (`status`);
 
 --
+-- Indexes for table `inward_items`
+--
+ALTER TABLE `inward_items`
+  ADD PRIMARY KEY (`id`),
+  ADD KEY `idx_status_expire` (`status`,`expire_on`),
+  ADD KEY `idx_barcode` (`barcode`),
+  ADD KEY `idx_item_code` (`item_code`);
+
+--
 -- Indexes for table `issues`
 --
 ALTER TABLE `issues`
@@ -2111,6 +2148,12 @@ ALTER TABLE `failed_punch_logs`
 -- AUTO_INCREMENT for table `image_annotations`
 --
 ALTER TABLE `image_annotations`
+  MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
+
+--
+-- AUTO_INCREMENT for table `inward_items`
+--
+ALTER TABLE `inward_items`
   MODIFY `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT;
 
 --

@@ -224,6 +224,11 @@ function buildNav(): array {
     if (hasTxn('price_variation_admin')) {
         $priceVar[] = ['page' => 'price_list', 'icon' => navIcon('tag'), 'label' => 'Master Price List'];
     }
+    // Inward barcode register — entry users and validators share the list;
+    // the "+ New Inward Item" form is reached by button, not a nav entry.
+    if (hasTxn('inward_item') || hasTxn('inward_validate')) {
+        $priceVar[] = ['page' => 'inward_items', 'icon' => navIcon('tag'), 'label' => 'Inward Items'];
+    }
 
     $groups = [];
     if ($admin)    $groups[] = ['group' => 'Administration',    'items' => $admin];
@@ -386,6 +391,17 @@ function allowedPages(): array {
     }
     if (isSuperadmin() || hasTxn('price_variation_admin')) {
         $pages[] = 'price_list_export';
+    }
+    // Inward barcode register — list/detail/export are shared by entry users
+    // and validators; the entry form and its CSV template are entry-only.
+    if (isSuperadmin() || hasTxn('inward_item') || hasTxn('inward_validate')) {
+        $pages[] = 'inward_items';
+        $pages[] = 'inward_item_detail';
+        $pages[] = 'export_inward_items';
+    }
+    if (isSuperadmin() || hasTxn('inward_item')) {
+        $pages[] = 'inward_item_new';
+        $pages[] = 'inward_sample_csv';
     }
     // Transactions — uploaders + privileged users may download attachments.
     $pages[] = 'download_txn_attachment';
@@ -897,6 +913,12 @@ function dispatchPage(string $page): void {
         case 'export_price_variations': if (function_exists('doPriceVariationsExport'))    doPriceVariationsExport();   break;
         case 'price_variation_detail':  if (function_exists('pagePriceVariationDetail'))  pagePriceVariationDetail();  break;
         case 'download_pv_attachment':  if (function_exists('doDownloadPvAttachment'))    doDownloadPvAttachment();    break;
+        // Inward barcode register
+        case 'inward_items':            if (function_exists('pageInwardItems'))        pageInwardItems();        break;
+        case 'inward_item_new':         if (function_exists('pageInwardItemNew'))      pageInwardItemNew();      break;
+        case 'inward_item_detail':      if (function_exists('pageInwardItemDetail'))   pageInwardItemDetail();   break;
+        case 'export_inward_items':     if (function_exists('doInwardItemsExport'))    doInwardItemsExport();    break;
+        case 'inward_sample_csv':       if (function_exists('doInwardSampleCsv'))      doInwardSampleCsv();      break;
         default:                pageDashboard();  break;
     }
 }

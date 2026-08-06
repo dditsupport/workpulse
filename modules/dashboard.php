@@ -209,6 +209,64 @@ function pendingForMe_priceVariations(): array {
     return $rows;
 }
 
+// Inward barcode register. Everything here is derived live from status +
+// expire_on, so a validator confirming a removal drops the row off this
+// widget on the very next page load — there is no notification record to
+// clear separately.
+function pendingForMe_inwardItems(): array {
+    $canEnter    = isSuperadmin() || hasTxn('inward_item') || hasTxn('inward_validate');
+    $canValidate = isSuperadmin() || hasTxn('inward_validate');
+    if (!$canEnter) return [];
+
+    $rows = [];
+    try {
+        // Awaiting the validator putting the barcode into the ERP.
+        if ($canValidate) {
+            $st = getDb()->query(
+                "SELECT id, item_code, item_name, mrp, barcode, created_at
+                 FROM   inward_items
+                 WHERE  status = 'pending'
+                 ORDER  BY created_at DESC LIMIT 20"
+            );
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+                $rows[] = [
+                    'source'     => 'Inward barcode · awaiting ERP update',
+                    'icon'       => dbIcon('rupee'),
+                    'title'      => trim(($r['item_name'] ?: $r['item_code']) . ' · ₹' . number_format((float)$r['mrp'], 2) . ' · ' . $r['barcode']),
+                    'url'        => '?page=inward_item_detail&id=' . (int)$r['id'],
+                    'created_at' => $r['created_at'],
+                ];
+            }
+        }
+        // Live in the ERP and out of date — expiring today, then the backlog
+        // of already-expired barcodes nobody has confirmed removed yet.
+        // Shown to entry users too so they can see what is outstanding.
+        $st = getDb()->query(
+            "SELECT id, item_code, item_name, mrp, barcode, expire_on,
+                    DATEDIFF(CURDATE(), expire_on) AS days_over
+             FROM   inward_items
+             WHERE  status = 'active' AND expire_on <= CURDATE()
+             ORDER  BY expire_on ASC LIMIT 30"
+        );
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $over = (int)$r['days_over'];
+            $rows[] = [
+                'source'     => $over === 0
+                              ? 'Barcode expires today · remove from ERP'
+                              : 'Barcode expired · confirm ERP removal',
+                'icon'       => dbIcon('rupee'),
+                'title'      => trim(($r['item_name'] ?: $r['item_code']) . ' · ₹' . number_format((float)$r['mrp'], 2) . ' · ' . $r['barcode'])
+                              . ($over > 0 ? ' (' . $over . 'd overdue)' : ''),
+                'url'        => '?page=inward_item_detail&id=' . (int)$r['id'],
+                // Age sorts from the expiry, not the entry date — an expiry is
+                // actionable from the day it lands.
+                'created_at' => $r['expire_on'] . ' 00:00:00',
+            ];
+        }
+    } catch (Exception $e) { /* table may be missing pre-migration */ }
+    return $rows;
+}
+
 function pendingForMe_checklist(int $locId): array {
     if ($locId <= 0) return [];
     // Only surface the checklist reminder to users who actually hold the
@@ -259,6 +317,7 @@ function collectPendingForMe(): array {
         pendingForMe_audits($empCode),
         pendingForMe_punchRequests(),
         pendingForMe_priceVariations(),
+        pendingForMe_inwardItems(),
         pendingForMe_checklist($locId)
     );
 
