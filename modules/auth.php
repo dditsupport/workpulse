@@ -158,62 +158,24 @@ function doLogin(): void {
             $_SESSION['bio_location_id'] = (int)($emp['location_id'] ?? 0);
             $_SESSION['bio_dept_id'] = (int)($emp['department_id'] ?? 0);
             $_SESSION['bio_dept_name'] = (string)($emp['department_name'] ?? '');
-            $_SESSION['bio_txns'] = [
-                'txn_dashboard'        => (int)($emp['txn_dashboard'] ?? 0),
-                'txn_employees'        => (int)($emp['txn_employees'] ?? 0),
-                'txn_departments'      => (int)($emp['txn_departments'] ?? 0),
-                'txn_locations'        => (int)($emp['txn_locations'] ?? 0),
-                'txn_attendance'       => (int)($emp['txn_attendance'] ?? 0),
-                'txn_approve_punches'  => (int)($emp['txn_approve_punches'] ?? 0),
-                'txn_failed_punches'   => (int)($emp['txn_failed_punches'] ?? 0),
-                'txn_issues'           => (int)($emp['txn_issues'] ?? 0),
-                'txn_create_issue'     => (int)($emp['txn_create_issue'] ?? 0),
-                'txn_edit_issue'       => (int)($emp['txn_edit_issue'] ?? 0),
-                'txn_checklist'        => (int)($emp['txn_checklist'] ?? 0),
-                'txn_manage_tasks'     => (int)($emp['txn_manage_tasks'] ?? 0),
-                'txn_manage_dept_tasks' => (int)($emp['txn_manage_dept_tasks'] ?? 0),
-                'txn_event_photo_upload' => (int)($emp['txn_event_photo_upload'] ?? 0),
-                'txn_checklist_report' => (int)($emp['txn_checklist_report'] ?? 0),
-                'txn_checklist_audit'  => (int)($emp['txn_checklist_audit'] ?? 0),
-                'txn_offer'            => (int)($emp['txn_offer'] ?? 0),
-                'txn_coupon_redeemed'  => (int)($emp['txn_coupon_redeemed'] ?? 0),
-                'txn_issue_summary'    => (int)($emp['txn_issue_summary'] ?? 0),
-                'txn_issue_comments'   => (int)($emp['txn_issue_comments'] ?? 0),
-                'txn_devices'          => (int)($emp['txn_devices'] ?? 0),
-                'txn_manage_categories' => (int)($emp['txn_manage_categories'] ?? 0),
-                'txn_generate_coupons' => (int)($emp['txn_generate_coupons'] ?? 0),
-                'txn_manage_passwords' => (int)($emp['txn_manage_passwords'] ?? 0),
-                'txn_settings'         => (int)($emp['txn_settings'] ?? 0),
-                'txn_generate_vouchers' => (int)($emp['txn_generate_vouchers'] ?? 0),
-                'txn_outlet_directory'  => (int)($emp['txn_outlet_directory'] ?? 0),
-                'txn_shelf_life'        => (int)($emp['txn_shelf_life'] ?? 0),
-                'txn_shelf_life_upload' => (int)($emp['txn_shelf_life_upload'] ?? 0),
-                'txn_store_hours'       => (int)($emp['txn_store_hours'] ?? 0),
-                'txn_price_tags'        => (int)($emp['txn_price_tags'] ?? 0),
-                'txn_dependencies'      => (int)($emp['txn_dependencies'] ?? 0),
-                'txn_dept_roles'        => (int)($emp['txn_dept_roles'] ?? 0),
-                'txn_audit_create'      => (int)($emp['txn_audit_create'] ?? 0),
-                'txn_audit_approve'     => (int)($emp['txn_audit_approve'] ?? 0),
-                'txn_audit_admin'       => (int)($emp['txn_audit_admin'] ?? 0),
-                'txn_audit_view'        => (int)($emp['txn_audit_view'] ?? 0),
-                'txn_audit_summary'     => (int)($emp['txn_audit_summary'] ?? 0),
-                'txn_violations_view'         => (int)($emp['txn_violations_view'] ?? 0),
-                'txn_record_violation'        => (int)($emp['txn_record_violation'] ?? 0),
-                'txn_reset_violation_counter' => (int)($emp['txn_reset_violation_counter'] ?? 0),
-                'txn_violation_admin'         => (int)($emp['txn_violation_admin'] ?? 0),
-                'txn_price_variation'         => (int)($emp['txn_price_variation'] ?? 0),
-                'txn_price_variation_confirm' => (int)($emp['txn_price_variation_confirm'] ?? 0),
-                'txn_price_variation_admin'   => (int)($emp['txn_price_variation_admin'] ?? 0),
-                'txn_transactions_report'     => (int)($emp['txn_transactions_report'] ?? 0),
-                'txn_policy_admin'            => (int)($emp['txn_policy_admin'] ?? 0),
-                'txn_policy_dashboard'        => (int)($emp['txn_policy_dashboard'] ?? 0),
-                'txn_audit_operation'         => (int)($emp['txn_audit_operation'] ?? 0),
-                'txn_audit_management'        => (int)($emp['txn_audit_management'] ?? 0),
-                'txn_audit_annotation_resolve' => (int)($emp['txn_audit_annotation_resolve'] ?? 0),
-                'txn_time_report'             => (int)($emp['txn_time_report'] ?? 0),
-                'txn_checklist_validate'      => (int)($emp['txn_checklist_validate'] ?? 0),
-                'txn_ticket_scheduler'        => (int)($emp['txn_ticket_scheduler'] ?? 0),
-            ];
+            // Copy every txn_* flag the role row carries. This is the other
+            // half of the r.* in the SELECT above: a new permission column on
+            // `roles` starts working the moment its migration runs, with no
+            // edit here. The hand-written list this replaces had to be kept in
+            // sync by hand, and when it wasn't the symptom was silent —
+            // txn_inward_item/txn_inward_validate were dropped on the way into
+            // the session, so granting the role on the Roles page did nothing
+            // and re-logging in never helped.
+            // Only `roles` contributes txn_* columns to this row (employees and
+            // departments have none), so the prefix match can't pick up
+            // anything else. LEFT JOIN with no role yields NULLs → 0 → every
+            // gate stays shut, exactly as before.
+            $_SESSION['bio_txns'] = [];
+            foreach ($emp as $k => $v) {
+                if (is_string($k) && str_starts_with($k, 'txn_')) {
+                    $_SESSION['bio_txns'][$k] = (int)$v;
+                }
+            }
             // Soft nudge: if the employee has any unaccepted in-scope policy,
             // land them on the policy view page (regardless of grace period).
             // After grace expires the per-request gate in index.php takes over
