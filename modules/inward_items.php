@@ -112,6 +112,45 @@ function inwCleanBarcode($raw): ?string {
     return $b;
 }
 
+// ── MRP + barcode composition ────────────────────────────
+// Both entry paths take the MRP and the plain barcode as separate fields
+// and the system joins them with a dot: 55 + 7622202357039 becomes the
+// stored 55.7622202357039. Keeping the two apart at entry is what makes
+// "the same product at two live MRPs" natural — one barcode typed once,
+// a row per price — and removes the chance of a hand-typed prefix
+// disagreeing with the MRP column beside it.
+
+// The plain barcode as entered: digits only. A dot here means someone
+// pasted an already-joined value, which would compose to 53.53.7622…, so
+// it is rejected with a message rather than silently mangled.
+function inwCleanEan($raw): ?string {
+    $b = trim((string)$raw);
+    if ($b === '' || strlen($b) > 48) return null;
+    if (!ctype_digit($b)) return null;
+    return $b;
+}
+
+// The MRP rendered for the barcode prefix. Whole values lose the decimal
+// part (53.00 → "53") so the same price always yields the same barcode no
+// matter how it was typed; a genuine fractional price keeps its digits,
+// minus trailing zeros (53.50 → "53.5").
+function inwMrpForBarcode(float $mrp): string {
+    if (abs($mrp - round($mrp)) < 0.005) return (string)(int)round($mrp);
+    return rtrim(rtrim(number_format($mrp, 2, '.', ''), '0'), '.');
+}
+
+function inwComposeBarcode(float $mrp, string $ean): string {
+    return inwMrpForBarcode($mrp) . '.' . $ean;
+}
+
+// Inverse, for the CSV export: hand back the plain barcode so an exported
+// sheet re-imports to exactly the same stored value. Falls back to the
+// whole string if the stored value doesn't carry the expected prefix.
+function inwBarcodeEan(string $barcode, $mrp): string {
+    $prefix = inwMrpForBarcode((float)$mrp) . '.';
+    return str_starts_with($barcode, $prefix) ? substr($barcode, strlen($prefix)) : $barcode;
+}
+
 function inwCleanMrp($raw): ?float {
     $v = str_replace([',', '₹', ' '], '', trim((string)$raw));
     if ($v === '' || !is_numeric($v)) return null;
@@ -371,6 +410,11 @@ function inwUpsertRows(array $rows, string $source): array {
             (item_code, item_name, mrp, barcode, expire_on, status, source, created_by, created_at)
          VALUES (?, ?, ?, ?, ?, \'pending\', ?, ?, NOW())'
     );
+    // Re-uploading the same item code and barcode with a later date moves
+    // the expiry on the existing row — no second row, and the row keeps its
+    // status and validator history. mrp is written too, but the composed
+    // barcode already encodes it, so a barcode match implies an mrp match
+    // and the assignment is a no-op in practice.
     $upd = $db->prepare(
         'UPDATE inward_items SET item_name = ?, mrp = ?, expire_on = ? WHERE id = ?'
     );
@@ -431,15 +475,20 @@ function doInwardItemAdd(): void {
 
         $label   = 'Row ' . ($i + 1) . ': ';
         $vCode   = inwCleanCode($code);
-        $vBar    = inwCleanBarcode($bc);
+        $vEan    = inwCleanEan($bc);
         $vMrp    = inwCleanMrp($mrp);
         $vExp    = inwParseFormDate($exp);
 
         if ($vCode === null) $errors[] = $label . 'item code is required.';
-        if ($vBar  === null) $errors[] = $label . 'barcode must be digits and dots only (e.g. 55.7622202357039).';
+        if ($vEan  === null) $errors[] = $label . (str_contains($bc, '.')
+            ? 'enter the barcode without the MRP (e.g. 7622202357039) — the MRP is joined automatically.'
+            : 'barcode must be digits only (e.g. 7622202357039).');
         if ($vMrp  === null) $errors[] = $label . 'MRP must be a number.';
         if ($vExp  === null) $errors[] = $label . 'pick a valid expiry date.';
-        if ($vCode === null || $vBar === null || $vMrp === null || $vExp === null) continue;
+        if ($vCode === null || $vEan === null || $vMrp === null || $vExp === null) continue;
+
+        // Same join as the importer — one rule for both entry paths.
+        $vBar = inwComposeBarcode($vMrp, $vEan);
 
         if (isset($seen[$vBar])) { $errors[] = $label . 'barcode ' . $vBar . ' is repeated in this form.'; continue; }
         $seen[$vBar] = true;
@@ -549,19 +598,28 @@ function doInwardItemImport(): void {
         if (count(array_filter($r, fn($v) => trim((string)$v) !== '')) === 0) continue; // blank line
 
         $vCode = inwCleanCode($cell($r, 'item_code'));
-        $vBar  = inwCleanBarcode($cell($r, 'barcode'));
+        $vEan  = inwCleanEan($cell($r, 'barcode'));
         $vMrp  = inwCleanMrp($cell($r, 'mrp'));
         $vExp  = inwBuildDate($cell($r, 'exp_day'), $cell($r, 'exp_month'), $cell($r, 'exp_year'));
         $name  = trim((string)$cell($r, 'item_name'));
 
         if ($vCode === null) $errors[] = "Line {$line}: Code is required.";
-        if ($vBar  === null) $errors[] = "Line {$line}: BarCode \"" . trim((string)$cell($r, 'barcode'))
-                                       . '" is invalid — digits and dots only.';
+        if ($vEan  === null) {
+            $rawBar = trim((string)$cell($r, 'barcode'));
+            // Point at the format change explicitly — a sheet in the old
+            // MRP-prefixed style fails here and the reason isn't obvious.
+            $errors[] = str_contains($rawBar, '.')
+                ? "Line {$line}: BarCode \"{$rawBar}\" already contains the MRP — enter the barcode on its own, the MRP is joined automatically."
+                : "Line {$line}: BarCode \"{$rawBar}\" is invalid — digits only.";
+        }
         if ($vMrp  === null) $errors[] = "Line {$line}: MRP \"" . trim((string)$cell($r, 'mrp')) . '" is not a number.';
         if ($vExp  === null) $errors[] = "Line {$line}: expiry " . trim((string)$cell($r, 'exp_day')) . '/'
                                        . trim((string)$cell($r, 'exp_month')) . '/'
                                        . trim((string)$cell($r, 'exp_year')) . ' is not a valid date.';
-        if ($vCode === null || $vBar === null || $vMrp === null || $vExp === null) continue;
+        if ($vCode === null || $vEan === null || $vMrp === null || $vExp === null) continue;
+
+        // MRP and barcode arrive separately; the stored value joins them.
+        $vBar = inwComposeBarcode($vMrp, $vEan);
 
         if (isset($seen[$vBar])) {
             $errors[] = "Line {$line}: BarCode {$vBar} already appears on line {$seen[$vBar]}.";
@@ -700,9 +758,12 @@ function doInwardSampleCsv(): void {
     $out = fopen('php://output', 'w');
     fwrite($out, "\xEF\xBB\xBF"); // UTF-8 BOM so Excel opens it cleanly
     fputcsv($out, array_map(fn($c) => $c['label'], inwCsvColumns()), ',', '"', '');
-    fputcsv($out, ['700757', '10 Round Plate Classic (10Pc x 12PKT)', '10', '10.123456', '30', '9', '26'], ',', '"', '');
-    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '53', '53.7622202357039', '30', '9', '2026'], ',', '"', '');
-    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '55', '55.7622202357039', '30', '9', '2026'], ',', '"', '');
+    // BarCode is the plain barcode — the MRP is joined on automatically.
+    // The two 704804 rows show the shape that matters: one barcode, two
+    // live MRPs, becoming 53.7622202357039 and 55.7622202357039.
+    fputcsv($out, ['700757', '10 Round Plate Classic (10Pc x 12PKT)', '10', '123456', '30', '9', '26'], ',', '"', '');
+    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '53', '7622202357039', '30', '9', '2026'], ',', '"', '');
+    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '55', '7622202357039', '30', '9', '2026'], ',', '"', '');
     fclose($out);
     exit;
 }
@@ -733,13 +794,20 @@ function doInwardItemsExport(): void {
     fwrite($out, "\xEF\xBB\xBF");
     fputcsv($out, array_merge(
         array_map(fn($c) => $c['label'], inwCsvColumns()),
-        ['Status', 'Entered By', 'Entered At', 'ERP Updated By', 'ERP Updated At', 'Removed By', 'Removed At']
+        ['Full Barcode', 'Status', 'Entered By', 'Entered At',
+         'ERP Updated By', 'ERP Updated At', 'Removed By', 'Removed At']
     ), ',', '"', '');
     foreach ($rows as $r) {
         $t = strtotime((string)$r['expire_on']);
         fputcsv($out, [
-            $r['item_code'], $r['item_name'] ?? '', $r['mrp'], $r['barcode'],
+            // BarCode is emitted plain, with the MRP prefix stripped back
+            // off, so an exported sheet can be corrected and re-imported to
+            // exactly the same stored value. The joined form follows in its
+            // own column for reference; the importer ignores it.
+            $r['item_code'], $r['item_name'] ?? '', $r['mrp'],
+            inwBarcodeEan((string)$r['barcode'], $r['mrp']),
             $t ? date('d', $t) : '', $t ? date('n', $t) : '', $t ? date('Y', $t) : '',
+            $r['barcode'],
             $r['status'], $r['created_by'], $r['created_at'],
             $r['erp_updated_by'] ?? '', $r['erp_updated_at'] ?? '',
             $r['removed_by'] ?? '', $r['removed_at'] ?? '',
@@ -981,8 +1049,13 @@ function pageInwardItems(): void {
             <input type="hidden" name="action" value="inw_import">
             <div style="display:flex;flex-direction:column;gap:12px">
                 <div style="background:rgba(26,143,227,.10);border:1px solid rgba(26,143,227,.35);border-radius:6px;padding:10px 12px;font-size:12px;line-height:1.6">
-                    Every row is one barcode. The same item code may appear on several rows —
-                    one per MRP — and each keeps its own expiry.
+                    Put the <b>MRP</b> and the <b>plain barcode</b> in their own columns —
+                    the system joins them with a dot. The same item code may appear on
+                    several rows, one per MRP, each keeping its own expiry:
+                    <div style="margin-top:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.7">
+                        53 + 7622202357039 &rarr; 53.7622202357039<br>
+                        55 + 7622202357039 &rarr; 55.7622202357039
+                    </div>
                     <div style="margin-top:8px">
                         <a href="?page=inward_sample_csv" class="btn btn-sm btn-secondary">Download sample CSV</a>
                     </div>
@@ -994,9 +1067,10 @@ function pageInwardItems(): void {
                         Header row required:
                         <code style="display:block;margin-top:3px;white-space:normal;word-break:break-word;line-height:1.5;background:rgba(255,255,255,.05);padding:4px 6px;border-radius:4px"><?= h(inwCsvHeaderLine()) ?></code>
                         <span style="opacity:.8;display:block;margin-top:5px">
+                            BarCode is the plain barcode, without the MRP — the MRP column is joined onto it automatically.
                             Year takes 2 or 4 digits — <code>26</code> and <code>2026</code> both mean 2026.
                             Name is optional: leave it blank to keep the name already on file, or fill it in to update a renamed product.
-                            Existing barcodes are updated in place; nothing is deleted.
+                            Re-uploading the same item code and barcode with a new expiry updates that row's date — it does not add a second row.
                         </span>
                     </div>
                 </div>
@@ -1080,12 +1154,14 @@ function pageInwardItemNew(): void {
 <div class="form-card" style="max-width:none">
     <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:14px">
         One row per barcode. An item code can carry several barcodes at once — one per MRP —
-        so add a row for each. Leave the name blank to pull it from the master price list.
+        so add a row for each. Enter the <b>plain barcode</b>; the MRP is joined onto it with a
+        dot when saved, and the result is previewed under the field. Leave the name blank to
+        pull it from the master price list.
     </div>
     <form method="POST" id="inwForm">
         <input type="hidden" name="action" value="inw_add">
         <div class="inw-row-grid" style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em">
-            <div>Item Code</div><div>Name</div><div>MRP</div><div>BarCode</div><div>Expires On</div><div></div>
+            <div>Item Code</div><div>Name</div><div>MRP</div><div>BarCode <span style="font-weight:400;text-transform:none;letter-spacing:0">(without MRP)</span></div><div>Expires On</div><div></div>
         </div>
         <div id="inwRows"></div>
         <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
@@ -1106,11 +1182,36 @@ function inwRowHtml(){
     return '<div class="inw-row-grid">'
       + '<div><input type="text" name="item_code[]" class="form-control" placeholder="704804" list="inwItemList" oninput="inwSuggest(this)" onchange="inwFillName(this)"></div>'
       + '<div><input type="text" name="item_name[]" class="form-control" placeholder="(auto from price list)"></div>'
-      + '<div><input type="text" name="mrp[]" class="form-control" inputmode="decimal" placeholder="55"></div>'
-      + '<div><input type="text" name="barcode[]" class="form-control" inputmode="decimal" placeholder="55.7622202357039"></div>'
+      + '<div><input type="text" name="mrp[]" class="form-control" inputmode="decimal" placeholder="55" oninput="inwPreview(this)"></div>'
+      + '<div><input type="text" name="barcode[]" class="form-control" inputmode="numeric" placeholder="7622202357039" oninput="inwPreview(this)">'
+      +   '<div class="inw-preview" style="font-size:10px;color:var(--muted);margin-top:3px;min-height:13px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace"></div></div>'
       + '<div><input type="date" name="expire_on[]" class="form-control"></div>'
       + '<div><button type="button" class="btn btn-sm btn-ghost" title="Remove row" onclick="inwDelRow(this)">&times;</button></div>'
       + '</div>';
+}
+
+// Show the value that will actually be stored, so the join isn't a
+// surprise at save time. Mirrors inwMrpForBarcode(): a whole MRP drops its
+// decimals, a fractional one keeps them minus trailing zeros.
+function inwPreview(el){
+    var row  = el.closest('.inw-row-grid');
+    var mrp  = row.querySelector('input[name="mrp[]"]').value.trim().replace(/[₹, ]/g, '');
+    var bc   = row.querySelector('input[name="barcode[]"]').value.trim();
+    var out  = row.querySelector('.inw-preview');
+    if (!out) return;
+    if (bc === '' && mrp === '') { out.textContent = ''; return; }
+    if (bc.indexOf('.') !== -1) {
+        out.textContent = 'Drop the MRP prefix — enter the barcode alone';
+        out.style.color = 'var(--red)';
+        return;
+    }
+    out.style.color = 'var(--muted)';
+    if (bc === '' || mrp === '' || isNaN(parseFloat(mrp)) || !/^\d+$/.test(bc)) { out.textContent = ''; return; }
+    var n = parseFloat(mrp);
+    var pfx = Math.abs(n - Math.round(n)) < 0.005
+            ? String(Math.round(n))
+            : String(parseFloat(n.toFixed(2)));
+    out.textContent = '→ ' + pfx + '.' + bc;
 }
 function inwAddRow(){
     var box = document.getElementById('inwRows');
