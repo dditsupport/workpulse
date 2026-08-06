@@ -101,28 +101,24 @@ function inwParseFormDate($raw): ?string {
     return inwBuildDate($m[3], $m[2], $m[1]);
 }
 
-// Barcodes are "MRP.EAN" strings and stay strings end to end — parsing one
-// as a number eats the leading zero in e.g. 85.08906101350834. Must start
-// with a digit, which is what catches the stray-quote typos that show up in
-// hand-edited sheets (169.'8906007702362).
-function inwCleanBarcode($raw): ?string {
-    $b = trim((string)$raw);
-    if ($b === '' || strlen($b) > 64) return null;
-    if (!preg_match('/^[0-9][0-9.]*$/', $b)) return null;
-    return $b;
-}
-
 // ── MRP + barcode composition ────────────────────────────
 // Both entry paths take the MRP and the plain barcode as separate fields
-// and the system joins them with a dot: 55 + 7622202357039 becomes the
-// stored 55.7622202357039. Keeping the two apart at entry is what makes
-// "the same product at two live MRPs" natural — one barcode typed once,
-// a row per price — and removes the chance of a hand-typed prefix
-// disagreeing with the MRP column beside it.
+// and the system joins them: 55 + 7622202357039 becomes the stored
+// 55-7622202357039. Keeping the two apart at entry is what makes "the
+// same product at two live MRPs" natural — one barcode typed once, a row
+// per price — and removes the chance of a hand-typed prefix disagreeing
+// with the MRP column beside it.
+//
+// The separator is a hyphen so a fractional price stays readable and
+// unambiguous: 53.50 composes to 53.5-7622202357039, where the dot can
+// only be the decimal point and the hyphen can only be the join. A dot
+// separator would have produced 53.5.7622202357039, which no longer says
+// where the price ends.
+const INW_BARCODE_SEP = '-';
 
-// The plain barcode as entered: digits only. A dot here means someone
-// pasted an already-joined value, which would compose to 53.53.7622…, so
-// it is rejected with a message rather than silently mangled.
+// The plain barcode as entered: digits only. A separator or a dot here
+// means someone pasted an already-joined value, which would compose to
+// 53-53-7622…, so it is rejected with a message rather than mangled.
 function inwCleanEan($raw): ?string {
     $b = trim((string)$raw);
     if ($b === '' || strlen($b) > 48) return null;
@@ -140,14 +136,14 @@ function inwMrpForBarcode(float $mrp): string {
 }
 
 function inwComposeBarcode(float $mrp, string $ean): string {
-    return inwMrpForBarcode($mrp) . '.' . $ean;
+    return inwMrpForBarcode($mrp) . INW_BARCODE_SEP . $ean;
 }
 
 // Inverse, for the CSV export: hand back the plain barcode so an exported
 // sheet re-imports to exactly the same stored value. Falls back to the
 // whole string if the stored value doesn't carry the expected prefix.
 function inwBarcodeEan(string $barcode, $mrp): string {
-    $prefix = inwMrpForBarcode((float)$mrp) . '.';
+    $prefix = inwMrpForBarcode((float)$mrp) . INW_BARCODE_SEP;
     return str_starts_with($barcode, $prefix) ? substr($barcode, strlen($prefix)) : $barcode;
 }
 
@@ -480,7 +476,7 @@ function doInwardItemAdd(): void {
         $vExp    = inwParseFormDate($exp);
 
         if ($vCode === null) $errors[] = $label . 'item code is required.';
-        if ($vEan  === null) $errors[] = $label . (str_contains($bc, '.')
+        if ($vEan  === null) $errors[] = $label . (str_contains($bc, INW_BARCODE_SEP) || str_contains($bc, '.')
             ? 'enter the barcode without the MRP (e.g. 7622202357039) — the MRP is joined automatically.'
             : 'barcode must be digits only (e.g. 7622202357039).');
         if ($vMrp  === null) $errors[] = $label . 'MRP must be a number.';
@@ -606,9 +602,10 @@ function doInwardItemImport(): void {
         if ($vCode === null) $errors[] = "Line {$line}: Code is required.";
         if ($vEan  === null) {
             $rawBar = trim((string)$cell($r, 'barcode'));
-            // Point at the format change explicitly — a sheet in the old
-            // MRP-prefixed style fails here and the reason isn't obvious.
-            $errors[] = str_contains($rawBar, '.')
+            // Point at the format explicitly — a sheet carrying the MRP in
+            // the barcode fails here and the reason isn't obvious otherwise.
+            $joined = str_contains($rawBar, INW_BARCODE_SEP) || str_contains($rawBar, '.');
+            $errors[] = $joined
                 ? "Line {$line}: BarCode \"{$rawBar}\" already contains the MRP — enter the barcode on its own, the MRP is joined automatically."
                 : "Line {$line}: BarCode \"{$rawBar}\" is invalid — digits only.";
         }
@@ -760,7 +757,7 @@ function doInwardSampleCsv(): void {
     fputcsv($out, array_map(fn($c) => $c['label'], inwCsvColumns()), ',', '"', '');
     // BarCode is the plain barcode — the MRP is joined on automatically.
     // The two 704804 rows show the shape that matters: one barcode, two
-    // live MRPs, becoming 53.7622202357039 and 55.7622202357039.
+    // live MRPs, becoming 53-7622202357039 and 55-7622202357039.
     fputcsv($out, ['700757', '10 Round Plate Classic (10Pc x 12PKT)', '10', '123456', '30', '9', '26'], ',', '"', '');
     fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '53', '7622202357039', '30', '9', '2026'], ',', '"', '');
     fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '55', '7622202357039', '30', '9', '2026'], ',', '"', '');
@@ -1050,11 +1047,12 @@ function pageInwardItems(): void {
             <div style="display:flex;flex-direction:column;gap:12px">
                 <div style="background:rgba(26,143,227,.10);border:1px solid rgba(26,143,227,.35);border-radius:6px;padding:10px 12px;font-size:12px;line-height:1.6">
                     Put the <b>MRP</b> and the <b>plain barcode</b> in their own columns —
-                    the system joins them with a dot. The same item code may appear on
-                    several rows, one per MRP, each keeping its own expiry:
+                    the system joins them with a <code><?= h(INW_BARCODE_SEP) ?></code>. The same item code may
+                    appear on several rows, one per MRP, each keeping its own expiry:
                     <div style="margin-top:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.7">
-                        53 + 7622202357039 &rarr; 53.7622202357039<br>
-                        55 + 7622202357039 &rarr; 55.7622202357039
+                        53 + 7622202357039 &rarr; 53<?= h(INW_BARCODE_SEP) ?>7622202357039<br>
+                        55 + 7622202357039 &rarr; 55<?= h(INW_BARCODE_SEP) ?>7622202357039<br>
+                        <span style="opacity:.75">53.50 + 7622202357039 &rarr; 53.5<?= h(INW_BARCODE_SEP) ?>7622202357039</span>
                     </div>
                     <div style="margin-top:8px">
                         <a href="?page=inward_sample_csv" class="btn btn-sm btn-secondary">Download sample CSV</a>
@@ -1155,8 +1153,8 @@ function pageInwardItemNew(): void {
     <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:14px">
         One row per barcode. An item code can carry several barcodes at once — one per MRP —
         so add a row for each. Enter the <b>plain barcode</b>; the MRP is joined onto it with a
-        dot when saved, and the result is previewed under the field. Leave the name blank to
-        pull it from the master price list.
+        <code><?= h(INW_BARCODE_SEP) ?></code> when saved, and the result is previewed under the field.
+        Leave the name blank to pull it from the master price list.
     </div>
     <form method="POST" id="inwForm">
         <input type="hidden" name="action" value="inw_add">
@@ -1193,6 +1191,8 @@ function inwRowHtml(){
 // Show the value that will actually be stored, so the join isn't a
 // surprise at save time. Mirrors inwMrpForBarcode(): a whole MRP drops its
 // decimals, a fractional one keeps them minus trailing zeros.
+var INW_SEP = <?= json_encode(INW_BARCODE_SEP) ?>;
+
 function inwPreview(el){
     var row  = el.closest('.inw-row-grid');
     var mrp  = row.querySelector('input[name="mrp[]"]').value.trim().replace(/[₹, ]/g, '');
@@ -1200,7 +1200,7 @@ function inwPreview(el){
     var out  = row.querySelector('.inw-preview');
     if (!out) return;
     if (bc === '' && mrp === '') { out.textContent = ''; return; }
-    if (bc.indexOf('.') !== -1) {
+    if (bc.indexOf(INW_SEP) !== -1 || bc.indexOf('.') !== -1) {
         out.textContent = 'Drop the MRP prefix — enter the barcode alone';
         out.style.color = 'var(--red)';
         return;
@@ -1211,7 +1211,7 @@ function inwPreview(el){
     var pfx = Math.abs(n - Math.round(n)) < 0.005
             ? String(Math.round(n))
             : String(parseFloat(n.toFixed(2)));
-    out.textContent = '→ ' + pfx + '.' + bc;
+    out.textContent = '→ ' + pfx + INW_SEP + bc;
 }
 function inwAddRow(){
     var box = document.getElementById('inwRows');
