@@ -20,7 +20,7 @@ require_once __DIR__ . '/modules/attendance.php';
 require_once __DIR__ . '/modules/settings.php';
 
 // Conditionally load modules (graceful if not yet created)
-foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos'] as $mod) {
+foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos'] as $mod) {
     $f = __DIR__ . '/modules/' . $mod . '.php';
     if (file_exists($f)) require_once $f;
 }
@@ -43,7 +43,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','policy_heartbeat','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','policy_heartbeat','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
@@ -68,6 +68,11 @@ if (function_exists('policyFirstBlockingVersion')
 // Ticket scheduler — lazy fallback: create any due tickets at most once
 // per day (covers deployments without a server cron). Self-throttled.
 if (function_exists('ticketSchedLazyRun')) ticketSchedLazyRun();
+
+// Inward barcode expiry digest — same once-per-day lazy fallback, so the
+// daily email still goes out on installs without a server cron. The real
+// entrypoint is cron/run_barcode_expiry.php.
+if (function_exists('inwExpiryLazyRun')) inwExpiryLazyRun();
 
 $flash = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
@@ -203,6 +208,13 @@ function routePost(string $a): void {
         case 'pv_add_attachment': if (function_exists('doPvAddAttachment'))        doPvAddAttachment();        break;
         case 'pv_search_items':   if (function_exists('doSearchPriceListItems'))   doSearchPriceListItems();   break;
         case 'delete_price_variations_by_month': if (function_exists('doDeletePriceVariationsByMonth') && isSuperadmin()) doDeletePriceVariationsByMonth(); break;
+        // Inward barcode register (maker/checker gates live in the handlers)
+        case 'inw_add':              if (function_exists('doInwardItemAdd'))       doInwardItemAdd();       break;
+        case 'inw_import':           if (function_exists('doInwardItemImport'))    doInwardItemImport();    break;
+        case 'inw_erp_updated':      if (function_exists('doInwardErpUpdated'))    doInwardErpUpdated();    break;
+        case 'inw_confirm_removed':  if (function_exists('doInwardConfirmRemoved')) doInwardConfirmRemoved(); break;
+        case 'inw_delete':           if (function_exists('doInwardItemDelete') && isSuperadmin()) doInwardItemDelete(); break;
+        case 'inw_search_items':     if (function_exists('doInwardSearchItems'))   doInwardSearchItems();   break;
         // Transactions
         case 'save_transaction':
             if (function_exists('doSaveTransaction') && canUploadTransaction()) doSaveTransaction(); break;
