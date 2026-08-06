@@ -78,7 +78,7 @@ function buildNav(): array {
             ['page' => 'violation_categories',    'icon' => navIcon('categories'),  'label' => 'Violation Categories'],
         ]],
         ['group' => 'Price Variation', 'items' => [
-            ['page' => 'price_variations', 'icon' => navIcon('summary'), 'label' => 'Variations'],
+            ['page' => 'price_variations', 'icon' => navIcon('summary'), 'label' => 'Online Variations'],
             ['page' => 'price_list',       'icon' => navIcon('tag'),     'label' => 'Master Price List'],
         ]],
         ['group' => 'Gallery', 'items' => [
@@ -219,7 +219,7 @@ function buildNav(): array {
     // the Variations list page (kept in allowedPages below) — no separate nav entry.
     $priceVar = [];
     if (hasTxn('price_variation') || hasTxn('price_variation_admin')) {
-        $priceVar[] = ['page' => 'price_variations', 'icon' => navIcon('summary'), 'label' => 'Variations'];
+        $priceVar[] = ['page' => 'price_variations', 'icon' => navIcon('summary'), 'label' => 'Online Variations'];
     }
     if (hasTxn('price_variation_admin')) {
         $priceVar[] = ['page' => 'price_list', 'icon' => navIcon('tag'), 'label' => 'Master Price List'];
