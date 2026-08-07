@@ -681,7 +681,10 @@ function phpEolDate(string $branch): string {
 }
 
 // ── Display Helpers ──────────────────────────────────────
-function h(string $s): string { return htmlspecialchars($s, ENT_QUOTES, 'UTF-8'); }
+// Nullable by design: half the columns this escapes are nullable (a task with
+// no section, an answer never given, an optional remark), and a display helper
+// fataling the whole page over an absent value is never the right trade.
+function h(?string $s): string { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
 
 function statusBadge(string $status, int $isActive): string {
     if (!$isActive) return '<span class="badge badge-red">Inactive</span>';

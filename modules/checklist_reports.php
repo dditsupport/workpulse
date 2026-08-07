@@ -510,9 +510,19 @@ function pageChecklistAudit(): void {
     $empMode = chkReportIsEmployeeMode($checklistId);
     $checklistName = '';
     foreach (chkReportChecklists() as $rc) { if ((int)$rc['id'] === $checklistId) { $checklistName = $rc['name']; break; } }
-    // Section options come from the selected checklist's bands; fall back to
-    // the legacy three so an un-migrated install still renders.
-    $secNamesSt = $db->prepare("SELECT name FROM chk_sections WHERE checklist_id = ? ORDER BY sort_order, id");
+    // Section options are the groups the checklist's own active tasks actually
+    // fall into, resolved the same way the item query below resolves them. A
+    // checklist with no bands at all — the head-office and Operations lists are
+    // flat — yields the single "General" bucket its tasks sit in; reading the
+    // options from chk_sections instead left those reports matching nothing and
+    // rendering empty.
+    $secNamesSt = $db->prepare(
+        "SELECT DISTINCT COALESCE(sec.name, i.section_name, 'General') AS name,
+                COALESCE(sec.sort_order, 9999) AS ord
+         FROM chk_items i
+         LEFT JOIN chk_sections sec ON sec.id = i.section_id
+         WHERE i.is_active = 1 AND i.checklist_id = ?
+         ORDER BY ord, name");
     $secNamesSt->execute([$checklistId]);
     $sectionOptions = $secNamesSt->fetchAll(PDO::FETCH_COLUMN) ?: ['1.Morning', '2.Afternoon', '3.Evening'];
     $statusOptions  = ['complete' => 'Complete', 'partial' => 'Partial', 'pending' => 'Pending'];
@@ -565,14 +575,14 @@ function pageChecklistAudit(): void {
         // section rows this report renders; fall back to the stored name for
         // items with no section_id (legacy / unassigned).
         $itemSql = "SELECT i.id, i.task_description,
-                           COALESCE(sec.name, i.section_name) AS section_name
+                           COALESCE(sec.name, i.section_name, 'General') AS section_name
                     FROM chk_items i
                     LEFT JOIN chk_sections sec ON sec.id = i.section_id
                     WHERE i.is_active = 1 AND i.checklist_id = ?";
         $itemParams = [$checklistId];
         if ($sectionFilterActive) {
             $ph = implode(',', array_fill(0, count($sections), '?'));
-            $itemSql .= " AND COALESCE(sec.name, i.section_name) IN ($ph)";
+            $itemSql .= " AND COALESCE(sec.name, i.section_name, 'General') IN ($ph)";
             $itemParams = array_merge($itemParams, $sections);
         }
         $itemSql .= " ORDER BY section_name, i.id ASC";
@@ -916,7 +926,8 @@ function pageChecklistAudit(): void {
         <tr><td colspan="<?= $colspan ?>" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px"><?= h($sec) ?></td></tr>
         <?php foreach ($secItems as $it):
             $iid = (int)$it['id']; $r = $resps0[$iid] ?? null;
-            $isNo = $r && mb_strtolower($r['response_value']) === 'no';
+            $ans  = trim((string)($r['response_value'] ?? ''));
+            $isNo = $ans !== '' && mb_strtolower($ans) === 'no';
             $cv = $vals0[$iid] ?? null;
         ?>
         <tr>
@@ -929,7 +940,7 @@ function pageChecklistAudit(): void {
                 <div class="text-muted" style="margin-top:3px;font-size:11px">&ldquo;<?= h($rmk) ?>&rdquo;</div>
                 <?php endif; ?>
             </td>
-            <td><?php if ($r): ?><span style="font-weight:700;color:<?= $isNo ? 'var(--red)' : 'var(--green)' ?>"><?= h($r['response_value']) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
+            <td><?php if ($ans !== ''): ?><span style="font-weight:700;color:<?= $isNo ? 'var(--red)' : 'var(--green)' ?>"><?= h($ans) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
             <?php if ($timeUi): $im = (int)($mins0[$iid] ?? 0); ?>
             <td style="white-space:nowrap"><?php if ($im > 0): ?><span style="display:inline-flex;align-items:center;gap:4px"><?= chkClockIcon(12) ?><?= h(fmtMinutes($im)) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
             <?php endif; ?>
@@ -1010,7 +1021,8 @@ $minsCell = function (int $m) use ($timeUi): string {
                 </div>
             <?php else: foreach ($secItems as $it):
                 $r = $resps[(int)$it['id']] ?? null;
-                $isNo = $r && mb_strtolower($r['response_value']) === 'no';
+                $ans  = trim((string)($r['response_value'] ?? ''));
+                $isNo = $ans !== '' && mb_strtolower($ans) === 'no';
             ?>
                 <div class="chk-tree-row item-row<?= $r ? '' : ' missing' ?>">
                     <div class="name" style="padding-left:74px">
@@ -1024,8 +1036,8 @@ $minsCell = function (int $m) use ($timeUi): string {
                         <?php endif; ?>
                     </div>
                     <div class="num">
-                        <?php if ($r): ?>
-                            <span style="font-weight:700;color:<?= $isNo ? 'var(--red)' : 'var(--green)' ?>"><?= h($r['response_value']) ?></span>
+                        <?php if ($ans !== ''): ?>
+                            <span style="font-weight:700;color:<?= $isNo ? 'var(--red)' : 'var(--green)' ?>"><?= h($ans) ?></span>
                         <?php else: ?>
                             <span style="color:var(--muted)">—</span>
                         <?php endif; ?>
