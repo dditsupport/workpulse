@@ -311,21 +311,27 @@ function checklistAttachmentMonth(string $logDate): string {
     return preg_match('/^(\d{4}-\d{2})/', $logDate, $m) ? $m[1] : date('Y-m');
 }
 
-// Build the storage directory for a (location, date) pair.
+// Build the storage directory for one attachment's scope.
 // Layout: uploads/checklist/{YYYY-MM}/{location_id}/ — month bucket first
 // (rolls a single month's uploads under one parent for easy archival /
 // trimming), location next. The log date itself isn't in the path because
 // every attachment already carries its date via chk_daily_responses.
 //
 // Employee-assigned (department) checklists have no outlet — they scope to
-// location_id = 0, which would otherwise pile all six departments into a
-// bogus "0" location folder. They get their own root instead, bucketed by
-// month only. location_id = 0 means department here by construction:
-// doSaveChecklist() forces a real outlet id on every location-mode save.
-function checklistAttachmentDir(int $locationId, string $logDate): string {
+// location_id = 0, which would otherwise pile every department into a bogus
+// "0" location folder. They get their own root, and inside the month bucket
+// a folder per checklist so the twenty-odd lists don't share one directory:
+//   uploads/department_checklist/{YYYY-MM}/{checklist_id}/
+// The checklist id rather than its name, matching how the location tree
+// keys on location_id: ids survive a rename, names do not.
+//
+// location_id = 0 means department here by construction: doSaveChecklist()
+// forces a real outlet id on every location-mode save.
+function checklistAttachmentDir(int $locationId, string $logDate, int $checklistId = 0): string {
     $monthBucket = checklistAttachmentMonth($logDate);
-    if ($locationId === 0) return DEPT_CHECKLIST_UPLOAD_DIR . $monthBucket . '/';
-    return CHECKLIST_UPLOAD_DIR . $monthBucket . '/' . $locationId . '/';
+    if ($locationId !== 0) return CHECKLIST_UPLOAD_DIR . $monthBucket . '/' . $locationId . '/';
+    return DEPT_CHECKLIST_UPLOAD_DIR . $monthBucket . '/'
+         . ($checklistId > 0 ? $checklistId . '/' : '');
 }
 
 // Legacy layout used briefly during the first rollout — kept as a
@@ -335,11 +341,18 @@ function checklistAttachmentDirLegacy(int $locationId, string $logDate): string 
     return CHECKLIST_UPLOAD_DIR . $locationId . '/' . $logDate . '/';
 }
 
-// Resolve the on-disk path for a stored file, trying the current layout
-// first and falling back to legacy. Returns null when neither exists.
-function checklistAttachmentPath(int $locationId, string $logDate, string $storedName): ?string {
-    $primary = checklistAttachmentDir($locationId, $logDate) . $storedName;
+// Resolve the on-disk path for a stored file, newest layout first and older
+// ones after. Nothing on disk is ever moved, so every layout this module has
+// written stays readable. Returns null when the file is under none of them.
+function checklistAttachmentPath(int $locationId, string $logDate, string $storedName, int $checklistId = 0): ?string {
+    $primary = checklistAttachmentDir($locationId, $logDate, $checklistId) . $storedName;
     if (file_exists($primary)) return $primary;
+    // Department files written before the per-checklist folder existed sit
+    // directly in the month bucket. Read-only fallback; never written.
+    if ($locationId === 0 && $checklistId > 0) {
+        $flat = DEPT_CHECKLIST_UPLOAD_DIR . checklistAttachmentMonth($logDate) . '/' . $storedName;
+        if (file_exists($flat)) return $flat;
+    }
     $legacy = checklistAttachmentDirLegacy($locationId, $logDate) . $storedName;
     if (file_exists($legacy)) return $legacy;
     // Department files written before department_checklist/ existed landed in
@@ -367,7 +380,7 @@ function checklistResponseId(int $checklistId, int $locationId, int $itemId, str
 // Persist files uploaded for one item under name="attachments[ITEM_ID][]".
 // Skips silently on size/extension/mime mismatches so a single bad file
 // doesn't derail the whole submit.
-function checklistSaveAttachments(int $responseId, int $locationId, string $logDate, int $itemId, string $uploaderCode): int {
+function checklistSaveAttachments(int $responseId, int $locationId, string $logDate, int $itemId, string $uploaderCode, int $checklistId = 0): int {
     if (empty($_FILES['attachments']['name'][$itemId]) || !is_array($_FILES['attachments']['name'][$itemId])) {
         return 0;
     }
@@ -378,7 +391,7 @@ function checklistSaveAttachments(int $responseId, int $locationId, string $logD
         'size'     => $_FILES['attachments']['size'][$itemId],
         'type'     => $_FILES['attachments']['type'][$itemId] ?? [],
     ];
-    $dir = checklistAttachmentDir($locationId, $logDate);
+    $dir = checklistAttachmentDir($locationId, $logDate, $checklistId);
     if (!is_dir($dir)) @mkdir($dir, 0755, true);
     $db = getDb();
     $st = $db->prepare(
@@ -766,7 +779,7 @@ function doSaveChecklist(): void {
             if (!checklistSectionEditable($secByItem[$itemId] ?? null, $logDate, $cl)) continue;
             $respId = checklistResponseId($checklistId, $locationId, $itemId, $logDate, $empCode);
             if ($respId === null) continue; // no answer yet → ignore file
-            $attSaved += checklistSaveAttachments($respId, $locationId, $logDate, $itemId, $empCode);
+            $attSaved += checklistSaveAttachments($respId, $locationId, $logDate, $itemId, $empCode, $checklistId);
         }
         if ($attSaved > 0) {
             $prev = $_SESSION['flash'] ?? null;
@@ -1075,7 +1088,7 @@ function downloadChecklistAttachment(): void {
     $attId = (int)($_GET['att_id'] ?? 0);
     $row   = checklistAttachmentForView($attId);
     if (!$row) { http_response_code(403); echo 'Access denied'; return; }
-    $path  = checklistAttachmentPath((int)$row['location_id'], (string)$row['log_date'], (string)$row['stored_name']);
+    $path  = checklistAttachmentPath((int)$row['location_id'], (string)$row['log_date'], (string)$row['stored_name'], (int)$row['checklist_id']);
     if (!$path) { http_response_code(404); echo 'File missing'; return; }
     header('Content-Type: ' . $row['mime_type']);
     header('Content-Disposition: inline; filename="' . str_replace('"', '', $row['filename']) . '"');
@@ -1118,7 +1131,7 @@ function doDeleteChecklistAttachment(): void {
         }
     }
 
-    $path = checklistAttachmentPath((int)$row['location_id'], (string)$row['log_date'], (string)$row['stored_name']);
+    $path = checklistAttachmentPath((int)$row['location_id'], (string)$row['log_date'], (string)$row['stored_name'], (int)$row['checklist_id']);
     try {
         getDb()->prepare('DELETE FROM chk_response_attachments WHERE id = ?')->execute([$attId]);
         if ($path) @unlink($path);
