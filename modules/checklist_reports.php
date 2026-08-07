@@ -36,18 +36,23 @@ function chkReportIsEmployeeMode(int $checklistId): bool {
     return $st->fetchColumn() === 'employee';
 }
 
+// How a checklist is named in a report dropdown. Two cycles of one department
+// share a name — "Operation - Paresh" is both a daily and a monthly checklist
+// — so the cycle is what tells the options apart. It also explains the gaps: a
+// weekly or monthly checklist files its answers against the first day of the
+// cycle, so only that date carries data in a day-by-day report.
+function chkReportOptionLabel(array $c): string {
+    $freq = function_exists('chkFrequency') ? chkFrequency($c) : 'daily';
+    return (string)$c['name'] . ($freq === 'daily' ? '' : ' — ' . chkFreqLabel($freq));
+}
+
 // A <form> GET selector for the active checklist, preserving extra hidden
 // params (e.g. the current month/date) so switching checklist keeps context.
 function chkReportSelectorHtml(int $selected, string $page, array $hidden = []): string {
     $opts = '';
     foreach (chkReportChecklists() as $c) {
         $sel = ((int)$c['id'] === $selected) ? ' selected' : '';
-        // A weekly / monthly checklist files its answers against the first day
-        // of the cycle, so only that date carries data in a day-by-day report
-        // — say which cycle it is so the gaps read as intended, not missing.
-        $freq = function_exists('chkFrequency') ? chkFrequency($c) : 'daily';
-        $tag  = $freq === 'daily' ? '' : ' — ' . chkFreqLabel($freq);
-        $opts .= '<option value="' . (int)$c['id'] . '"' . $sel . '>' . h($c['name'] . $tag) . '</option>';
+        $opts .= '<option value="' . (int)$c['id'] . '"' . $sel . '>' . h(chkReportOptionLabel($c)) . '</option>';
     }
     $h = '<input type="hidden" name="page" value="' . h($page) . '">';
     foreach ($hidden as $k => $v) $h .= '<input type="hidden" name="' . h($k) . '" value="' . h((string)$v) . '">';
@@ -272,7 +277,7 @@ function pageChecklistReport(): void {
             <label>Checklist</label>
             <select name="checklist_id" class="form-control" style="width:200px" onchange="this.form.submit()">
                 <?php foreach (chkReportChecklists() as $c): ?>
-                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h($c['name']) ?></option>
+                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h(chkReportOptionLabel($c)) ?></option>
                 <?php endforeach; ?>
             </select>
         </div>
@@ -688,7 +693,7 @@ function pageChecklistAudit(): void {
             <label>Checklist</label>
             <select name="checklist_id" class="form-control" style="width:180px" onchange="this.form.submit()">
                 <?php foreach (chkReportChecklists() as $c): ?>
-                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h($c['name']) ?></option>
+                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h(chkReportOptionLabel($c)) ?></option>
                 <?php endforeach; ?>
             </select>
         </div>
@@ -1192,7 +1197,7 @@ function pageChecklistOverview(): void {
             <label>Checklist</label>
             <select name="checklist_id" class="form-control" style="width:180px" onchange="this.form.submit()">
                 <?php foreach (chkReportChecklists() as $c): ?>
-                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h($c['name']) ?></option>
+                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h(chkReportOptionLabel($c)) ?></option>
                 <?php endforeach; ?>
             </select>
         </div>
@@ -1687,7 +1692,7 @@ function pageChecklistValidate(): void {
             <label>Checklist</label>
             <select name="checklist_id" class="form-control" style="width:200px" onchange="this.form.submit()">
                 <?php foreach ($validatable as $c): ?>
-                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h($c['name']) ?></option>
+                <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $checklistId ? 'selected' : '' ?>><?= h(chkReportOptionLabel($c)) ?></option>
                 <?php endforeach; ?>
             </select>
         </div>
