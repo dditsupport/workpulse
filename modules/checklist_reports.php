@@ -10,9 +10,12 @@
 
 // Active checklists for the report selector.
 function chkReportChecklists(): array {
+    // frequency is only selected once the column exists, so the reports keep
+    // working on a database that has not run the migration.
+    $freqCol = (function_exists('chkHasFrequency') && chkHasFrequency()) ? ', frequency' : '';
     try {
         return getDb()->query(
-            "SELECT id, name, assign_type FROM chk_checklists WHERE is_active = 1 ORDER BY sort_order, id"
+            "SELECT id, name, assign_type{$freqCol} FROM chk_checklists WHERE is_active = 1 ORDER BY sort_order, id"
         )->fetchAll(PDO::FETCH_ASSOC);
     } catch (Exception $e) { return []; }
 }
@@ -39,7 +42,12 @@ function chkReportSelectorHtml(int $selected, string $page, array $hidden = []):
     $opts = '';
     foreach (chkReportChecklists() as $c) {
         $sel = ((int)$c['id'] === $selected) ? ' selected' : '';
-        $opts .= '<option value="' . (int)$c['id'] . '"' . $sel . '>' . h($c['name']) . '</option>';
+        // A weekly / monthly checklist files its answers against the first day
+        // of the cycle, so only that date carries data in a day-by-day report
+        // — say which cycle it is so the gaps read as intended, not missing.
+        $freq = function_exists('chkFrequency') ? chkFrequency($c) : 'daily';
+        $tag  = $freq === 'daily' ? '' : ' — ' . chkFreqLabel($freq);
+        $opts .= '<option value="' . (int)$c['id'] . '"' . $sel . '>' . h($c['name'] . $tag) . '</option>';
     }
     $h = '<input type="hidden" name="page" value="' . h($page) . '">';
     foreach ($hidden as $k => $v) $h .= '<input type="hidden" name="' . h($k) . '" value="' . h((string)$v) . '">';
