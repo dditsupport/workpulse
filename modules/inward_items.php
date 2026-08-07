@@ -155,6 +155,17 @@ function inwCleanMrp($raw): ?float {
     return round($f, 2);
 }
 
+// Whole units received. Accepts "10", "10.0" and "1,000"; anything with a
+// real fractional part is refused rather than silently truncated.
+function inwCleanQty($raw): ?int {
+    $v = str_replace([',', ' '], '', trim((string)$raw));
+    if ($v === '' || !is_numeric($v)) return null;
+    $f = (float)$v;
+    if ($f < 0 || $f > 99999999) return null;
+    if (abs($f - round($f)) > 0.0001) return null;
+    return (int)round($f);
+}
+
 function inwCleanCode($raw): ?string {
     $c = trim((string)$raw);
     if ($c === '' || strlen($c) > 64) return null;
@@ -170,6 +181,8 @@ function inwCsvColumns(): array {
                         'aliases' => ['code', 'item code']],
         'item_name' => ['label' => 'Name',            'required' => false,
                         'aliases' => ['name', 'item name', 'description']],
+        'qty'       => ['label' => 'Qty',             'required' => true,
+                        'aliases' => ['qty', 'quantity', 'qnty']],
         'mrp'       => ['label' => 'MRP',             'required' => true,
                         'aliases' => ['mrp', 'price']],
         'barcode'   => ['label' => 'BarCode',         'required' => true,
@@ -280,35 +293,73 @@ function inwBuildWhere(array $f): array {
     return ['where' => $where, 'params' => $params];
 }
 
-function inwGetList(array $f): array {
-    $empty = ['rows' => [], 'total' => 0, 'page' => 1, 'pages' => 1, 'per_page' => INW_PAGE_SIZE];
+// The list page's tree: item code → barcode → batches.
+//
+// Paginates over item CODES, not rows, so a group is never split across
+// pages — an item with nine batches shows all nine or none. Two queries:
+// the codes on this page, then every matching row for those codes.
+function inwGetTree(array $f): array {
+    $empty = ['groups' => [], 'total' => 0, 'page' => 1, 'pages' => 1];
     if (!inwHasTable()) return $empty;
 
     $flt  = inwBuildWhere($f);
     $base = ' FROM inward_items WHERE 1=1' . $flt['where'];
 
     try {
-        $c = getDb()->prepare('SELECT COUNT(*)' . $base);
+        $c = getDb()->prepare('SELECT COUNT(DISTINCT item_code)' . $base);
         $c->execute($flt['params']);
         $total = (int)$c->fetchColumn();
     } catch (Exception $e) { return $empty; }
 
-    $pages = $total > 0 ? (int)ceil($total / INW_PAGE_SIZE) : 1;
-    $page  = min(max(1, (int)$f['page']), $pages);
-    $off   = ($page - 1) * INW_PAGE_SIZE;
+    $perPage = 25;
+    $pages   = $total > 0 ? (int)ceil($total / $perPage) : 1;
+    $page    = min(max(1, (int)$f['page']), $pages);
+    $off     = ($page - 1) * $perPage;
 
     try {
+        // Soonest expiry first, so the codes needing attention lead.
         $st = getDb()->prepare(
-            'SELECT *' . $base
-            . ' ORDER BY expire_on ASC, item_code ASC, mrp ASC'
-            . ' LIMIT ' . (int)INW_PAGE_SIZE . ' OFFSET ' . (int)$off
+            'SELECT item_code, MIN(expire_on) AS first_expiry' . $base
+            . ' GROUP BY item_code ORDER BY first_expiry ASC, item_code ASC'
+            . ' LIMIT ' . (int)$perPage . ' OFFSET ' . (int)$off
         );
         $st->execute($flt['params']);
+        $codes = $st->fetchAll(PDO::FETCH_COLUMN);
+    } catch (Exception $e) { return $empty; }
+    if (!$codes) return ['groups' => [], 'total' => $total, 'page' => $page, 'pages' => $pages];
+
+    $in = implode(',', array_fill(0, count($codes), '?'));
+    try {
+        $st = getDb()->prepare(
+            'SELECT *' . $base . " AND item_code IN ($in)"
+            . ' ORDER BY item_code ASC, mrp ASC, expire_on ASC, id ASC'
+        );
+        $st->execute(array_merge($flt['params'], $codes));
         $rows = $st->fetchAll(PDO::FETCH_ASSOC);
     } catch (Exception $e) { $rows = []; }
 
-    return ['rows' => $rows, 'total' => $total, 'page' => $page,
-            'pages' => $pages, 'per_page' => INW_PAGE_SIZE];
+    // item_code → barcode → batch rows, carrying roll-ups for the headers.
+    $groups = [];
+    foreach ($rows as $r) {
+        $code = (string)$r['item_code'];
+        $bc   = (string)$r['barcode'];
+        if (!isset($groups[$code])) {
+            $groups[$code] = ['item_code' => $code, 'item_name' => '', 'qty' => 0,
+                              'batches' => 0, 'barcodes' => []];
+        }
+        // Newest non-blank name wins — rows are ordered by id within a
+        // barcode, so a later import's corrected name surfaces.
+        if (trim((string)($r['item_name'] ?? '')) !== '') $groups[$code]['item_name'] = $r['item_name'];
+        if (!isset($groups[$code]['barcodes'][$bc])) {
+            $groups[$code]['barcodes'][$bc] = ['barcode' => $bc, 'mrp' => $r['mrp'],
+                                               'qty' => 0, 'rows' => []];
+        }
+        $groups[$code]['barcodes'][$bc]['rows'][] = $r;
+        $groups[$code]['barcodes'][$bc]['qty']   += (int)$r['qty'];
+        $groups[$code]['qty']                    += (int)$r['qty'];
+        $groups[$code]['batches']++;
+    }
+    return ['groups' => $groups, 'total' => $total, 'page' => $page, 'pages' => $pages];
 }
 
 // Bucket counts for the filter chips on the list page.
@@ -398,51 +449,44 @@ function inwDaysLeft(string $ymd): int {
 // the descriptive fields in place and keeps status + validator history, so
 // re-importing a corrected sheet never resurrects settled work or re-queues a
 // barcode the validator has already put into the ERP.
-function inwUpsertRows(array $rows, string $source): array {
+// The register is append-only: every entered line becomes its own row.
+//
+// A batch is a quantity of one barcode with one expiry, and the same
+// barcode legitimately arrives again later with a different expiry — so
+// nothing is merged, no expiry is ever rewritten by a later import, and
+// quantities are never summed. Each row carries created_at, which the tree
+// shows as "added", so two batches that differ only by when they were
+// received stay tellable apart.
+function inwInsertRows(array $rows, string $source): int {
     $db  = getDb();
     $me  = myCode();
     $ins = $db->prepare(
         'INSERT INTO inward_items
-            (item_code, item_name, mrp, barcode, expire_on, status, source, created_by, created_at)
-         VALUES (?, ?, ?, ?, ?, \'pending\', ?, ?, NOW())'
-    );
-    // Re-uploading the same item code and barcode with a later date moves
-    // the expiry on the existing row — no second row, and the row keeps its
-    // status and validator history. mrp is written too, but the composed
-    // barcode already encodes it, so a barcode match implies an mrp match
-    // and the assignment is a no-op in practice.
-    $upd = $db->prepare(
-        'UPDATE inward_items SET item_name = ?, mrp = ?, expire_on = ? WHERE id = ?'
+            (item_code, item_name, qty, mrp, barcode, expire_on, status, source, created_by, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, \'pending\', ?, ?, NOW())'
     );
 
-    $inserted = 0; $updated = 0;
+    $inserted = 0;
     $db->beginTransaction();
     try {
         foreach ($rows as $r) {
-            $live = inwFindLive($r['barcode']);
-            if ($live) {
-                // A blank Name keeps whatever is on file; a filled one
-                // overwrites it (that is how a renamed product is corrected).
-                $name = $r['item_name'] !== null && $r['item_name'] !== ''
-                      ? $r['item_name']
-                      : ($live['item_name'] ?? null);
-                $upd->execute([$name, $r['mrp'], $r['expire_on'], (int)$live['id']]);
-                $updated++;
-            } else {
-                $name = $r['item_name'] !== null && $r['item_name'] !== ''
-                      ? $r['item_name']
-                      : inwLookupName($r['item_code']);
-                $ins->execute([$r['item_code'], $name, $r['mrp'], $r['barcode'],
-                               $r['expire_on'], $source, $me]);
-                $inserted++;
-            }
+            // A blank Name falls back to the master price list; whatever is
+            // supplied is what this row carries. Rows entered earlier keep
+            // the name they were entered with — an import adds history, it
+            // doesn't rewrite it.
+            $name = $r['item_name'] !== null && $r['item_name'] !== ''
+                  ? $r['item_name']
+                  : inwLookupName($r['item_code']);
+            $ins->execute([$r['item_code'], $name, $r['qty'], $r['mrp'], $r['barcode'],
+                           $r['expire_on'], $source, $me]);
+            $inserted++;
         }
         $db->commit();
     } catch (Exception $e) {
         if ($db->inTransaction()) $db->rollBack();
         throw $e;
     }
-    return [$inserted, $updated];
+    return $inserted;
 }
 
 // ── POST: add rows from the entry form ───────────────────
@@ -454,6 +498,7 @@ function doInwardItemAdd(): void {
 
     $codes    = $_POST['item_code'] ?? [];
     $names    = $_POST['item_name'] ?? [];
+    $qtys     = $_POST['qty']       ?? [];
     $mrps     = $_POST['mrp']       ?? [];
     $barcodes = $_POST['barcode']   ?? [];
     $expiries = $_POST['expire_on'] ?? [];
@@ -464,14 +509,16 @@ function doInwardItemAdd(): void {
     for ($i = 0; $i < $n; $i++) {
         $code = trim((string)($codes[$i] ?? ''));
         $bc   = trim((string)($barcodes[$i] ?? ''));
+        $qty  = trim((string)($qtys[$i] ?? ''));
         $mrp  = trim((string)($mrps[$i] ?? ''));
         $exp  = trim((string)($expiries[$i] ?? ''));
         // Fully blank row — the repeater always renders at least one.
-        if ($code === '' && $bc === '' && $mrp === '' && $exp === '') continue;
+        if ($code === '' && $bc === '' && $qty === '' && $mrp === '' && $exp === '') continue;
 
         $label   = 'Row ' . ($i + 1) . ': ';
         $vCode   = inwCleanCode($code);
         $vEan    = inwCleanEan($bc);
+        $vQty    = inwCleanQty($qty);
         $vMrp    = inwCleanMrp($mrp);
         $vExp    = inwParseFormDate($exp);
 
@@ -479,15 +526,22 @@ function doInwardItemAdd(): void {
         if ($vEan  === null) $errors[] = $label . (str_contains($bc, INW_BARCODE_SEP) || str_contains($bc, '.')
             ? 'enter the barcode without the MRP (e.g. 7622202357039) — the MRP is joined automatically.'
             : 'barcode must be digits only (e.g. 7622202357039).');
+        if ($vQty  === null) $errors[] = $label . 'quantity must be a whole number.';
         if ($vMrp  === null) $errors[] = $label . 'MRP must be a number.';
         if ($vExp  === null) $errors[] = $label . 'pick a valid expiry date.';
-        if ($vCode === null || $vEan === null || $vMrp === null || $vExp === null) continue;
+        if ($vCode === null || $vEan === null || $vQty === null || $vMrp === null || $vExp === null) continue;
 
         // Same join as the importer — one rule for both entry paths.
         $vBar = inwComposeBarcode($vMrp, $vEan);
 
-        if (isset($seen[$vBar])) { $errors[] = $label . 'barcode ' . $vBar . ' is repeated in this form.'; continue; }
-        $seen[$vBar] = true;
+        // Repeating a barcode is fine — that's a second batch. Only the same
+        // barcode AND expiry twice is indistinguishable and so an error.
+        $key = $vBar . '|' . $vExp;
+        if (isset($seen[$key])) {
+            $errors[] = $label . 'barcode ' . $vBar . ' expiring ' . inwFmtDate($vExp) . ' is repeated in this form.';
+            continue;
+        }
+        $seen[$key] = true;
 
         $live = inwFindLive($vBar);
         if ($live && (string)$live['item_code'] !== $vCode) {
@@ -495,15 +549,15 @@ function doInwardItemAdd(): void {
             continue;
         }
         $rows[] = ['item_code' => $vCode, 'item_name' => trim((string)($names[$i] ?? '')),
-                   'mrp' => $vMrp, 'barcode' => $vBar, 'expire_on' => $vExp];
+                   'qty' => $vQty, 'mrp' => $vMrp, 'barcode' => $vBar, 'expire_on' => $vExp];
     }
 
     if ($errors) { flash('error', implode(' ', array_slice($errors, 0, 10))); header('Location: ' . $back); exit; }
     if (!$rows)  { flash('error', 'Fill in at least one row.');               header('Location: ' . $back); exit; }
 
     try {
-        [$ins, $upd] = inwUpsertRows($rows, 'form');
-        flash('success', "Saved — {$ins} new, {$upd} updated.");
+        $ins = inwInsertRows($rows, 'form');
+        flash('success', "Saved {$ins} batch row(s).");
         header('Location: index.php?page=inward_items&view=1'); exit;
     } catch (Exception $e) {
         flash('error', 'Save failed: ' . $e->getMessage());
@@ -595,11 +649,14 @@ function doInwardItemImport(): void {
 
         $vCode = inwCleanCode($cell($r, 'item_code'));
         $vEan  = inwCleanEan($cell($r, 'barcode'));
+        $vQty  = inwCleanQty($cell($r, 'qty'));
         $vMrp  = inwCleanMrp($cell($r, 'mrp'));
         $vExp  = inwBuildDate($cell($r, 'exp_day'), $cell($r, 'exp_month'), $cell($r, 'exp_year'));
         $name  = trim((string)$cell($r, 'item_name'));
 
         if ($vCode === null) $errors[] = "Line {$line}: Code is required.";
+        if ($vQty  === null) $errors[] = "Line {$line}: Qty \"" . trim((string)$cell($r, 'qty'))
+                                       . '" must be a whole number.';
         if ($vEan  === null) {
             $rawBar = trim((string)$cell($r, 'barcode'));
             // Point at the format explicitly — a sheet carrying the MRP in
@@ -613,16 +670,22 @@ function doInwardItemImport(): void {
         if ($vExp  === null) $errors[] = "Line {$line}: expiry " . trim((string)$cell($r, 'exp_day')) . '/'
                                        . trim((string)$cell($r, 'exp_month')) . '/'
                                        . trim((string)$cell($r, 'exp_year')) . ' is not a valid date.';
-        if ($vCode === null || $vEan === null || $vMrp === null || $vExp === null) continue;
+        if ($vCode === null || $vEan === null || $vQty === null || $vMrp === null || $vExp === null) continue;
 
         // MRP and barcode arrive separately; the stored value joins them.
         $vBar = inwComposeBarcode($vMrp, $vEan);
 
-        if (isset($seen[$vBar])) {
-            $errors[] = "Line {$line}: BarCode {$vBar} already appears on line {$seen[$vBar]}.";
+        // A barcode may repeat within one file — that's two batches of the
+        // same product at different expiries, which is exactly what the
+        // register is for. Only an identical barcode AND expiry is a
+        // duplicate, since there is no way to tell those two lines apart.
+        $key = $vBar . '|' . $vExp;
+        if (isset($seen[$key])) {
+            $errors[] = "Line {$line}: BarCode {$vBar} expiring "
+                      . inwFmtDate($vExp) . " already appears on line {$seen[$key]}.";
             continue;
         }
-        $seen[$vBar] = $line;
+        $seen[$key] = $line;
 
         // A barcode that already belongs to another item code is a data
         // error, not something to silently reassign.
@@ -632,8 +695,8 @@ function doInwardItemImport(): void {
             continue;
         }
 
-        $rows[] = ['item_code' => $vCode, 'item_name' => $name, 'mrp' => $vMrp,
-                   'barcode' => $vBar, 'expire_on' => $vExp];
+        $rows[] = ['item_code' => $vCode, 'item_name' => $name, 'qty' => $vQty,
+                   'mrp' => $vMrp, 'barcode' => $vBar, 'expire_on' => $vExp];
     }
     fclose($fh);
 
@@ -651,8 +714,8 @@ function doInwardItemImport(): void {
     }
 
     try {
-        [$ins, $upd] = inwUpsertRows($rows, 'import');
-        flash('success', "Imported — {$ins} new, {$upd} updated.");
+        $ins = inwInsertRows($rows, 'import');
+        flash('success', "Imported {$ins} batch row(s).");
     } catch (Exception $e) {
         flash('error', 'Import failed: ' . $e->getMessage());
     }
@@ -758,9 +821,12 @@ function doInwardSampleCsv(): void {
     // BarCode is the plain barcode — the MRP is joined on automatically.
     // The two 704804 rows show the shape that matters: one barcode, two
     // live MRPs, becoming 53-7622202357039 and 55-7622202357039.
-    fputcsv($out, ['700757', '10 Round Plate Classic (10Pc x 12PKT)', '10', '123456', '30', '9', '26'], ',', '"', '');
-    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '53', '7622202357039', '30', '9', '2026'], ',', '"', '');
-    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '55', '7622202357039', '30', '9', '2026'], ',', '"', '');
+    fputcsv($out, ['700757', '10 Round Plate Classic (10Pc x 12PKT)', '10', '10', '123456', '30', '9', '26'], ',', '"', '');
+    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '10', '53', '7622202357039', '30', '9', '2026'], ',', '"', '');
+    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '10', '55', '7622202357039', '30', '9', '2026'], ',', '"', '');
+    // A second batch of the same barcode at a later expiry — a new row, never
+    // merged into the one above and never summed with it.
+    fputcsv($out, ['704804', 'Cadbury - Bournville Cranberry 30 gm', '24', '55', '7622202357039', '31', '12', '2026'], ',', '"', '');
     fclose($out);
     exit;
 }
@@ -801,7 +867,7 @@ function doInwardItemsExport(): void {
             // off, so an exported sheet can be corrected and re-imported to
             // exactly the same stored value. The joined form follows in its
             // own column for reference; the importer ignores it.
-            $r['item_code'], $r['item_name'] ?? '', $r['mrp'],
+            $r['item_code'], $r['item_name'] ?? '', $r['qty'], $r['mrp'],
             inwBarcodeEan((string)$r['barcode'], $r['mrp']),
             $t ? date('d', $t) : '', $t ? date('n', $t) : '', $t ? date('Y', $t) : '',
             $r['barcode'],
@@ -847,6 +913,7 @@ function inwBuildDigestEmail(array $today, array $overdue): string {
            . "<thead><tr style='background:#fafafa'>"
            . "<th style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'>Code</th>"
            . "<th style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'>Item</th>"
+           . "<th style='padding:6px 8px;text-align:right;border-bottom:1px solid #ddd'>Qty</th>"
            . "<th style='padding:6px 8px;text-align:right;border-bottom:1px solid #ddd'>MRP</th>"
            . "<th style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'>BarCode</th>"
            . "<th style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'>Expiry</th>"
@@ -863,6 +930,7 @@ function inwBuildDigestEmail(array $today, array $overdue): string {
             $h .= '<tr>'
                 . "<td style='padding:5px 8px;border-bottom:1px solid #eee'>" . h((string)$r['item_code']) . '</td>'
                 . "<td style='padding:5px 8px;border-bottom:1px solid #eee'>" . h((string)($r['item_name'] ?? '—')) . '</td>'
+                . "<td style='padding:5px 8px;border-bottom:1px solid #eee;text-align:right'>" . (int)$r['qty'] . '</td>'
                 . "<td style='padding:5px 8px;border-bottom:1px solid #eee;text-align:right'>" . inwFmtMoney($r['mrp']) . '</td>'
                 . "<td style='padding:5px 8px;border-bottom:1px solid #eee;font-family:monospace'>" . $bc . '</td>'
                 . "<td style='padding:5px 8px;border-bottom:1px solid #eee'>" . inwFmtDate((string)$r['expire_on']) . '</td>'
@@ -952,8 +1020,31 @@ function inwPageStyles(): void {
 .inw-chip.on{background:rgba(26,143,227,.14);border-color:rgba(26,143,227,.45);color:#9ed1f6}
 .inw-chip b{font-weight:700;color:inherit}
 .inw-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-.inw-row-grid{display:grid;grid-template-columns:1.1fr 2fr .7fr 1.4fr 1fr 32px;gap:8px;align-items:end;margin-bottom:8px}
+.inw-row-grid{display:grid;grid-template-columns:1.1fr 1.8fr .5fr .6fr 1.3fr 1fr 32px;gap:8px;align-items:end;margin-bottom:8px}
 @media(max-width:900px){.inw-row-grid{grid-template-columns:1fr 1fr;}}
+
+/* Tree: item code → barcode → batches. Collapse is a single class on the
+   node, so a closed parent hides its whole subtree with no extra state. */
+.inw-tree{border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--surface)}
+.inw-node > .inw-kids{display:none;padding:0 0 0 18px}
+.inw-node.open > .inw-kids{display:block}
+.inw-node.open > .inw-head > .inw-caret{transform:rotate(90deg)}
+.inw-head{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:9px 12px;background:none;border:0;border-top:1px solid var(--border);color:inherit;font:inherit;cursor:pointer}
+.inw-tree > .inw-node:first-child > .inw-head{border-top:0}
+.inw-head:hover{background:rgba(255,255,255,.04)}
+.inw-head-code{font-weight:600}
+.inw-head-bc{font-size:13px;padding-left:6px}
+.inw-caret{display:inline-block;transition:transform .12s ease;color:var(--muted);font-size:11px;flex:0 0 10px}
+.inw-head .inw-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400}
+.inw-head .inw-mrp{font-weight:600;min-width:70px}
+.inw-head .inw-meta{margin-left:auto;font-size:11px;font-weight:400;color:var(--muted);white-space:nowrap;flex:0 0 auto}
+.inw-head.inw-due .inw-code,.inw-head.inw-due .inw-mrp{color:var(--red)}
+.inw-kids .table-wrap{border-radius:6px}
+@media(max-width:700px){
+  .inw-head{flex-wrap:wrap;gap:6px}
+  .inw-head .inw-meta{margin-left:0;flex-basis:100%}
+  .inw-head .inw-name{flex-basis:100%}
+}
 </style>
 <?php
 }
@@ -964,8 +1055,8 @@ function pageInwardItems(): void {
     if (!inwHasTable()) { echo inwMigrationNotice(); return; }
 
     $f      = inwResolveFilter();
-    $res    = inwGetList($f);
-    $rows   = $res['rows'];
+    $res    = inwGetTree($f);
+    $groups = $res['groups'];
     $counts = inwCounts();
     $today  = date('Y-m-d');
 
@@ -983,7 +1074,7 @@ function pageInwardItems(): void {
 <div class="page-header" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
     <h2 style="margin:0">Inward Items</h2>
     <span style="font-size:12px;color:var(--muted)">
-        <?= (int)$res['total'] ?> matching
+        <?= (int)$res['total'] ?> item code<?= (int)$res['total'] === 1 ? '' : 's' ?>
         <?php if ($res['pages'] > 1): ?> · page <?= (int)$res['page'] ?> of <?= (int)$res['pages'] ?><?php endif; ?>
     </span>
     <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
@@ -1048,7 +1139,7 @@ function pageInwardItems(): void {
                 <div style="background:rgba(26,143,227,.10);border:1px solid rgba(26,143,227,.35);border-radius:6px;padding:10px 12px;font-size:12px;line-height:1.6">
                     Put the <b>MRP</b> and the <b>plain barcode</b> in their own columns —
                     the system joins them with a <code><?= h(INW_BARCODE_SEP) ?></code>. The same item code may
-                    appear on several rows, one per MRP, each keeping its own expiry:
+                    appear on several rows — one per MRP, and again per expiry — each with its own Qty:
                     <div style="margin-top:6px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.7">
                         53 + 7622202357039 &rarr; 53<?= h(INW_BARCODE_SEP) ?>7622202357039<br>
                         55 + 7622202357039 &rarr; 55<?= h(INW_BARCODE_SEP) ?>7622202357039<br>
@@ -1067,8 +1158,10 @@ function pageInwardItems(): void {
                         <span style="opacity:.8;display:block;margin-top:5px">
                             BarCode is the plain barcode, without the MRP — the MRP column is joined onto it automatically.
                             Year takes 2 or 4 digits — <code>26</code> and <code>2026</code> both mean 2026.
-                            Name is optional: leave it blank to keep the name already on file, or fill it in to update a renamed product.
-                            Re-uploading the same item code and barcode with a new expiry updates that row's date — it does not add a second row.
+                            Name is optional; leave it blank to pull it from the master price list.
+                            <b>Every line is recorded as its own batch</b> with the date it was added — quantities are never summed
+                            and an existing expiry is never overwritten. The same barcode may appear more than once, as long as
+                            each of those rows has a different expiry.
                         </span>
                     </div>
                 </div>
@@ -1089,39 +1182,102 @@ function inwCloseImport(e){
 </script>
 <?php endif; ?>
 
-<div class="table-wrap" data-stack>
-    <table class="table">
-        <thead>
-            <tr>
-                <th style="width:90px">Code</th>
-                <th>Item</th>
-                <th style="width:90px;text-align:right">MRP</th>
-                <th style="width:170px">BarCode</th>
-                <th style="width:110px">Expiry</th>
-                <th style="width:120px">Status</th>
-                <th style="width:80px"></th>
-            </tr>
-        </thead>
-        <tbody>
-        <?php if (!$rows): ?>
-            <tr><td colspan="7" style="text-align:center;color:var(--muted);padding:26px">
-                Nothing here. Try another filter, or use the chips above.
-            </td></tr>
-        <?php else: foreach ($rows as $r):
-            $overdue = $r['status'] === 'active' && $r['expire_on'] < $today; ?>
-            <tr>
-                <td class="inw-code"><?= h((string)$r['item_code']) ?></td>
-                <td><?= h((string)($r['item_name'] ?? '')) ?: '<span class="text-muted">—</span>' ?></td>
-                <td style="text-align:right"><?= inwFmtMoney($r['mrp']) ?></td>
-                <td class="inw-code"><?= h((string)$r['barcode']) ?></td>
-                <td<?= $overdue ? ' style="color:var(--red);font-weight:600"' : '' ?>><?= h(inwFmtDate((string)$r['expire_on'])) ?></td>
-                <td><?= inwStatusBadge($r) ?></td>
-                <td><a href="?page=inward_item_detail&id=<?= (int)$r['id'] ?>" class="btn btn-sm btn-secondary">Open</a></td>
-            </tr>
-        <?php endforeach; endif; ?>
-        </tbody>
-    </table>
+<?php if (!$groups): ?>
+<div class="table-wrap" style="text-align:center;color:var(--muted);padding:26px">
+    Nothing here. Try another filter, or use the chips above.
 </div>
+<?php else: ?>
+<div style="display:flex;gap:8px;margin-bottom:8px">
+    <button type="button" class="btn btn-sm btn-ghost" onclick="inwTreeAll(true)">Expand all</button>
+    <button type="button" class="btn btn-sm btn-ghost" onclick="inwTreeAll(false)">Collapse all</button>
+</div>
+<div class="inw-tree">
+<?php foreach ($groups as $g):
+    // A code is "due" if any of its batches is live and at or past expiry —
+    // that's what decides whether the collapsed row flags for attention.
+    $gDue = false;
+    foreach ($g['barcodes'] as $b) foreach ($b['rows'] as $r) {
+        if ($r['status'] === 'active' && $r['expire_on'] <= $today) $gDue = true;
+    } ?>
+    <div class="inw-node">
+        <button type="button" class="inw-head inw-head-code<?= $gDue ? ' inw-due' : '' ?>" onclick="inwToggle(this)">
+            <span class="inw-caret">▸</span>
+            <span class="inw-code"><?= h($g['item_code']) ?></span>
+            <span class="inw-name"><?= h($g['item_name']) ?: '<span class="text-muted">—</span>' ?></span>
+            <span class="inw-meta">
+                <?= count($g['barcodes']) ?> barcode<?= count($g['barcodes']) === 1 ? '' : 's' ?>
+                · <?= (int)$g['batches'] ?> batch<?= (int)$g['batches'] === 1 ? '' : 'es' ?>
+                · qty <b><?= (int)$g['qty'] ?></b>
+            </span>
+        </button>
+        <div class="inw-kids">
+        <?php foreach ($g['barcodes'] as $b):
+            $bDue = false;
+            foreach ($b['rows'] as $r) if ($r['status'] === 'active' && $r['expire_on'] <= $today) $bDue = true; ?>
+            <div class="inw-node">
+                <button type="button" class="inw-head inw-head-bc<?= $bDue ? ' inw-due' : '' ?>" onclick="inwToggle(this)">
+                    <span class="inw-caret">▸</span>
+                    <span class="inw-mrp"><?= inwFmtMoney($b['mrp']) ?></span>
+                    <span class="inw-code"><?= h($b['barcode']) ?></span>
+                    <span class="inw-meta">
+                        <?= count($b['rows']) ?> batch<?= count($b['rows']) === 1 ? '' : 'es' ?>
+                        · qty <b><?= (int)$b['qty'] ?></b>
+                    </span>
+                </button>
+                <div class="inw-kids">
+                    <div class="table-wrap" data-stack style="margin:0 0 6px">
+                        <table class="table">
+                            <thead>
+                                <tr>
+                                    <th style="width:90px;text-align:right">Qty</th>
+                                    <th style="width:130px">Expires</th>
+                                    <th style="width:140px">Status</th>
+                                    <th style="width:170px">Added</th>
+                                    <th></th>
+                                    <th style="width:80px"></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                            <?php foreach ($b['rows'] as $r):
+                                $overdue = $r['status'] === 'active' && $r['expire_on'] < $today; ?>
+                                <tr>
+                                    <td style="text-align:right"><b><?= (int)$r['qty'] ?></b></td>
+                                    <td<?= $overdue ? ' style="color:var(--red);font-weight:600"' : '' ?>><?= h(inwFmtDate((string)$r['expire_on'])) ?></td>
+                                    <td><?= inwStatusBadge($r) ?></td>
+                                    <td style="font-size:11px;color:var(--muted)">
+                                        <?= h(inwFmtDate(substr((string)$r['created_at'], 0, 10))) ?>
+                                        · <?= h((string)$r['created_by']) ?>
+                                    </td>
+                                    <td style="font-size:11px;color:var(--muted)"><?= h((string)($r['item_name'] ?? '')) ?></td>
+                                    <td><a href="?page=inward_item_detail&id=<?= (int)$r['id'] ?>" class="btn btn-sm btn-secondary">Open</a></td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        <?php endforeach; ?>
+        </div>
+    </div>
+<?php endforeach; ?>
+</div>
+<script>
+// Expand/collapse is a class on the node, so nesting works without any
+// per-level bookkeeping: a collapsed parent hides its subtree wholesale.
+function inwToggle(btn){ btn.parentNode.classList.toggle('open'); }
+function inwTreeAll(open){
+    document.querySelectorAll('.inw-tree .inw-node').forEach(function(n){
+        n.classList[open ? 'add' : 'remove']('open');
+    });
+}
+// Anything already expired or expiring today opens on load — the rows that
+// need action shouldn't need hunting for.
+document.querySelectorAll('.inw-tree .inw-head.inw-due').forEach(function(h){
+    h.parentNode.classList.add('open');
+});
+</script>
+<?php endif; ?>
 
 <?php if ($res['pages'] > 1):
     $qs = ['page' => 'inward_items', 'view' => 1, 'q' => $f['q'], 'status' => $f['status'],
@@ -1151,15 +1307,16 @@ function pageInwardItemNew(): void {
 
 <div class="form-card" style="max-width:none">
     <div style="font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:14px">
-        One row per barcode. An item code can carry several barcodes at once — one per MRP —
-        so add a row for each. Enter the <b>plain barcode</b>; the MRP is joined onto it with a
+        One row per batch — a quantity of one barcode with one expiry. An item code can carry
+        several barcodes at once (one per MRP), and the same barcode can appear again at a later
+        expiry, so add a row for each. Enter the <b>plain barcode</b>; the MRP is joined onto it with a
         <code><?= h(INW_BARCODE_SEP) ?></code> when saved, and the result is previewed under the field.
         Leave the name blank to pull it from the master price list.
     </div>
     <form method="POST" id="inwForm">
         <input type="hidden" name="action" value="inw_add">
         <div class="inw-row-grid" style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.04em">
-            <div>Item Code</div><div>Name</div><div>MRP</div><div>BarCode <span style="font-weight:400;text-transform:none;letter-spacing:0">(without MRP)</span></div><div>Expires On</div><div></div>
+            <div>Item Code</div><div>Name</div><div>Qty</div><div>MRP</div><div>BarCode <span style="font-weight:400;text-transform:none;letter-spacing:0">(without MRP)</span></div><div>Expires On</div><div></div>
         </div>
         <div id="inwRows"></div>
         <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
@@ -1180,6 +1337,7 @@ function inwRowHtml(){
     return '<div class="inw-row-grid">'
       + '<div><input type="text" name="item_code[]" class="form-control" placeholder="704804" list="inwItemList" oninput="inwSuggest(this)" onchange="inwFillName(this)"></div>'
       + '<div><input type="text" name="item_name[]" class="form-control" placeholder="(auto from price list)"></div>'
+      + '<div><input type="text" name="qty[]" class="form-control" inputmode="numeric" placeholder="10"></div>'
       + '<div><input type="text" name="mrp[]" class="form-control" inputmode="decimal" placeholder="55" oninput="inwPreview(this)"></div>'
       + '<div><input type="text" name="barcode[]" class="form-control" inputmode="numeric" placeholder="7622202357039" oninput="inwPreview(this)">'
       +   '<div class="inw-preview" style="font-size:10px;color:var(--muted);margin-top:3px;min-height:13px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace"></div></div>'
@@ -1295,6 +1453,7 @@ function pageInwardItemDetail(): void {
             <tbody>
                 <tr><th style="width:190px">Item Code</th><td class="inw-code"><?= h((string)$r['item_code']) ?></td></tr>
                 <tr><th>Item Name</th><td><?= h((string)($r['item_name'] ?? '')) ?: '<span class="text-muted">—</span>' ?></td></tr>
+                <tr><th>Qty</th><td><b><?= (int)$r['qty'] ?></b></td></tr>
                 <tr><th>MRP</th><td><?= inwFmtMoney($r['mrp']) ?></td></tr>
                 <tr><th>BarCode</th><td class="inw-code"><?= h((string)$r['barcode']) ?></td></tr>
                 <tr><th>Expires On</th><td><?= h(inwFmtDate((string)$r['expire_on'])) ?>

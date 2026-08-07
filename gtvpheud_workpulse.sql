@@ -673,6 +673,7 @@ CREATE TABLE `inward_items` (
   `id` int(10) UNSIGNED NOT NULL,
   `item_code` varchar(64) NOT NULL,
   `item_name` varchar(255) DEFAULT NULL,
+  `qty` int(10) UNSIGNED NOT NULL DEFAULT 0,
   `mrp` decimal(10,2) NOT NULL DEFAULT 0.00,
   `barcode` varchar(64) NOT NULL,
   `expire_on` date NOT NULL,
@@ -1685,7 +1686,8 @@ ALTER TABLE `inward_items`
   ADD PRIMARY KEY (`id`),
   ADD KEY `idx_status_expire` (`status`,`expire_on`),
   ADD KEY `idx_barcode` (`barcode`),
-  ADD KEY `idx_item_code` (`item_code`);
+  ADD KEY `idx_item_code` (`item_code`),
+  ADD KEY `idx_code_barcode_expire` (`item_code`,`barcode`,`expire_on`);
 
 --
 -- Indexes for table `issues`
