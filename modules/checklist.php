@@ -203,6 +203,25 @@ function chkFreqThis(string $freq): string {
     return ['daily' => 'Today', 'weekly' => 'This week', 'monthly' => 'This month'][$freq] ?? 'Today';
 }
 
+// The name to print where the cycle is already stated right beside it — the
+// hub, whose cards sit under a Daily/Weekly/Monthly heading, and the fill
+// page, whose title carries a frequency badge. "Operation - Paresh - Monthly"
+// under a heading that reads Monthly says it twice.
+//
+// Only a trailing suffix naming the checklist's *own* cycle is dropped, so a
+// daily checklist called "Monthly Review Prep" keeps its name, and the stored
+// name is never touched: the report selectors, Manage Checklists and My Time
+// all still show it in full, which is what tells two cycles of one department
+// apart there.
+function chkDisplayName(array $cl): string {
+    $name = (string)($cl['name'] ?? '');
+    $word = chkFreqLabel(chkFrequency($cl));                 // Daily | Weekly | Monthly
+    // /u so the en and em dashes in the class stay single characters — without
+    // it the match can cut a multi-byte dash in half and corrupt the output.
+    $short = preg_replace('/\s*[-–—]\s*' . $word . '\s*$/iu', '', $name);
+    return ($short !== null && trim($short) !== '') ? $short : $name;
+}
+
 // Human label for one cycle: "07 Aug 2026", "02–08 Aug 2026", "August 2026".
 function chkPeriodLabel(string $freq, string $periodStart): string {
     $s = strtotime($periodStart);
@@ -1421,7 +1440,7 @@ function pageChecklistHub(): void {
         ?>
         <a href="<?= h($c['link']) ?>" class="table-wrap" style="display:block;padding:16px;text-decoration:none;color:var(--text)">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
-                <strong style="font-size:15px"><?= h($cl['name']) ?></strong>
+                <strong style="font-size:15px"><?= h(chkDisplayName($cl)) ?></strong>
                 <span class="badge <?= $c['isLoc'] ? 'badge-blue' : 'badge-grey' ?>" style="font-weight:600"><?= $c['isLoc'] ? 'By location' : 'Department' ?></span>
             </div>
             <div style="height:8px;border-radius:999px;background:var(--bg);overflow:hidden;margin-bottom:6px">
@@ -1605,7 +1624,7 @@ function pageChecklistFill(int $checklistId): void {
 ?>
 <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
     <a href="?page=checklist" class="btn btn-ghost btn-sm">&lsaquo; All checklists</a>
-    <h2 style="margin:0">✅ <?= h($cl['name']) ?></h2>
+    <h2 style="margin:0">✅ <?= h(chkDisplayName($cl)) ?></h2>
     <span class="badge badge-blue" style="font-weight:600"><?= h(chkFreqLabel($freq)) ?></span>
 </div>
 
