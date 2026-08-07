@@ -42,6 +42,14 @@ function weekStartSunday(string $date): string {
     return date('Y-m-d', strtotime("-{$dow} days", $t));
 }
 
+// chk_checklists.frequency is optional (see chkHasFrequency), so it is only
+// selected when it exists — the timesheet must not break on a database that
+// has not run the checklist-cycle migration.
+function ttChecklistFreqCol(): string {
+    return (function_exists('chkHasFrequency') && chkHasFrequency())
+        ? ', cc.frequency AS checklist_freq' : '';
+}
+
 // Display label for an entry: "WP-12 — summary" when tied to a ticket,
 // the created task's name when tied to a task, else the legacy free-text
 // label (rows logged before tasks became first-class).
@@ -51,7 +59,14 @@ function timeEntryLabel(array $e): string {
         return 'WP-' . (int)$e['issue_id'] . ($s !== '' ? ' — ' . $s : '');
     }
     if (!empty($e['task_id'])) return (string)($e['task_name'] ?? ('Task #' . (int)$e['task_id']));
-    if (!empty($e['checklist_id'])) return 'Checklist — ' . (string)($e['checklist_name'] ?? ('#' . (int)$e['checklist_id']));
+    if (!empty($e['checklist_id'])) {
+        // Two cycles of one department share a name — "Operation - Paresh" is
+        // both a daily and a monthly checklist — so the cycle goes in the label.
+        $name = (string)($e['checklist_name'] ?? ('#' . (int)$e['checklist_id']));
+        $freq = (string)($e['checklist_freq'] ?? 'daily');
+        if ($freq !== 'daily' && function_exists('chkFreqLabel')) $name .= ' — ' . chkFreqLabel($freq);
+        return 'Checklist — ' . $name;
+    }
     return (string)($e['task_label'] ?? '—');
 }
 
@@ -385,7 +400,7 @@ function pageMyTime(): void {
     $edit = null;
     if (!empty($_GET['edit'])) {
         $est = $db->prepare(
-            "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name
+            "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . "
              FROM time_entries t
              LEFT JOIN issues i      ON t.issue_id = i.id
              LEFT JOIN time_tasks tk ON t.task_id  = tk.id
@@ -398,7 +413,7 @@ function pageMyTime(): void {
     }
 
     $st = $db->prepare(
-        "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name
+        "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . "
          FROM time_entries t
          LEFT JOIN issues i      ON t.issue_id = i.id
          LEFT JOIN time_tasks tk ON t.task_id  = tk.id
@@ -789,7 +804,7 @@ function timeReportRows(string $emp, string $from, string $to, string $ticket): 
         if ($tid !== null) { $where[] = 't.issue_id = ?'; $params[] = $tid; }
         else               { $where[] = '1=0'; }
     }
-    $sql = "SELECT t.*, e.full_name AS emp_name, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name
+    $sql = "SELECT t.*, e.full_name AS emp_name, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . "
             FROM time_entries t
             LEFT JOIN employees e  ON t.employee_code = e.employee_code
             LEFT JOIN issues i     ON t.issue_id = i.id

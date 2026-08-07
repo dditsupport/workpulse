@@ -2604,7 +2604,7 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
             <?php else: foreach ($tasks as $t): ?>
             <tr class="<?= $t['is_active'] ? '' : 'row-inactive' ?>">
                 <td><?= $t['id'] ?></td>
-                <td><?= h($t['section_name']) ?></td>
+                <td><?= h($t['section_name'] ?: 'General') ?></td>
                 <td><?= h($t['task_description']) ?></td>
                 <td><span class="badge badge-blue"><?= h($t['input_type']) ?></span></td>
                 <td><?= (int)$t['est_minutes'] ?></td>
