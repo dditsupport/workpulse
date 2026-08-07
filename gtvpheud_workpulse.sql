@@ -292,6 +292,7 @@ CREATE TABLE `chk_checklists` (
   `id` int(10) UNSIGNED NOT NULL,
   `name` varchar(120) NOT NULL,
   `assign_type` enum('location','employee') NOT NULL DEFAULT 'location',
+  `frequency` enum('daily','weekly','monthly') NOT NULL DEFAULT 'daily',
   `time_gated` tinyint(1) NOT NULL DEFAULT 1,
   `rollover_min` int(11) NOT NULL DEFAULT 0,
   `sort_order` int(11) NOT NULL DEFAULT 0,

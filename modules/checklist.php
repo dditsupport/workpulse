@@ -1,18 +1,27 @@
 <?php
 // =========================================================
-// Checklist Module — daily checklist + manage tasks
+// Checklist Module — daily / weekly / monthly checklists + manage tasks
+//
+// A checklist repeats on one of three cycles (chk_checklists.frequency):
+//   daily   → one cycle per calendar day, closing at midnight (or at
+//             rollover_min past it, e.g. Store = 02:00)
+//   weekly  → Sunday → Saturday, closing Saturday midnight
+//   monthly → 1st → last day, closing on the last day at midnight
 //
 // Time-window rules (non-superadmin):
-//   - Only one date is fillable: the "effective checklist date"
-//     (= yesterday's calendar date if it's currently before 02:00,
-//      else today's calendar date).
-//   - Within that day, sections are editable inside these windows:
+//   - Only one period is fillable: the "effective checklist date", which
+//     is the *anchor* (first day) of the current cycle — the day itself
+//     for daily, that week's Sunday for weekly, the 1st for monthly.
+//   - On a DAILY checklist, sections further split the day into editable
+//     windows, e.g.:
 //       1.Morning   → 08:00 → 14:00 same day
 //       2.Afternoon → 14:00 → 19:00 same day
 //       3.Evening   → 19:00 → 02:00 next calendar day
-//   - Outside the window the cells render read-only ("Opens at HH:MM"
+//     Outside the window the cells render read-only ("Opens at HH:MM"
 //     before the start, "Closed at HH:MM" after the deadline).
-//   - Past dates render read-only; future dates are blocked.
+//   - On a WEEKLY / MONTHLY checklist the sections are grouping headers
+//     only: the whole period is fillable until it closes.
+//   - Past periods render read-only; future periods are blocked.
 //   - Superadmin bypasses all restrictions.
 // =========================================================
 
@@ -131,13 +140,107 @@ function chkCanFill(array $cl, string $code): bool {
     return hasTxn('checklist') || myLocationId() > 0;
 }
 
+// ── Frequency / period engine ─────────────────────────────
+// Responses, attachments and validations are all keyed by a single date
+// (chk_daily_responses.log_date), so a repeating cycle is represented by
+// its *anchor* — the first day of the period. Everything downstream keeps
+// working unchanged because it still sees one date per cycle.
+define('CHK_FREQS', ['daily', 'weekly', 'monthly']);
+
+// Is chk_checklists.frequency there? Weekly / monthly cycles are hidden
+// until the column is added, so the module keeps working on a database
+// that has not run the migration (every checklist reads as daily).
+function chkHasFrequency(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    try {
+        $r = getDb()->query('SELECT frequency FROM chk_checklists LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
+
+function chkFrequency(array $cl): string {
+    $f = (string)($cl['frequency'] ?? 'daily');
+    return in_array($f, CHK_FREQS, true) ? $f : 'daily';
+}
+
+// First day of the cycle a date falls in: the date itself (daily), that
+// week's Sunday (weekly — the week closes the following Saturday at
+// midnight), or the 1st of the month (monthly).
+function chkPeriodStart(string $freq, string $date): string {
+    $ts = strtotime($date);
+    if ($ts === false) $ts = time();
+    switch ($freq) {
+        case 'weekly':  return date('Y-m-d', strtotime('-' . (int)date('w', $ts) . ' day', $ts));
+        case 'monthly': return date('Y-m-01', $ts);
+        default:        return date('Y-m-d', $ts);
+    }
+}
+
+// Last day of the cycle that starts on $periodStart — Saturday for a week,
+// the month's last day for a month. The cycle closes at that day's midnight.
+function chkPeriodEnd(string $freq, string $periodStart): string {
+    $ts = strtotime($periodStart);
+    if ($ts === false) $ts = time();
+    switch ($freq) {
+        case 'weekly':  return date('Y-m-d', strtotime('+6 day', $ts));
+        case 'monthly': return date('Y-m-t', $ts);
+        default:        return date('Y-m-d', $ts);
+    }
+}
+
+// "Daily" / "Weekly" / "Monthly", and the noun the copy uses for one cycle.
+function chkFreqLabel(string $freq): string {
+    return ['daily' => 'Daily', 'weekly' => 'Weekly', 'monthly' => 'Monthly'][$freq] ?? 'Daily';
+}
+function chkFreqNoun(string $freq): string {
+    return ['daily' => 'day', 'weekly' => 'week', 'monthly' => 'month'][$freq] ?? 'day';
+}
+// "today" / "this week" / "this month" — used on the hub cards.
+function chkFreqThis(string $freq): string {
+    return ['daily' => 'Today', 'weekly' => 'This week', 'monthly' => 'This month'][$freq] ?? 'Today';
+}
+
+// Human label for one cycle: "07 Aug 2026", "02–08 Aug 2026", "August 2026".
+function chkPeriodLabel(string $freq, string $periodStart): string {
+    $s = strtotime($periodStart);
+    if ($s === false) return $periodStart;
+    if ($freq === 'monthly') return date('F Y', $s);
+    if ($freq === 'weekly') {
+        $e = strtotime(chkPeriodEnd('weekly', $periodStart));
+        return date('M Y', $s) === date('M Y', $e)
+            ? date('d', $s) . '–' . date('d M Y', $e)
+            : date('d M', $s) . ' – ' . date('d M Y', $e);
+    }
+    return date('d M Y', $s);
+}
+
+// When the open cycle stops accepting answers, in words.
+function chkPeriodCloseLabel(array $cl, string $periodStart): string {
+    $freq = chkFrequency($cl);
+    if ($freq === 'daily') {
+        $roll = (int)($cl['rollover_min'] ?? 0);
+        return $roll > 0
+            ? ('at ' . date('h:i A', strtotime('00:00') + $roll * 60) . ' tomorrow')
+            : 'at midnight';
+    }
+    return 'at midnight on ' . date('D, d M Y', strtotime(chkPeriodEnd($freq, $periodStart)));
+}
+
 // ── Time-window engine (per-checklist, DB-driven) ─────────
-// The fillable "day" for a checklist. rollover_min shifts the boundary:
-// while now's minute-of-day is below rollover_min we still report yesterday
-// (Store rollover_min=120 → before 02:00 counts as the prior day, matching
-// the old hardcoded behavior). Un-gated checklists still roll at midnight.
+// The fillable cycle for a checklist, as its anchor date. On a daily
+// checklist rollover_min shifts the boundary: while now's minute-of-day is
+// below rollover_min we still report yesterday (Store rollover_min=120 →
+// before 02:00 counts as the prior day, matching the old hardcoded
+// behavior). Weekly and monthly cycles close on plain calendar boundaries
+// — Saturday midnight and the month's last midnight — so rollover_min,
+// which is a same-day-shift setting, does not apply to them.
 function checklistEffectiveDate(array $cl): string {
-    $now = time();
+    $now  = time();
+    $freq = chkFrequency($cl);
+    if ($freq !== 'daily') return chkPeriodStart($freq, date('Y-m-d', $now));
     $minOfDay = (int)date('G', $now) * 60 + (int)date('i', $now);
     if ($minOfDay < (int)($cl['rollover_min'] ?? 0)) {
         return date('Y-m-d', strtotime('-1 day', $now));
@@ -157,13 +260,16 @@ function checklistSectionDeadlineTs(array $section, string $logDate): int {
     return $base === false ? 0 : $base + (int)$section['end_min'] * 60;
 }
 
-// "not_yet_open" | "open" | "closed" for a section on a given date.
-// $section may be null (an item with no section → open all day on the
-// effective date). Superadmin bypasses; an un-gated checklist is always
-// open on its effective date.
+// "not_yet_open" | "open" | "closed" for a section on a given period.
+// $section may be null (an item with no section → open all through the
+// effective period). Superadmin bypasses; an un-gated checklist is always
+// open on its effective period, and so is every weekly / monthly one —
+// the per-section bands are minutes-from-midnight of a single day, which
+// says nothing about a cycle that spans a week or a month, so there the
+// sections are grouping headers and the whole period stays fillable.
 function checklistSectionState(?array $section, string $logDate, array $cl): string {
     if (isSuperadmin()) return 'open';
-    if (empty($cl['time_gated'])) {
+    if (empty($cl['time_gated']) || chkFrequency($cl) !== 'daily') {
         return ($logDate === checklistEffectiveDate($cl)) ? 'open' : 'closed';
     }
     if ($logDate !== checklistEffectiveDate($cl)) return 'closed';
@@ -476,9 +582,14 @@ function doSaveChecklist(): void {
         header("Location: index.php?page=checklist"); exit;
     }
     $isLocMode = chkScopeIsLocation($cl);
+    $freq      = chkFrequency($cl);
     $logDate   = $_POST['log_date'] ?? checklistEffectiveDate($cl);
     $answers   = $_POST['ans'] ?? [];
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $logDate)) $logDate = checklistEffectiveDate($cl);
+    // Answers are stored against the period anchor, so any day inside the
+    // cycle the form posted back collapses onto the same row.
+    $logDate = preg_match('/^\d{4}-\d{2}-\d{2}$/', $logDate)
+        ? chkPeriodStart($freq, $logDate)
+        : checklistEffectiveDate($cl);
 
     // Resolve scope (location_id). Employee-mode checklists share one factory
     // copy under location_id = 0; location-mode keeps the per-outlet scope.
@@ -503,9 +614,10 @@ function doSaveChecklist(): void {
           . ($isLocMode ? "&location_id={$locationId}" : '')
           . "&date={$logDate}";
 
-    // Only the effective checklist date is writable for non-superadmin.
+    // Only the effective checklist period is writable for non-superadmin.
     if (!isSuperadmin() && $logDate !== checklistEffectiveDate($cl)) {
-        flash('error', 'You can only fill the current checklist day (' . checklistEffectiveDate($cl) . ').');
+        flash('error', 'You can only fill the current checklist ' . chkFreqNoun($freq)
+            . ' (' . chkPeriodLabel($freq, checklistEffectiveDate($cl)) . ').');
         header("Location: {$back}"); exit;
     }
 
@@ -923,6 +1035,9 @@ function doSaveChecklistMeta(): void {
     $gated    = isset($_POST['time_gated']) ? 1 : 0;
     $rollover = max(0, (int)($_POST['rollover_min'] ?? 0));
     $sort     = (int)($_POST['sort_order'] ?? 0);
+    $freq     = (string)($_POST['frequency'] ?? 'daily');
+    if (!in_array($freq, CHK_FREQS, true)) $freq = 'daily';
+    $hasFreq  = chkHasFrequency();
     if ($name === '') {
         flash('error', 'Checklist name required.');
         header('Location: ' . chkManageBack($id)); exit;
@@ -936,14 +1051,19 @@ function doSaveChecklistMeta(): void {
         header('Location: ' . chkManageBack(0)); exit;
     }
     $db = getDb();
+    // frequency is written only when the column exists, so the module still
+    // saves on a database that has not run the migration.
+    $freqCol = $hasFreq ? ', frequency=?' : '';
+    $freqArg = $hasFreq ? [$freq] : [];
     if ($id > 0) {
         $cl = chkRequireManage($id);
         if (!isSuperadmin()) $assign = (string)$cl['assign_type'];
-        $db->prepare("UPDATE chk_checklists SET name=?, assign_type=?, time_gated=?, rollover_min=?, sort_order=? WHERE id=?")
-           ->execute([$name, $assign, $gated, $rollover, $sort, $id]);
+        $db->prepare("UPDATE chk_checklists SET name=?, assign_type=?, time_gated=?, rollover_min=?, sort_order=?{$freqCol} WHERE id=?")
+           ->execute(array_merge([$name, $assign, $gated, $rollover, $sort], $freqArg, [$id]));
     } else {
-        $db->prepare("INSERT INTO chk_checklists (name, assign_type, time_gated, rollover_min, sort_order, is_active) VALUES (?,?,?,?,?,1)")
-           ->execute([$name, $assign, $gated, $rollover, $sort]);
+        $db->prepare('INSERT INTO chk_checklists (name, assign_type, time_gated, rollover_min, sort_order, is_active'
+                   . ($hasFreq ? ', frequency' : '') . ') VALUES (?,?,?,?,?,1' . ($hasFreq ? ',?' : '') . ')')
+           ->execute(array_merge([$name, $assign, $gated, $rollover, $sort], $freqArg));
         $id = (int)$db->lastInsertId();
     }
     flash('success', 'Checklist saved.');
@@ -1128,13 +1248,19 @@ function chkDoneCount(int $checklistId, int $locationId, string $logDate): int {
 }
 
 // ── Hub: list every checklist assigned to the user ────────
+// Split into one section per cycle — Daily, Weekly, Monthly — so a store
+// manager sees at a glance what is due today apart from what is due this
+// week or this month. All three headings always render, an empty one
+// saying so rather than silently disappearing.
 function pageChecklistHub(): void {
-    $me   = myCode();
-    $cards = [];
+    $me     = myCode();
+    $groups = ['daily' => [], 'weekly' => [], 'monthly' => []];
+    $any    = false;
     foreach (chkActiveChecklists() as $cl) {
         if (!chkCanFill($cl, $me)) continue;
         $cid    = (int)$cl['id'];
         $isLoc  = chkScopeIsLocation($cl);
+        $freq   = chkFrequency($cl);
         // Progress is scoped to the user's own location; null = none claimed,
         // which the card reports instead of a misleading 0/N.
         $scopeLoc   = $isLoc ? myLocationId() : 0;
@@ -1142,40 +1268,64 @@ function pageChecklistHub(): void {
         $total      = chkItemTotal($cid);
         $done       = ($isLoc && $scopeLoc <= 0) ? null : chkDoneCount($cid, $scopeLoc, $eff);
         $link = "?page=checklist&id={$cid}";
-        $cards[] = ['cl' => $cl, 'isLoc' => $isLoc, 'total' => $total, 'done' => $done, 'link' => $link];
+        $groups[$freq][] = [
+            'cl' => $cl, 'isLoc' => $isLoc, 'freq' => $freq, 'total' => $total,
+            'done' => $done, 'link' => $link, 'period' => chkPeriodLabel($freq, $eff),
+        ];
+        $any = true;
     }
 ?>
 <div class="page-header"><h2>✅ Checklists</h2></div>
-<?php if (empty($cards)): ?>
+<?php if (!$any): ?>
 <div class="alert alert-error">No checklists are assigned to you yet.
     <?php if (!isSuperadmin() && myLocationId() <= 0): ?>
     If you fill a store checklist, claim your location under <a href="?page=my_location" style="color:var(--accent)">My Location</a> first.
     <?php endif; ?>
 </div>
 <?php else: ?>
-<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px">
-    <?php foreach ($cards as $c): $cl = $c['cl']; $done = $c['done']; $total = $c['total'];
-        $pct = ($total > 0 && $done !== null) ? (int)round($done * 100 / $total) : 0;
-        $bg  = ($done === null) ? 'var(--border)' : ($done >= $total && $total > 0 ? 'var(--green)' : ($done > 0 ? 'var(--yellow)' : 'var(--red)'));
-    ?>
-    <a href="<?= h($c['link']) ?>" class="table-wrap" style="display:block;padding:16px;text-decoration:none;color:var(--text)">
-        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
-            <strong style="font-size:15px"><?= h($cl['name']) ?></strong>
-            <span class="badge <?= $c['isLoc'] ? 'badge-blue' : 'badge-grey' ?>" style="font-weight:600"><?= $c['isLoc'] ? 'By location' : 'Department' ?></span>
-        </div>
-        <div style="height:8px;border-radius:999px;background:var(--bg);overflow:hidden;margin-bottom:6px">
-            <span style="display:block;height:100%;width:<?= $pct ?>%;background:<?= $bg ?>"></span>
-        </div>
-        <div class="text-muted" style="font-size:12px">
-            <?php if ($done === null): ?>
-                No location claimed
-            <?php else: ?>
-                Today: <?= $done ?>/<?= $total ?> done
+<?php foreach ($groups as $freq => $cards): ?>
+<div style="margin-bottom:20px">
+    <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px">
+        <h3 style="font-size:15px;margin:0"><?= h(chkFreqLabel($freq)) ?></h3>
+        <span class="text-muted" style="font-size:12px">
+            <?php if ($freq === 'weekly'): ?>Sunday to Saturday — closes Saturday midnight
+            <?php elseif ($freq === 'monthly'): ?>1st to the last day — closes on the last day at midnight
+            <?php else: ?>One cycle per day
             <?php endif; ?>
-        </div>
-    </a>
-    <?php endforeach; ?>
+        </span>
+    </div>
+    <?php if (empty($cards)): ?>
+    <div class="text-muted" style="font-size:12px;padding:12px 14px;border:1px dashed var(--border);border-radius:8px">
+        No <?= h(strtolower(chkFreqLabel($freq))) ?> checklist is assigned to you.
+    </div>
+    <?php else: ?>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px">
+        <?php foreach ($cards as $c): $cl = $c['cl']; $done = $c['done']; $total = $c['total'];
+            $pct = ($total > 0 && $done !== null) ? (int)round($done * 100 / $total) : 0;
+            $bg  = ($done === null) ? 'var(--border)' : ($done >= $total && $total > 0 ? 'var(--green)' : ($done > 0 ? 'var(--yellow)' : 'var(--red)'));
+        ?>
+        <a href="<?= h($c['link']) ?>" class="table-wrap" style="display:block;padding:16px;text-decoration:none;color:var(--text)">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
+                <strong style="font-size:15px"><?= h($cl['name']) ?></strong>
+                <span class="badge <?= $c['isLoc'] ? 'badge-blue' : 'badge-grey' ?>" style="font-weight:600"><?= $c['isLoc'] ? 'By location' : 'Department' ?></span>
+            </div>
+            <div style="height:8px;border-radius:999px;background:var(--bg);overflow:hidden;margin-bottom:6px">
+                <span style="display:block;height:100%;width:<?= $pct ?>%;background:<?= $bg ?>"></span>
+            </div>
+            <div class="text-muted" style="font-size:12px">
+                <?php if ($done === null): ?>
+                    No location claimed
+                <?php else: ?>
+                    <?= h(chkFreqThis($c['freq'])) ?>: <?= $done ?>/<?= $total ?> done
+                <?php endif; ?>
+            </div>
+            <div class="text-muted" style="font-size:11px;margin-top:2px"><?= h($c['period']) ?></div>
+        </a>
+        <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
 </div>
+<?php endforeach; ?>
 <?php endif;
 }
 
@@ -1192,11 +1342,18 @@ function pageChecklistFill(int $checklistId): void {
         header('Location: index.php?page=checklist'); exit;
     }
     $isLoc         = chkScopeIsLocation($cl);
+    $freq          = chkFrequency($cl);
     $effectiveDate = checklistEffectiveDate($cl);
+    // ?date= may name any day inside a cycle (a bookmark, a report link);
+    // it always resolves to that cycle's anchor, which is what the answers
+    // are stored against.
     $displayDate   = $_GET['date'] ?? $effectiveDate;
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $displayDate)) $displayDate = $effectiveDate;
+    $displayDate   = preg_match('/^\d{4}-\d{2}-\d{2}$/', $displayDate)
+        ? chkPeriodStart($freq, $displayDate)
+        : $effectiveDate;
     $isPast        = ($displayDate < $effectiveDate);
     $isFutureDate  = ($displayDate > $effectiveDate);
+    $periodLabel   = chkPeriodLabel($freq, $displayDate);
 
     // Resolve scope (location_id) for location-mode. Everyone — admins
     // included — fills against their own employees.location_id; there is no
@@ -1216,17 +1373,53 @@ function pageChecklistFill(int $checklistId): void {
     }
     $haveScope = !$isLoc || $locationId > 0;
 
-    // Per-checklist day rollover wording (e.g. Store → 02:00).
-    $rolloverLabel = '';
-    if ((int)($cl['rollover_min'] ?? 0) > 0) {
-        $rolloverLabel = date('h:i A', strtotime('00:00') + (int)$cl['rollover_min'] * 60);
-    }
+    // When the open cycle stops accepting answers, in words.
+    $closeLabel = chkPeriodCloseLabel($cl, $effectiveDate);
 
-    $monthStart = date('Y-m-01', strtotime($displayDate));
-    $monthEnd   = date('Y-m-t', strtotime($displayDate));
-    $prevMonth  = date('Y-m-d', strtotime('-1 month', strtotime($monthStart)));
-    $nextMonth  = date('Y-m-d', strtotime('+1 month', strtotime($monthStart)));
-    $locQS      = $isLoc && $locationId > 0 ? "&location_id={$locationId}" : '';
+    // ── Period picker window ─────────────────────────────
+    // One tile per cycle, paged by the natural container of that cycle:
+    // days of a month (daily), the weeks touching a month (weekly), the
+    // twelve months of a year (monthly). Each tile is keyed by the cycle's
+    // anchor date, which is exactly what log_date holds.
+    $dTs      = strtotime($displayDate);
+    $navFirst = $freq === 'monthly' ? date('Y-01-01', $dTs) : date('Y-m-01', $dTs);
+    $navLast  = $freq === 'monthly' ? date('Y-12-31', $dTs) : date('Y-m-t',  $dTs);
+    $navStep  = $freq === 'monthly' ? 'year' : 'month';
+    // Prev / Next aim at the middle of the neighbouring month rather than its
+    // 1st: a ?date= is re-normalised to its cycle anchor on arrival, and the
+    // week holding the 1st often starts in the month before it — which would
+    // page two months back instead of one. The week holding the 15th never does.
+    $navPin   = $freq === 'weekly' ? 'Y-m-15' : 'Y-m-d';
+    $navPrev  = date($navPin, strtotime("-1 {$navStep}", strtotime($navFirst)));
+    $navNext  = date($navPin, strtotime("+1 {$navStep}", strtotime($navFirst)));
+    $navLabel = $freq === 'monthly' ? date('Y', $dTs) : date('F Y', $dTs);
+
+    $tiles = [];   // ['start','label']
+    if ($freq === 'weekly') {
+        // Every week that touches this month, so a week straddling the
+        // month boundary is reachable from either side.
+        $cur = chkPeriodStart('weekly', $navFirst);
+        while ($cur <= $navLast) {
+            $end = chkPeriodEnd('weekly', $cur);
+            $tiles[] = ['start' => $cur, 'label' => date('j M', strtotime($cur)) . '–' . date('j M', strtotime($end))];
+            $cur = date('Y-m-d', strtotime('+7 day', strtotime($cur)));
+        }
+    } elseif ($freq === 'monthly') {
+        for ($m = 1; $m <= 12; $m++) {
+            $start = date('Y-m-01', mktime(0, 0, 0, $m, 1, (int)date('Y', $dTs)));
+            $tiles[] = ['start' => $start, 'label' => date('M', strtotime($start))];
+        }
+    } else {
+        $daysInMonth = (int)date('t', $dTs);
+        for ($d = 1; $d <= $daysInMonth; $d++) {
+            $start = date('Y-m-', $dTs) . str_pad($d, 2, '0', STR_PAD_LEFT);
+            $tiles[] = ['start' => $start, 'label' => (string)$d];
+        }
+    }
+    $tileMin  = $tiles ? $tiles[0]['start'] : $navFirst;
+    $tileMax  = $tiles ? end($tiles)['start'] : $navLast;
+    $tileWide = $freq === 'weekly' ? 104 : ($freq === 'monthly' ? 84 : 72);
+    $locQS    = $isLoc && $locationId > 0 ? "&location_id={$locationId}" : '';
 
     $db = getDb();
     $sections = chkGetSections($checklistId);
@@ -1235,14 +1428,14 @@ function pageChecklistFill(int $checklistId): void {
     $totalQ = max(1, chkItemTotal($checklistId));
 
     if ($haveScope) {
-        // Monthly tile counts (distinct answered items per day).
+        // Tile counts (distinct answered items per cycle anchor).
         $st = $db->prepare(
             "SELECT log_date, COUNT(DISTINCT item_id) AS done FROM chk_daily_responses
              WHERE checklist_id = ? AND location_id = ? AND log_date BETWEEN ? AND ?
                AND response_value IS NOT NULL AND response_value <> ''
              GROUP BY log_date"
         );
-        $st->execute([$checklistId, $locationId, $monthStart, $monthEnd]);
+        $st->execute([$checklistId, $locationId, $tileMin, $tileMax]);
         $existingCounts = $st->fetchAll(PDO::FETCH_KEY_PAIR);
 
         // Tasks + this scope's latest answer per item (one row per item).
@@ -1291,6 +1484,7 @@ function pageChecklistFill(int $checklistId): void {
 <div class="page-header" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
     <a href="?page=checklist" class="btn btn-ghost btn-sm">&lsaquo; All checklists</a>
     <h2 style="margin:0">✅ <?= h($cl['name']) ?></h2>
+    <span class="badge badge-blue" style="font-weight:600"><?= h(chkFreqLabel($freq)) ?></span>
 </div>
 
 <!-- Scope -->
@@ -1301,28 +1495,29 @@ function pageChecklistFill(int $checklistId): void {
     <?php elseif ($myLocId > 0): ?>
         <strong style="font-size:15px"><?= h($locationName) ?></strong>
     <?php endif; ?>
-        <span class="text-muted">Viewing: <strong><?= date('d M Y', strtotime($displayDate)) ?></strong></span>
+        <span class="text-muted">Viewing: <strong><?= h($periodLabel) ?></strong></span>
+        <?php if (!$isPast && !$isFutureDate): ?>
+        <span class="text-muted" style="font-size:12px">· Closes <?= h($closeLabel) ?></span>
+        <?php endif; ?>
     </div>
 </div>
 
 <?php if ($noLocation): ?>
 <div class="alert alert-error">You have not claimed a location yet. Please go to <a href="?page=my_location" style="color:var(--accent)">My Location</a> to claim your location first.</div>
 <?php elseif ($haveScope): ?>
-<!-- Month Calendar Tiles -->
+<!-- Period tiles: days of a month / weeks of a month / months of a year -->
 <div class="table-wrap" style="padding:16px;margin-bottom:14px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <a href="?page=checklist&id=<?= $checklistId ?><?= $locQS ?>&date=<?= $prevMonth ?>" class="btn btn-ghost btn-sm">&lsaquo; Prev</a>
-        <strong><?= date('F Y', strtotime($displayDate)) ?></strong>
-        <a href="?page=checklist&id=<?= $checklistId ?><?= $locQS ?>&date=<?= $nextMonth ?>" class="btn btn-ghost btn-sm">Next &rsaquo;</a>
+        <a href="?page=checklist&id=<?= $checklistId ?><?= $locQS ?>&date=<?= $navPrev ?>" class="btn btn-ghost btn-sm">&lsaquo; Prev</a>
+        <strong><?= h($navLabel) ?></strong>
+        <a href="?page=checklist&id=<?= $checklistId ?><?= $locQS ?>&date=<?= $navNext ?>" class="btn btn-ghost btn-sm">Next &rsaquo;</a>
     </div>
-    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(72px,1fr));gap:6px">
-        <?php
-        $daysInMonth = (int)date('t', strtotime($displayDate));
-        for ($d = 1; $d <= $daysInMonth; $d++):
-            $tileDate = date('Y-m-', strtotime($displayDate)) . str_pad($d, 2, '0', STR_PAD_LEFT);
-            // Anything past the effective day is "future" for fill purposes
-            // (you can't open a checklist for tomorrow). Past dates stay
-            // clickable but render the form read-only.
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(<?= (int)$tileWide ?>px,1fr));gap:6px">
+        <?php foreach ($tiles as $tile):
+            $tileDate = $tile['start'];
+            // Anything past the effective period is "future" for fill
+            // purposes (you can't open next week's checklist). Past periods
+            // stay clickable but render the form read-only.
             $tileFuture = ($tileDate > $effectiveDate);
             $tilePast   = ($tileDate < $effectiveDate);
             $done = $existingCounts[$tileDate] ?? 0;
@@ -1336,16 +1531,17 @@ function pageChecklistFill(int $checklistId): void {
         <?php if ($tileFuture): ?>
         <span style="background:<?= $bg ?>;color:#9ca3af;border-radius:6px;padding:8px 4px;text-align:center;
                   font-size:11px;font-weight:700;display:block;opacity:0.5;cursor:not-allowed;">
-            <?= $d ?><br><span style="font-weight:400">—</span>
+            <?= h($tile['label']) ?><br><span style="font-weight:400">—</span>
         </span>
         <?php else: ?>
         <a href="?page=checklist&id=<?= $checklistId ?><?= $locQS ?>&date=<?= $tileDate ?>"
+           title="<?= h(chkPeriodLabel($freq, $tileDate)) ?>"
            style="background:<?= $bg ?>;color:#fff;border-radius:6px;padding:8px 4px;text-align:center;
                   font-size:11px;font-weight:700;text-decoration:none;display:block;opacity:<?= $tileOpacity ?>;<?= $active ?>">
-            <?= $d ?><br><span style="font-weight:400"><?= $done ?>/<?= $totalQ ?></span>
+            <?= h($tile['label']) ?><br><span style="font-weight:400"><?= $done ?>/<?= $totalQ ?></span>
         </a>
         <?php endif; ?>
-        <?php endfor; ?>
+        <?php endforeach; ?>
     </div>
     <div style="display:flex;gap:14px;margin-top:10px;font-size:11px;color:var(--muted)">
         <span><span style="color:var(--green)">&#9632;</span> Complete</span>
@@ -1356,13 +1552,17 @@ function pageChecklistFill(int $checklistId): void {
 
 <!-- Checklist Form -->
 <?php if ($isFutureDate): ?>
-<div class="alert alert-error">Future dates cannot be filled. The current checklist day is <strong><?= h(date('d M Y', strtotime($effectiveDate))) ?></strong>.</div>
+<div class="alert alert-error">Future <?= h(chkFreqNoun($freq)) ?>s cannot be filled. The current checklist <?= h(chkFreqNoun($freq)) ?> is <strong><?= h(chkPeriodLabel($freq, $effectiveDate)) ?></strong>.</div>
 <?php elseif (!empty($tasks)): ?>
 <?php
-// Per-section editability for this displayed date — used to gate inputs.
+// Per-section editability for this displayed period — used to gate inputs.
 // Keyed by section_id (0 = item with no section). Driven by the checklist's
 // editable chk_sections windows via the time-window engine.
 // $sectionStatus[<section_id>] = ['state','open','name','startLabel','deadlineLabel']
+// The HH:MM labels only mean something on a daily checklist: a weekly or
+// monthly cycle has no per-day bands, so its sections stay label-less and
+// the badge reads a plain Open / Closed.
+$timeBands     = ($freq === 'daily');
 $sectionStatus = [];
 foreach ($tasks as $t) {
     $sid = (int)($t['section_id'] ?? 0);
@@ -1373,13 +1573,13 @@ foreach ($tasks as $t) {
             'state'         => $state,
             'open'          => $state === 'open',
             'name'          => $secRow['name'] ?? ($t['section_name'] ?: 'General'),
-            'startLabel'    => $secRow ? date('h:i A', checklistSectionStartTs($secRow, $displayDate))    : '',
-            'deadlineLabel' => $secRow ? date('h:i A', checklistSectionDeadlineTs($secRow, $displayDate)) : '',
+            'startLabel'    => ($secRow && $timeBands) ? date('h:i A', checklistSectionStartTs($secRow, $displayDate))    : '',
+            'deadlineLabel' => ($secRow && $timeBands) ? date('h:i A', checklistSectionDeadlineTs($secRow, $displayDate)) : '',
         ];
     }
 }
 
-// Form is read-only when viewing a past day OR when no section is
+// Form is read-only when viewing a past period OR when no section is
 // currently open (either everything's closed already OR everything's
 // still scheduled for later in the day — we show different copy below).
 $anyOpenSection = false;
@@ -1401,21 +1601,23 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
 ?>
 <?php if ($timeUi && $loggedMins > 0): ?>
 <div class="alert" style="margin-bottom:10px;background:rgba(99,102,241,.10);color:var(--text);border:1px solid rgba(99,102,241,.30)">
-    <?= chkClockIcon(14) ?> <strong><?= h(fmtMinutes($loggedMins)) ?></strong> logged for this day in
+    <?= chkClockIcon(14) ?> <strong><?= h(fmtMinutes($loggedMins)) ?></strong> logged for this <?= h(chkFreqNoun($freq)) ?> in
     <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a><?= $timeEntered ? '' : ' (estimated from the tasks you completed)' ?>.
 </div>
 <?php elseif ($timeUi && !$readOnly): ?>
 <div class="text-muted" style="font-size:12px;margin-bottom:10px">
     <?= chkClockIcon(13) ?> Enter the minutes you spent next to each task — they add up into one
-    <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a> entry for this day.
+    <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a> entry for this <?= h(chkFreqNoun($freq)) ?>.
 </div>
 <?php endif; ?>
 <?php if ($isPast): ?>
-<div class="alert" style="margin-bottom:10px;background:rgba(107,114,128,.12);color:#9ca3af;border:1px solid rgba(107,114,128,.3)">Viewing a past day — read-only.</div>
+<div class="alert" style="margin-bottom:10px;background:rgba(107,114,128,.12);color:#9ca3af;border:1px solid rgba(107,114,128,.3)">Viewing a past <?= h(chkFreqNoun($freq)) ?> — read-only.</div>
 <?php elseif (!$anyOpenSection && $anyUpcoming): ?>
 <div class="alert" style="margin-bottom:10px;background:rgba(201,168,0,.10);color:var(--yellow);border:1px solid rgba(201,168,0,.30)">No section is open right now. The next section opens later today — check back at the time shown on each section header.</div>
 <?php elseif (!$anyOpenSection): ?>
-<div class="alert" style="margin-bottom:10px;background:rgba(107,114,128,.12);color:#9ca3af;border:1px solid rgba(107,114,128,.3)">All sections for today are closed. The day will roll over<?= $rolloverLabel ? ' at ' . h($rolloverLabel) : '' ?>.</div>
+<div class="alert" style="margin-bottom:10px;background:rgba(107,114,128,.12);color:#9ca3af;border:1px solid rgba(107,114,128,.3)">
+    All sections for today are closed. The <?= h(chkFreqNoun($freq)) ?> rolls over <?= h($closeLabel) ?>.
+</div>
 <?php endif; ?>
 <form method="POST" enctype="multipart/form-data" id="chkForm"<?= $readOnly ? ' onsubmit="return false"' : '' ?>>
     <input type="hidden" name="action" value="save_checklist">
@@ -1486,7 +1688,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                                     ? 'Not filled'
                                     : ($secInfo['state'] === 'not_yet_open'
                                         ? ('Opens at ' . ($secInfo['startLabel'] ?: '—'))
-                                        : 'Section closed');
+                                        : ($timeBands ? 'Section closed' : 'Closed'));
                             ?>
                             <span class="text-muted" style="font-size:12px">— <?= h($cellMsg) ?> —</span>
                         <?php else: ?>
@@ -1582,7 +1784,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
     if ($hasFillable || $hasAttachable): ?>
     <div class="form-actions" style="position:sticky;bottom:0;margin-top:10px;padding:10px 0;background:var(--bg);border-top:1px solid var(--border);z-index:20">
         <button type="submit" class="btn btn-success">
-            <?= $hasFillable ? 'Submit Daily Progress' : 'Save Attachments' ?>
+            <?= $hasFillable ? 'Submit ' . h(chkFreqLabel($freq)) . ' Progress' : 'Save Attachments' ?>
         </button>
         <?php if ($timeUi): ?>
         <span class="text-muted" style="font-size:12px;margin-left:10px">
@@ -1770,6 +1972,7 @@ function pageChecklistItemFiles(): void {
     // checklists are pinned to the viewer's own outlet; only report/manage
     // roles may widen to another outlet or to all of them.
     $isLoc     = chkScopeIsLocation($cl);
+    $freq      = chkFrequency($cl);
     $myLoc     = myLocationId();
     $scopeAll  = false;
     if (!$isLoc) {
@@ -1785,10 +1988,12 @@ function pageChecklistItemFiles(): void {
     }
     $noLocation = $isLoc && !$canSeeAll && $myLoc <= 0;
 
-    // ?on=YYYY-MM-DD narrows to one checklist day — where a report marker
-    // for a specific date lands. Without it the whole history is listed.
+    // ?on=YYYY-MM-DD narrows to one checklist cycle — where a report marker
+    // for a specific date lands. Any day inside the cycle resolves to its
+    // anchor, which is what log_date holds. Without it the whole history is
+    // listed.
     $onDate = trim((string)($_GET['on'] ?? ''));
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $onDate)) $onDate = null;
+    $onDate = preg_match('/^\d{4}-\d{2}-\d{2}$/', $onDate) ? chkPeriodStart($freq, $onDate) : null;
 
     $LIMIT = 200;
     $files = $noLocation ? [] : checklistItemFiles($checklistId, $scopeLoc, $itemId, $LIMIT, $onDate);
@@ -1799,12 +2004,14 @@ function pageChecklistItemFiles(): void {
         $onDate = null;
     }
 
-    // Group by the checklist day the file was filed against.
+    // Group by the checklist cycle the file was filed against.
     $byDate = [];
     foreach ($files as $f) $byDate[(string)$f['log_date']][] = $f;
 
     $backDate = (string)($_GET['date'] ?? '');
-    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $backDate)) $backDate = checklistEffectiveDate($cl);
+    $backDate = preg_match('/^\d{4}-\d{2}-\d{2}$/', $backDate)
+        ? chkPeriodStart($freq, $backDate)
+        : checklistEffectiveDate($cl);
     $backUrl   = '?page=checklist&id=' . $checklistId . '&date=' . h($backDate);
     $backLabel = 'Back to checklist';
     // Arriving from a report? Send them back to the report they were reading
@@ -1858,11 +2065,11 @@ function pageChecklistItemFiles(): void {
         <span><?= $isLoc ? ($scopeAll ? 'All outlets' : h($locName((int)$scopeLoc))) : 'Department checklist' ?></span>
         <span>·</span>
         <?php if ($onDate !== null): ?>
-        <span><strong><?= count($files) ?></strong> file(s) on <strong><?= h(date('d M Y', strtotime($onDate))) ?></strong></span>
+        <span><strong><?= count($files) ?></strong> file(s) on <strong><?= h(chkPeriodLabel($freq, $onDate)) ?></strong></span>
         <span>·</span>
         <a href="<?= $allDatesUrl ?>" style="color:var(--accent)">Show all dates</a>
         <?php else: ?>
-        <span><strong><?= count($files) ?></strong> file(s) across <strong><?= count($byDate) ?></strong> day(s)</span>
+        <span><strong><?= count($files) ?></strong> file(s) across <strong><?= count($byDate) ?></strong> <?= h(chkFreqNoun($freq)) ?>(s)</span>
         <?php endif; ?>
     </div>
     <?php if ($isLoc && $canSeeAll): ?>
@@ -1884,8 +2091,8 @@ function pageChecklistItemFiles(): void {
 <?php else: ?>
 <?php if ($onDate !== null): ?>
 <div class="alert" style="margin-bottom:12px;background:rgba(26,143,227,.10);color:var(--text);border:1px solid rgba(26,143,227,.30)">
-    Showing <strong><?= h(date('d M Y', strtotime($onDate))) ?></strong> only —
-    <a href="<?= $allDatesUrl ?>" style="color:var(--accent)">see every day this task has files</a>.
+    Showing <strong><?= h(chkPeriodLabel($freq, $onDate)) ?></strong> only —
+    <a href="<?= $allDatesUrl ?>" style="color:var(--accent)">see every <?= h(chkFreqNoun($freq)) ?> this task has files</a>.
 </div>
 <?php endif; ?>
 <?php if (count($files) >= $LIMIT): ?>
@@ -1896,7 +2103,7 @@ function pageChecklistItemFiles(): void {
 <?php foreach ($byDate as $date => $rows): ?>
 <div class="table-wrap" style="padding:14px;margin-bottom:12px">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-        <strong style="font-size:14px"><?= h(date('d M Y (D)', strtotime($date))) ?></strong>
+        <strong style="font-size:14px"><?= h($freq === 'daily' ? date('d M Y (D)', strtotime($date)) : chkPeriodLabel($freq, $date)) ?></strong>
         <span class="text-muted" style="font-size:12px">
             <?php
             // A shared location checklist can carry answers from more than
@@ -1994,12 +2201,12 @@ function pageManageTasks(): void {
         <select name="id" class="form-control" style="width:240px" onchange="this.form.submit()">
             <?php foreach ($checklists as $c): ?>
             <option value="<?= (int)$c['id'] ?>" <?= (int)$c['id'] === $selId ? 'selected' : '' ?>>
-                <?= h($c['name']) ?><?= (int)$c['is_active'] ? '' : ' (inactive)' ?>
+                <?= h($c['name']) ?> — <?= h(chkFreqLabel(chkFrequency($c))) ?><?= (int)$c['is_active'] ? '' : ' (inactive)' ?>
             </option>
             <?php endforeach; ?>
         </select>
     </form>
-    <button type="button" class="btn btn-ghost btn-sm" onclick="document.getElementById('clEdit').style.display='';clMeta(<?= $cl ? (int)$cl['id'] : 0 ?>,<?= h(json_encode($cl['name'] ?? '')) ?>,'<?= h($cl['assign_type'] ?? 'location') ?>',<?= (int)($cl['time_gated'] ?? 1) ?>,<?= (int)($cl['rollover_min'] ?? 0) ?>,<?= (int)($cl['sort_order'] ?? 0) ?>)">Edit checklist</button>
+    <button type="button" class="btn btn-ghost btn-sm" onclick="document.getElementById('clEdit').style.display='';clMeta(<?= $cl ? (int)$cl['id'] : 0 ?>,<?= h(json_encode($cl['name'] ?? '')) ?>,'<?= h($cl['assign_type'] ?? 'location') ?>',<?= (int)($cl['time_gated'] ?? 1) ?>,<?= (int)($cl['rollover_min'] ?? 0) ?>,<?= (int)($cl['sort_order'] ?? 0) ?>,'<?= h($cl ? chkFrequency($cl) : 'daily') ?>')">Edit checklist</button>
     <?php if (isSuperadmin()): ?>
     <button type="button" class="btn btn-primary btn-sm" onclick="document.getElementById('clEdit').style.display='';clMetaNew()">+ New checklist</button>
     <?php endif; ?>
@@ -2019,9 +2226,18 @@ function pageManageTasks(): void {
                     <option value="location">Location (all outlets)</option>
                     <option value="employee">Designated employees</option>
                 </select></div>
+            <div class="form-group"><label>Frequency</label>
+                <select name="frequency" id="clFreq" class="form-control"<?= chkHasFrequency() ? '' : ' disabled' ?>>
+                    <option value="daily">Daily</option>
+                    <option value="weekly">Weekly (Sun–Sat, closes Saturday midnight)</option>
+                    <option value="monthly">Monthly (1st–last day, closes last day midnight)</option>
+                </select>
+                <?php if (!chkHasFrequency()): ?>
+                <span class="text-muted" style="font-size:11px">Add the <code>frequency</code> column to enable weekly / monthly cycles.</span>
+                <?php endif; ?></div>
             <div class="form-group"><label>Day rollover (min after midnight)</label>
                 <input type="number" name="rollover_min" id="clRollover" class="form-control" min="0" max="1440" value="0">
-                <span class="text-muted" style="font-size:11px">e.g. 120 = day rolls at 02:00</span></div>
+                <span class="text-muted" style="font-size:11px">Daily only — e.g. 120 = day rolls at 02:00</span></div>
             <div class="form-group"><label>Sort order</label>
                 <input type="number" name="sort_order" id="clSort" class="form-control" value="0"></div>
             <div class="form-group"><label>&nbsp;</label>
@@ -2039,6 +2255,12 @@ function pageManageTasks(): void {
 <!-- Sections -->
 <div class="form-card" style="margin-bottom:16px">
     <h3 style="font-size:14px;margin-bottom:10px">Sections &amp; time windows — <?= h($cl['name']) ?></h3>
+    <?php if (chkFrequency($cl) !== 'daily'): ?>
+    <div class="text-muted" style="font-size:12px;margin-bottom:10px">
+        This is a <?= h(strtolower(chkFreqLabel(chkFrequency($cl)))) ?> checklist — the sections group its tasks, but the
+        time windows below are not enforced. The whole <?= h(chkFreqNoun(chkFrequency($cl))) ?> stays fillable until it closes.
+    </div>
+    <?php endif; ?>
     <div class="table-wrap" data-stack style="margin-bottom:10px">
         <table class="table" style="font-size:13px">
             <thead><tr><th style="width:50px">Sort</th><th>Name</th><th style="width:120px">Window</th><th style="width:160px">Actions</th></tr></thead>
@@ -2164,7 +2386,7 @@ function secReset() {
     document.getElementById('secSort').value = 0;
     document.getElementById('secSubmit').textContent = 'Add Section';
 }
-function clMeta(id, name, assign, gated, rollover, sort) {
+function clMeta(id, name, assign, gated, rollover, sort, freq) {
     document.getElementById('clTitle').textContent = id ? 'Edit Checklist #' + id : 'New Checklist';
     document.getElementById('clId').value = id;
     document.getElementById('clName').value = name;
@@ -2172,8 +2394,9 @@ function clMeta(id, name, assign, gated, rollover, sort) {
     document.getElementById('clGated').checked = !!gated;
     document.getElementById('clRollover').value = rollover;
     document.getElementById('clSort').value = sort;
+    document.getElementById('clFreq').value = freq || 'daily';
 }
-function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0); }
+function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
 </script>
 
 <!-- Tasks Table -->
