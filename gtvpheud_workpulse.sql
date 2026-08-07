@@ -315,6 +315,7 @@ CREATE TABLE `chk_daily_responses` (
   `log_date` date NOT NULL,
   `response_value` varchar(255) DEFAULT NULL,
   `time_minutes` smallint(5) UNSIGNED DEFAULT NULL,
+  `remarks` varchar(500) DEFAULT NULL,
   `submitted_at` datetime DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
