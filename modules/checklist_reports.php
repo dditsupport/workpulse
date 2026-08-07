@@ -74,15 +74,25 @@ function exportChecklistReport(): void {
     $qs->execute([$checklistId]);
     $questions = $qs->fetchAll(PDO::FETCH_ASSOC);
 
+    // The day cell carries the answer and, when the filler left one, their
+    // remark in brackets — one column per day either way, so the file stays a
+    // clean matrix for whatever reads it downstream.
+    $withRemarks = function_exists('chkHasRemarks') && chkHasRemarks();
     $responses = [];
     $st = $db->prepare(
-        "SELECT item_id, DAY(log_date) AS day, response_value
-         FROM chk_daily_responses
-         WHERE checklist_id = ? AND location_id = ? AND MONTH(log_date) = ? AND YEAR(log_date) = ?"
+        'SELECT item_id, DAY(log_date) AS day, response_value' . ($withRemarks ? ', remarks' : '') .
+        '  FROM chk_daily_responses
+         WHERE checklist_id = ? AND location_id = ? AND MONTH(log_date) = ? AND YEAR(log_date) = ?'
     );
     $st->execute([$checklistId, $locationId, $selectedMonth, $selectedYear]);
     foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row) {
-        $responses[$row['item_id']][$row['day']] = $row['response_value'];
+        $cell   = (string)$row['response_value'];
+        $remark = $withRemarks ? trim((string)($row['remarks'] ?? '')) : '';
+        if ($remark !== '') {
+            $remark = trim(preg_replace('/\s+/', ' ', $remark));
+            $cell   = $cell === '' ? $remark : $cell . ' (' . $remark . ')';
+        }
+        $responses[$row['item_id']][$row['day']] = $cell;
     }
 
     // Location name
@@ -527,6 +537,8 @@ function pageChecklistAudit(): void {
     $locFilterActive = count($selectedLocs) < count($allLocations);
 
     $locations = []; $itemsBySection = []; $responsesByLoc = []; $locTree = []; $valByLoc = [];
+    // The filler's own remark on each task, distinct from the validator's.
+    $auditRemarks = function_exists('chkHasRemarks') && chkHasRemarks();
     $attByLoc  = [];   // [location_id][item_id] => ['n','img'] for the chosen day
     $minsByLoc = [];   // [location_id][item_id] => minutes noted against the task
     // Per-task time is optional: it needs chk_daily_responses.time_minutes and
@@ -572,11 +584,12 @@ function pageChecklistAudit(): void {
 
         // Responses for the chosen day, indexed by [locId][itemId].
         $respSt = $db->prepare(
-            "SELECT a.location_id, a.item_id, a.response_value, a.submitted_at,
-                    e.full_name AS staff_member, e.employee_code AS staff_code
+            'SELECT a.location_id, a.item_id, a.response_value, a.submitted_at,'
+            . ($auditRemarks ? ' a.remarks,' : '') .
+            '       e.full_name AS staff_member, e.employee_code AS staff_code
              FROM chk_daily_responses a
              LEFT JOIN employees e ON a.employee_code = e.employee_code
-             WHERE a.checklist_id = ? AND a.log_date = ?"
+             WHERE a.checklist_id = ? AND a.log_date = ?'
         );
         $respSt->execute([$checklistId, $filterDate]);
         foreach ($respSt->fetchAll(PDO::FETCH_ASSOC) as $row) {
@@ -907,6 +920,9 @@ function pageChecklistAudit(): void {
                 <?php $at = $attByLoc[0][$iid] ?? null;
                       if (function_exists('chkFileBadge'))
                           echo chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, null, $filterDate); ?>
+                <?php $rmk = trim((string)($r['remarks'] ?? '')); if ($rmk !== ''): ?>
+                <div class="text-muted" style="margin-top:3px;font-size:11px">&ldquo;<?= h($rmk) ?>&rdquo;</div>
+                <?php endif; ?>
             </td>
             <td><?php if ($r): ?><span style="font-weight:700;color:<?= $isNo ? 'var(--red)' : 'var(--green)' ?>"><?= h($r['response_value']) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
             <?php if ($timeUi): $im = (int)($mins0[$iid] ?? 0); ?>
@@ -998,6 +1014,9 @@ $minsCell = function (int $m) use ($timeUi): string {
                         <?php $at = $attByLoc[$locId][(int)$it['id']] ?? null;
                               if (function_exists('chkFileBadge'))
                                   echo chkFileBadge($checklistId, (int)$it['id'], (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, $locId, $filterDate); ?>
+                        <?php $rmk = trim((string)($r['remarks'] ?? '')); if ($rmk !== ''): ?>
+                        <div style="font-size:11px;margin-top:3px;color:var(--muted);white-space:normal;word-break:break-word">&ldquo;<?= h($rmk) ?>&rdquo;</div>
+                        <?php endif; ?>
                     </div>
                     <div class="num">
                         <?php if ($r): ?>
@@ -1625,7 +1644,9 @@ function pageChecklistValidate(): void {
 
     $viewClicked = !empty($_GET['view']) || (!$empMode && $locationId > 0);
     $locationName = '';
-    $items = []; $responses = []; $vals = []; $atts = [];
+    $items = []; $responses = []; $vals = []; $atts = []; $staffRemarks = [];
+    // The filler's own remark on each task, distinct from the validator's.
+    $remarkCol = function_exists('chkHasRemarks') && chkHasRemarks();
     if ($viewClicked) {
         foreach ($locations as $loc) {
             if ((int)$loc['location_id'] === $locationId) { $locationName = $loc['location_name']; break; }
@@ -1634,9 +1655,15 @@ function pageChecklistValidate(): void {
         $is->execute([$checklistId]);
         $items = $is->fetchAll(PDO::FETCH_ASSOC);
 
-        $rs = $db->prepare("SELECT item_id, response_value FROM chk_daily_responses WHERE checklist_id = ? AND location_id = ? AND log_date = ?");
+        $rs = $db->prepare('SELECT item_id, response_value' . ($remarkCol ? ', remarks' : '')
+            . ' FROM chk_daily_responses WHERE checklist_id = ? AND location_id = ? AND log_date = ?');
         $rs->execute([$checklistId, $locationId, $logDate]);
-        foreach ($rs->fetchAll(PDO::FETCH_ASSOC) as $r) $responses[(int)$r['item_id']] = $r['response_value'];
+        foreach ($rs->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $responses[(int)$r['item_id']] = $r['response_value'];
+            if ($remarkCol && trim((string)($r['remarks'] ?? '')) !== '') {
+                $staffRemarks[(int)$r['item_id']] = (string)$r['remarks'];
+            }
+        }
 
         $vs = $db->prepare("SELECT item_id, status, remarks FROM chk_validations WHERE checklist_id = ? AND location_id = ? AND log_date = ?");
         $vs->execute([$checklistId, $locationId, $logDate]);
@@ -1703,13 +1730,15 @@ function pageChecklistValidate(): void {
                 <th style="width:48px;text-align:center">#</th>
                 <th>Task</th>
                 <th style="width:110px">Response</th>
+                <?php if ($remarkCol): ?><th style="width:220px">Staff remark</th><?php endif; ?>
                 <th style="width:150px">Validation</th>
-                <th style="width:300px">Remarks</th>
+                <th style="width:300px">Validator remark</th>
             </tr></thead>
             <tbody>
-            <?php $section = null; $sr = 1; foreach ($items as $it):
+            <?php $vCols = $remarkCol ? 6 : 5;
+            $section = null; $sr = 1; foreach ($items as $it):
                 if (($it['section_name'] ?? '') !== $section): $section = (string)($it['section_name'] ?? ''); ?>
-                <tr><td colspan="5" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px"><?= h($section ?: 'General') ?></td></tr>
+                <tr><td colspan="<?= $vCols ?>" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px"><?= h($section ?: 'General') ?></td></tr>
             <?php endif;
                 $iid     = (int)$it['id'];
                 $resp    = $responses[$iid] ?? '';
@@ -1731,6 +1760,13 @@ function pageChecklistValidate(): void {
                         <span class="text-muted" style="font-size:12px">—</span>
                         <?php endif; ?>
                     </td>
+                    <?php if ($remarkCol): $sr_ = $staffRemarks[$iid] ?? ''; ?>
+                    <td style="white-space:normal;word-break:break-word;font-size:12px">
+                        <?php if ($sr_ !== ''): ?>
+                        <span class="text-muted">&ldquo;<?= h($sr_) ?>&rdquo;</span>
+                        <?php else: ?><span class="text-muted">—</span><?php endif; ?>
+                    </td>
+                    <?php endif; ?>
                     <td>
                         <select name="status[<?= $iid ?>]" class="form-control" style="width:140px">
                             <option value="">— Not validated —</option>

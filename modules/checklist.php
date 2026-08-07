@@ -627,10 +627,11 @@ function doSaveChecklist(): void {
     // employee is just recording how long each took.
     $hasUploads = !empty($_FILES['attachments']['name']) && is_array($_FILES['attachments']['name']);
     $times      = chkNormalizeTaskTimes($_POST['task_time'] ?? null);   // itemId => minutes
+    $remarks    = chkHasRemarks() ? chkNormalizeRemarks($_POST['remark'] ?? null) : [];  // itemId => text
     // Every editable cell posts an ans[] key, blank or not — "did they
     // actually answer something" is a different question from "was ans[] sent".
     $hasRealAnswers = (bool)array_filter($answers, fn($v) => trim((string)$v) !== '');
-    if (($isLocMode && $locationId <= 0) || (empty($answers) && !$hasUploads && empty($times))) {
+    if (($isLocMode && $locationId <= 0) || (empty($answers) && !$hasUploads && empty($times) && empty($remarks))) {
         flash('error', 'No data submitted.');
         header("Location: {$back}"); exit;
     }
@@ -644,27 +645,44 @@ function doSaveChecklist(): void {
     $ownItems  = [];   // itemIds that belong to this checklist
     chkLoadItemMeta($checklistId, array_keys($answers), $allSections, $ownItems, $secByItem);
 
-    $hasTaskTime = chkHasTaskTime();
-    $st = $db->prepare($hasTaskTime
-        ? "INSERT INTO chk_daily_responses (checklist_id, location_id, item_id, employee_code, log_date, response_value, time_minutes, submitted_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
-           ON DUPLICATE KEY UPDATE
-             response_value = VALUES(response_value),
-             checklist_id   = VALUES(checklist_id),
-             employee_code  = VALUES(employee_code),
-             time_minutes   = VALUES(time_minutes),
-             submitted_at   = NOW()"
-        : "INSERT INTO chk_daily_responses (checklist_id, location_id, item_id, employee_code, log_date, response_value, submitted_at)
-           VALUES (?, ?, ?, ?, ?, ?, NOW())
-           ON DUPLICATE KEY UPDATE
-             response_value = VALUES(response_value),
-             checklist_id   = VALUES(checklist_id),
-             employee_code  = VALUES(employee_code),
-             submitted_at   = NOW()"
-    );
+    // Minutes and remarks are separate optional columns, and a submit may
+    // carry either, both or neither for a given task. Only the ones actually
+    // posted for that task are written: a form that sends minutes but no
+    // remark must leave an existing remark alone, and the reverse. A blank box
+    // that *was* posted means NULL — that is how each is cleared.
+    $hasTaskTime  = chkHasTaskTime();
+    $hasRemarkCol = chkHasRemarks();
+    $extraFor = function (int $itemId) use ($hasTaskTime, $hasRemarkCol, $times, $remarks): array {
+        $set = [];
+        if ($hasTaskTime && array_key_exists($itemId, $times)) {
+            $set['time_minutes'] = $times[$itemId] > 0 ? (int)$times[$itemId] : null;
+        }
+        if ($hasRemarkCol && array_key_exists($itemId, $remarks)) {
+            $set['remarks'] = $remarks[$itemId] !== '' ? $remarks[$itemId] : null;
+        }
+        return $set;
+    };
+    // One prepared statement per column subset, built on first use. There are
+    // at most four, so this stays cheap while keeping the SQL honest.
+    $stCache = [];
+    $upsertFor = function (array $extra, bool $withAnswer) use (&$stCache, $db) {
+        $names = array_keys($extra);
+        $key   = ($withAnswer ? 'a:' : 'x:') . implode(',', $names);
+        if (!isset($stCache[$key])) {
+            $head = ['checklist_id', 'location_id', 'item_id', 'employee_code', 'log_date'];
+            $cols = array_merge($head, $withAnswer ? ['response_value'] : [], $names);
+            $upd  = array_merge($withAnswer ? ['response_value', 'employee_code'] : [], ['checklist_id'], $names);
+            $stCache[$key] = $db->prepare(
+                'INSERT INTO chk_daily_responses (' . implode(', ', $cols) . ', submitted_at) VALUES ('
+                . implode(', ', array_fill(0, count($cols), '?')) . ', NOW()) ON DUPLICATE KEY UPDATE '
+                . implode(', ', array_map(fn($c) => "{$c} = VALUES({$c})", $upd))
+                . ($withAnswer ? ', submitted_at = NOW()' : ''));
+        }
+        return $stCache[$key];
+    };
 
-    $saved = 0; $skippedClosed = 0;
-    $timedItems = [];   // itemIds whose minutes the answer upsert already wrote
+    $saved = 0; $skippedClosed = 0; $remarksSaved = 0;
+    $doneItems = [];   // itemIds whose extras the answer upsert already wrote
     try {
         $db->beginTransaction();
         foreach ($answers as $itemId => $val) {
@@ -674,34 +692,44 @@ function doSaveChecklist(): void {
                 $skippedClosed++;
                 continue;
             }
-            if ($hasTaskTime) {
-                $st->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $val, $times[$itemId] ?? null]);
-                $timedItems[$itemId] = true;
-            } else {
-                $st->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $val]);
-            }
+            $extra = $extraFor($itemId);
+            $upsertFor($extra, true)->execute(array_merge(
+                [$checklistId, $locationId, $itemId, $empCode, $logDate, $val], array_values($extra)));
+            $doneItems[$itemId] = true;
+            if (($remarks[$itemId] ?? '') !== '') $remarksSaved++;
             $saved++;
         }
 
-        // Minutes typed against a task that carries no answer in this submit
-        // (answered earlier today, or timed before being ticked off) have no
-        // upsert to ride along with. Insert-or-update the minutes alone —
+        // Minutes or a remark typed against a task carrying no answer in this
+        // submit (answered earlier in the cycle, or noted before being ticked
+        // off) have no upsert to ride along with. Write the extras alone —
         // response_value is deliberately absent from the UPDATE list so an
         // existing answer survives untouched.
-        if ($hasTaskTime && $times) {
-            chkLoadItemMeta($checklistId, array_keys($times), $allSections, $ownItems, $secByItem);
-            $tu = $db->prepare(
-                "INSERT INTO chk_daily_responses (checklist_id, location_id, item_id, employee_code, log_date, time_minutes, submitted_at)
-                 VALUES (?, ?, ?, ?, ?, ?, NOW())
-                 ON DUPLICATE KEY UPDATE time_minutes = VALUES(time_minutes), checklist_id = VALUES(checklist_id)");
-            $tc = $db->prepare(
-                "UPDATE chk_daily_responses SET time_minutes = NULL
-                 WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND log_date = ? AND employee_code = ?");
-            foreach ($times as $itemId => $mins) {
-                if (isset($timedItems[$itemId]) || empty($ownItems[$itemId])) continue;
+        $extraOnly = array_keys($times + $remarks);
+        if ($extraOnly) {
+            chkLoadItemMeta($checklistId, $extraOnly, $allSections, $ownItems, $secByItem);
+            $clearCache = [];
+            foreach ($extraOnly as $itemId) {
+                if (isset($doneItems[$itemId]) || empty($ownItems[$itemId])) continue;
                 if (!checklistSectionEditable($secByItem[$itemId] ?? null, $logDate, $cl)) continue;
-                if ($mins > 0) $tu->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $mins]);
-                else           $tc->execute([$checklistId, $locationId, $itemId, $logDate, $empCode]);
+                $extra = $extraFor($itemId);
+                if (!$extra) continue;
+                if (array_filter($extra, fn($v) => $v !== null)) {
+                    $upsertFor($extra, false)->execute(array_merge(
+                        [$checklistId, $locationId, $itemId, $empCode, $logDate], array_values($extra)));
+                    if (($remarks[$itemId] ?? '') !== '') $remarksSaved++;
+                } else {
+                    // Everything posted for this task was blank. Clear those
+                    // columns with an UPDATE rather than an INSERT: emptying the
+                    // boxes on a task that was never answered must not conjure a
+                    // row whose only content is NULLs.
+                    $key = implode(',', array_keys($extra));
+                    $clearCache[$key] ??= $db->prepare(
+                        'UPDATE chk_daily_responses SET '
+                        . implode(', ', array_map(fn($c) => "{$c} = NULL", array_keys($extra)))
+                        . ' WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND log_date = ? AND employee_code = ?');
+                    $clearCache[$key]->execute([$checklistId, $locationId, $itemId, $logDate, $empCode]);
+                }
             }
         }
         $db->commit();
@@ -748,13 +776,28 @@ function doSaveChecklist(): void {
     }
 
     // Mirror this user's time into page=my_time — the per-task minutes they
-    // entered when there are any, else the completed tasks' estimate.
+    // entered when there are any, else the completed tasks' estimate. The
+    // cycle's remarks ride along as that entry's notes.
     $logged = chkSyncTimeEntry($checklistId, $empCode, $logDate);
-    if ($times && empty($_SESSION['flash'])) {
-        // Time-only submit — say so, otherwise the redirect looks like a no-op.
+    if (($times || $remarksSaved > 0) && empty($_SESSION['flash'])) {
+        // Time- or remark-only submit — say so, otherwise the redirect looks
+        // like a no-op.
         flash('success', $logged > 0
             ? ('Time logged: ' . (function_exists('fmtMinutes') ? fmtMinutes($logged) : $logged . 'm') . '.')
             : 'Time entry cleared.');
+    }
+    // Remarks posted but all of them blank — the submit cleared one. Say
+    // something, otherwise the redirect looks like the click did nothing.
+    if ($remarks && empty($_SESSION['flash'])) {
+        flash('success', 'Checklist updated.');
+    }
+    // A remark only reaches My Time through the cycle's time entry, and that
+    // entry only exists once there are minutes to log. Say so rather than
+    // letting the remark quietly go nowhere.
+    if ($remarksSaved > 0 && $logged <= 0) {
+        $prev = $_SESSION['flash'] ?? null;
+        $prevMsg = ($prev && ($prev['type'] ?? '') === 'success') ? rtrim((string)$prev['msg']) . ' ' : '';
+        flash('success', $prevMsg . 'Remark saved. Add the minutes you spent on that task for it to show in My Time.');
     }
 
     header("Location: {$back}"); exit;
@@ -820,6 +863,25 @@ function chkHasTaskTime(): bool {
     }
 }
 
+// Same gate for chk_daily_responses.remarks — the per-task note the filler
+// writes beside the answer. Absent column → no remarks box, no remarks in
+// the reports, and My Time notes keep their old fixed labels.
+function chkHasRemarks(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    try {
+        $r = getDb()->query('SELECT remarks FROM chk_daily_responses LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
+
+// The longest a task description may run inside a My Time note before it is
+// trimmed. Descriptions go up to 500 characters on the Store checklist, which
+// would bury the remark it is meant to label.
+define('CHK_REMARK_TASK_MAX', 40);
+
 // The single checklist-linked time entry for one employee+checklist+day,
 // or null. Fails open (returns null) when time_entries.checklist_id is not
 // there yet, so that column stays optional too.
@@ -847,6 +909,20 @@ function chkNormalizeTaskTimes($raw): array {
         $itemId = (int)$itemId;
         if ($itemId <= 0 || !is_numeric(trim((string)$val))) continue;
         $out[$itemId] = max(0, min(8 * 60, (int)$val));
+    }
+    return $out;
+}
+
+// Same for the posted remark[ITEM_ID] map. An empty string is kept rather
+// than dropped — that is how a remark gets cleared, exactly as a 0 clears a
+// task's minutes above. Capped to the column's 500 characters.
+function chkNormalizeRemarks($raw): array {
+    if (!is_array($raw)) return [];
+    $out = [];
+    foreach ($raw as $itemId => $val) {
+        $itemId = (int)$itemId;
+        if ($itemId <= 0 || !is_scalar($val)) continue;
+        $out[$itemId] = mb_substr(trim((string)$val), 0, 500);
     }
     return $out;
 }
@@ -882,7 +958,40 @@ function chkTaskTimeTotal(int $checklistId, string $empCode, string $logDate): i
     }
 }
 
-// Recomputes that single time_entries row from the day's responses
+// The cycle's remarks, as the notes line for its My Time entry: each remark
+// labelled with the task it belongs to, joined by the same " · " My Time
+// already uses when it renders notes inline. Task descriptions run to 500
+// characters on the Store checklist, so each is trimmed — a note is meant to
+// be read at a glance in a timesheet row. Returns '' when nothing was noted,
+// which leaves the caller's fixed label in place.
+function chkRemarksNote(int $checklistId, string $empCode, string $logDate): string {
+    if (!chkHasRemarks() || $empCode === '') return '';
+    try {
+        $st = getDb()->prepare(
+            "SELECT i.task_description, r.remarks
+             FROM chk_daily_responses r
+             JOIN chk_items i ON i.id = r.item_id
+             WHERE r.checklist_id = ? AND r.employee_code = ? AND r.log_date = ?
+               AND r.remarks IS NOT NULL AND r.remarks <> ''
+             ORDER BY i.id");
+        $st->execute([$checklistId, $empCode, $logDate]);
+    } catch (Exception $e) {
+        return '';
+    }
+    $parts = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $task = trim(preg_replace('/\s+/', ' ', (string)$r['task_description']));
+        if (mb_strlen($task) > CHK_REMARK_TASK_MAX) {
+            $task = rtrim(mb_substr($task, 0, CHK_REMARK_TASK_MAX - 1)) . '…';
+        }
+        $note = trim(preg_replace('/\s+/', ' ', (string)$r['remarks']));
+        if ($note === '') continue;
+        $parts[] = $task === '' ? $note : ($task . ': ' . $note);
+    }
+    return implode(' · ', $parts);
+}
+
+// Recomputes that single time_entries row from the cycle's responses
 // (delete-then-insert, keyed by employee+checklist+date) and returns the
 // minutes logged. Fails open — returns 0 — so a missing
 // time_entries.checklist_id column never blocks a checklist save.
@@ -904,6 +1013,12 @@ function chkSyncTimeEntry(int $checklistId, string $empCode, string $logDate): i
             $mins  = (int)$sumSt->fetchColumn();
             $notes = CHK_TIME_NOTE_AUTO;
         }
+
+        // What the person actually wrote beats the fixed label. Only when no
+        // task carries a remark does the entry fall back to saying where the
+        // minutes came from.
+        $remarkNote = chkRemarksNote($checklistId, $empCode, $logDate);
+        if ($remarkNote !== '') $notes = $remarkNote;
 
         $db->prepare("DELETE FROM time_entries WHERE employee_code = ? AND checklist_id = ? AND entry_date = ?")
            ->execute([$empCode, $checklistId, $logDate]);
@@ -1442,9 +1557,16 @@ function pageChecklistFill(int $checklistId): void {
         // Per-task minutes come off *this* user's own response row (`mine`),
         // never the latest one: on a shared location checklist the boxes must
         // show what I logged, not what a colleague did.
+        // Remarks come off the same `mine` row as the minutes, for the same
+        // reason: on a shared location checklist the box must show what I
+        // wrote, not what a colleague did.
         $hasTaskTime = chkHasTaskTime();
-        $mineSel  = $hasTaskTime ? 'mine.time_minutes AS my_minutes, ' : '';
-        $mineJoin = $hasTaskTime
+        $hasRemarkCol = chkHasRemarks();
+        $mineCols = [];
+        if ($hasTaskTime)  $mineCols[] = 'mine.time_minutes AS my_minutes';
+        if ($hasRemarkCol) $mineCols[] = 'mine.remarks AS my_remarks';
+        $mineSel  = $mineCols ? implode(', ', $mineCols) . ', ' : '';
+        $mineJoin = $mineCols
             ? "LEFT JOIN chk_daily_responses mine
                       ON mine.item_id = q.id AND mine.checklist_id = ? AND mine.location_id = ?
                      AND mine.log_date = ? AND mine.employee_code = ?"
@@ -1467,7 +1589,7 @@ function pageChecklistFill(int $checklistId): void {
         );
         $st->execute(array_merge(
             [$checklistId, $locationId, $displayDate],
-            $hasTaskTime ? [$checklistId, $locationId, $displayDate, $me] : [],
+            $mineCols ? [$checklistId, $locationId, $displayDate, $me] : [],
             [$checklistId]
         ));
         $tasks = $st->fetchAll(PDO::FETCH_ASSOC);
@@ -1594,9 +1716,13 @@ $readOnly = $isPast || !$anyOpenSection;
 // fmtMinutes() from the time tracking module; without either, the time boxes
 // simply don't render and the est_minutes fallback carries on as before.
 $timeUi      = chkHasTaskTime() && function_exists('fmtMinutes');
+$remarkUi    = chkHasRemarks();
 $timeRow     = $timeUi ? chkTimeEntryRow($checklistId, $me, $displayDate) : null;
 $loggedMins  = (int)($timeRow['minutes'] ?? 0);
-$timeEntered = $timeRow && (string)($timeRow['notes'] ?? '') === CHK_TIME_NOTE_ENTERED;
+// Whether the minutes were typed rather than estimated. Read from the
+// responses, not from the notes text — notes now carry the cycle's remarks
+// when there are any, so the old string compare would always miss.
+$timeEntered = $timeRow && chkTaskTimeTotal($checklistId, $me, $displayDate) > 0;
 $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunday') ? weekStartSunday($displayDate) : $displayDate);
 ?>
 <?php if ($timeUi && $loggedMins > 0): ?>
@@ -1727,6 +1853,25 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                         <?php endif; ?>
                         </div>
                         <?php
+                        // Per-task remark, on its own line under the answer.
+                        // Editable on the same terms as the minutes box, so a
+                        // note can be added to a task ticked off earlier. The
+                        // cycle's remarks become the notes of its My Time entry.
+                        $myRemark = trim((string)($t['my_remarks'] ?? ''));
+                        if ($remarkUi && $cellEditable): ?>
+                            <div style="margin-top:4px">
+                                <input type="text" name="remark[<?= (int)$t['id'] ?>]" class="form-control chk-task-remark"
+                                       maxlength="500" value="<?= h($myRemark) ?>"
+                                       placeholder="Remark (optional)"
+                                       aria-label="Remark for this task"
+                                       style="width:100%;padding:3px 6px;font-size:12px">
+                            </div>
+                        <?php elseif ($remarkUi && $myRemark !== ''): ?>
+                            <div class="text-muted" style="margin-top:4px;font-size:11px;white-space:normal;word-break:break-word">
+                                &ldquo;<?= h($myRemark) ?>&rdquo;
+                            </div>
+                        <?php endif; ?>
+                        <?php
                         $attList    = $itemAttachments[(int)$t['id']] ?? [];
                         $hasAnswer  = !empty($t['response_value']);
                         // Allow file input alongside an unanswered editable
@@ -1818,6 +1963,42 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
     }
     Array.prototype.forEach.call(boxes, function (b) { b.addEventListener('input', sum); });
     sum();
+})();
+// A remark only reaches My Time through the cycle's time entry, and that
+// needs minutes. Flag it inline as soon as a remark is typed against a task
+// with an empty minutes box, rather than only after the round trip.
+(function () {
+    var remarks = document.querySelectorAll('.chk-task-remark');
+    if (!remarks.length) return;
+    function cellOf(el) { return el.closest ? el.closest('td') : null; }
+    function hintFor(box) {
+        var cell = cellOf(box);
+        if (!cell) return null;
+        var node = cell.querySelector('.chk-remark-hint');
+        if (!node) {
+            node = document.createElement('div');
+            node.className = 'chk-remark-hint text-muted';
+            node.style.cssText = 'font-size:10px;margin-top:2px;color:var(--yellow)';
+            box.parentNode.appendChild(node);
+        }
+        return node;
+    }
+    function check(box) {
+        var cell = cellOf(box);
+        if (!cell) return;
+        var time = cell.querySelector('.chk-task-time');
+        var mins = time ? parseInt(time.value, 10) : NaN;
+        var node = hintFor(box);
+        if (!node) return;
+        node.textContent = (box.value.trim() !== '' && !(mins > 0))
+            ? 'Add minutes for this remark to reach My Time.' : '';
+    }
+    Array.prototype.forEach.call(remarks, function (box) {
+        box.addEventListener('input', function () { check(box); });
+        var cell = cellOf(box), time = cell && cell.querySelector('.chk-task-time');
+        if (time) time.addEventListener('input', function () { check(box); });
+        check(box);
+    });
 })();
 </script>
 <!-- Hidden form for attachment delete (one form, item-id-less by design — uses att_id only) -->
