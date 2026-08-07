@@ -15,8 +15,8 @@
 -- so the Operations migration can follow without renumbering.
 -- =========================================================
 
--- The cycle column. Already present on the live database; IF NOT
--- EXISTS (MariaDB 10.2+) makes re-running this harmless.
+-- The cycle column. Already present on the live database, so the
+-- IF NOT EXISTS (MariaDB 10.2+) makes re-running this harmless.
 ALTER TABLE `chk_checklists`
   ADD COLUMN IF NOT EXISTS `frequency` enum('daily','weekly','monthly')
   NOT NULL DEFAULT 'daily' AFTER `assign_type`;
