@@ -2,6 +2,11 @@
 // =========================================================
 // WORK PULSE  ·  Unified App Router
 // =========================================================
+// The app enforces its own idle timeout (enforceIdleTimeout(), modules/auth.php),
+// so PHP's collector must not expire a session the app still considers valid —
+// a long checklist fill can sit for well over the 1440s default with no request.
+// Must precede session_start(), so it cannot live in config.php below.
+ini_set('session.gc_maxlifetime', '28800');
 session_start();
 date_default_timezone_set('Asia/Kolkata');
 ini_set('display_errors', 1);
