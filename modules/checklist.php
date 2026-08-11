@@ -1956,7 +1956,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
     <div class="table-wrap">
         <table class="table chk-table">
             <thead>
-                <tr><th style="width:48px;text-align:center">#</th><th>Particular</th><th style="width:<?= $timeUi ? 320 : 260 ?>px">Status / Answer</th></tr>
+                <tr><th style="width:48px;text-align:center">#</th><th style="width:60%">Particular</th><th style="width:36%">Status / Answer</th></tr>
             </thead>
             <tbody>
             <?php
@@ -2078,7 +2078,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                         $canAttach = $cellEditable;
                         if ($attList || $canAttach):
                         ?>
-                            <span class="chk-att-wrap" style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">
+                            <span class="chk-att-wrap" style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap;flex:1 1 150px;min-width:0">
                                 <?php foreach ($attList as $att): ?>
                                     <span style="display:inline-flex;align-items:center;gap:4px">
                                         <a class="chk-att-chip" target="_blank"
@@ -2101,7 +2101,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                                            name="attachments[<?= (int)$t['id'] ?>][]"
                                            accept="image/*,application/pdf,.doc,.docx,.xls,.xlsx"
                                            multiple capture="environment"
-                                           style="font-size:11px;max-width:190px">
+                                           style="font-size:11px;flex:1 1 120px;min-width:0">
                                 <?php endif; ?>
                             </span>
                         <?php endif; ?>
