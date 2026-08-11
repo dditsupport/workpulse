@@ -1609,13 +1609,23 @@ function pageChecklistHub(): void {
         </div>
         <?php if ($c['noScope']): ?>
         <div class="text-muted" style="font-size:12px">No location claimed</div>
-        <?php else: foreach ($c['lines'] as $ln): ?>
-        <div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;line-height:1.7">
-            <span><span class="badge <?= $ln['freq'] === 'daily' ? 'badge-grey' : 'badge-blue' ?>" style="font-weight:600"><?= h($ln['label']) ?></span>
-                <span class="text-muted" style="margin-left:6px"><?= h($ln['period']) ?></span></span>
-            <strong<?= $ln['done'] >= $ln['total'] ? ' style="color:var(--green)"' : '' ?>><?= (int)$ln['done'] ?>/<?= (int)$ln['total'] ?></strong>
+        <?php else: ?>
+        <?php
+        // A column gap rather than line-height: the cycle badges carry their own
+        // padding, so leading alone leaves their boxes all but touching.
+        ?>
+        <div style="display:flex;flex-direction:column;gap:7px">
+            <?php foreach ($c['lines'] as $ln): ?>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px">
+                <span style="display:inline-flex;align-items:center;gap:7px;min-width:0">
+                    <span class="badge <?= $ln['freq'] === 'daily' ? 'badge-grey' : 'badge-blue' ?>" style="font-weight:600"><?= h($ln['label']) ?></span>
+                    <span class="text-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= h($ln['period']) ?></span>
+                </span>
+                <strong style="white-space:nowrap<?= $ln['done'] >= $ln['total'] ? ';color:var(--green)' : '' ?>"><?= (int)$ln['done'] ?>/<?= (int)$ln['total'] ?></strong>
+            </div>
+            <?php endforeach; ?>
         </div>
-        <?php endforeach; endif; ?>
+        <?php endif; ?>
     </a>
     <?php endforeach; ?>
 </div>
