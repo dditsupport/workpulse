@@ -20,14 +20,21 @@ function enforceIdleTimeout(): void {
     // review justification, or attaching files to a price variation can
     // each take >10 minutes).
     $exemptPages   = ['audit_new', 'audit_edit', 'audit_manager_review', 'audit_operation_review', 'audit_management_review',
-                      'audit_annotation_image'];
+                      'audit_annotation_image', 'checklist_files'];
     $exemptActions = ['create_audit', 'save_audit_weights', 'delete_audit_attachment', 'approve_audit', 'manager_review_audit',
                       'operation_review_audit', 'management_approve_audit',
                       'create_audit_annotation', 'add_audit_annotation_comment', 'resolve_audit_annotation', 'reopen_audit_annotation',
-                      'pv_add_attachment'];
+                      'pv_add_attachment',
+                      'save_checklist', 'delete_checklist_attachment'];
     $curPage   = $_GET['page'] ?? '';
     $curAction = $_POST['action'] ?? '';
-    if (in_array($curPage, $exemptPages, true) || in_array($curAction, $exemptActions, true)) {
+    // Filling a checklist (?page=checklist&id=N) is long-form work too: a
+    // department list can run to dozens of tasks, each with minutes, a typed
+    // remark and photo attachments, and nothing reaches the server between
+    // opening the page and the single save at the end. The hub (no id) is a
+    // short card list and stays on the clock.
+    $onChecklistFill = ($curPage === 'checklist' && (int)($_GET['id'] ?? 0) > 0);
+    if ($onChecklistFill || in_array($curPage, $exemptPages, true) || in_array($curAction, $exemptActions, true)) {
         $_SESSION['last_activity'] = time();
         return;
     }
