@@ -13,14 +13,21 @@
 // ── Duration helpers ─────────────────────────────────────
 // A <select> of duration slots in 15-minute steps (15m … 8h), values in
 // whole minutes, labels like "2h 30m". $value (minutes) pre-selects a slot.
-function durationSelect(string $name, int $value = 0, bool $required = false): string {
+function durationSelect(string $name, int $value = 0, bool $required = false, string $extraClass = '', string $style = ''): string {
     $opts = '<option value="">--</option>';
     for ($mins = 15; $mins <= 8 * 60; $mins += 15) {
         $sel   = $mins === $value ? ' selected' : '';
         $opts .= '<option value="' . $mins . '"' . $sel . '>' . fmtMinutes($mins) . '</option>';
     }
+    // A value that is not on a 15-minute slot (typed before this was a select)
+    // still needs somewhere to sit, or editing the row would silently drop it.
+    if ($value > 0 && $value % 15 !== 0) {
+        $opts .= '<option value="' . $value . '" selected>' . fmtMinutes($value) . '</option>';
+    }
     $req = $required ? ' required' : '';
-    return '<select name="' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '" class="form-control"' . $req . '>' . $opts . '</select>';
+    $cls = 'form-control' . ($extraClass !== '' ? ' ' . $extraClass : '');
+    $sty = $style !== '' ? ' style="' . htmlspecialchars($style, ENT_QUOTES, 'UTF-8') . '"' : '';
+    return '<select name="' . htmlspecialchars($name, ENT_QUOTES, 'UTF-8') . '" class="' . $cls . '"' . $req . $sty . '>' . $opts . '</select>';
 }
 
 // Format minutes back to a compact "2h 30m" / "45m" string.

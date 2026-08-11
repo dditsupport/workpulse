@@ -166,6 +166,59 @@ function chkFrequency(array $cl): string {
     return in_array($f, CHK_FREQS, true) ? $f : 'daily';
 }
 
+// Is chk_sections.frequency there? The cycle lives on the section, so one
+// checklist can carry Daily, Weekly and Monthly work at once. Without the
+// column every section reads as the checklist's own cycle, which is how the
+// module behaved before.
+function chkHasSectionFreq(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    try {
+        $r = getDb()->query('SELECT frequency FROM chk_sections LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
+
+// Is chk_daily_responses.worked_on there? It records the calendar day minutes
+// were actually entered, as opposed to log_date which is the anchor of the
+// cycle the answer belongs to. Without it the timesheet falls back to dating
+// entries by the anchor, which is the old (wrong for weekly/monthly) behaviour.
+function chkHasWorkedOn(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    try {
+        $r = getDb()->query('SELECT worked_on FROM chk_daily_responses LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
+
+// The cycle one task runs on: its section's, falling back to the checklist's
+// for a task with no section. $section is a chk_sections row or null.
+function chkItemFreq(?array $section, array $cl): string {
+    if ($section !== null && chkHasSectionFreq()) {
+        $f = (string)($section['frequency'] ?? '');
+        if (in_array($f, CHK_FREQS, true)) return $f;
+    }
+    return chkFrequency($cl);
+}
+
+// The log_date one task's answer is stored under, for a given calendar day:
+// the day itself for daily work, that week's Sunday, or the 1st of the month.
+function chkItemLogDate(?array $section, array $cl, string $day): string {
+    return chkPeriodStart(chkItemFreq($section, $cl), $day);
+}
+
+// Does this checklist ask how long each task took? Location-assigned lists
+// (the outlet checklists) do not — a store manager ticks the round off, they
+// do not run a timesheet against it.
+function chkTracksTime(array $cl): bool {
+    return !chkScopeIsLocation($cl);
+}
+
 // First day of the cycle a date falls in: the date itself (daily), that
 // week's Sunday (weekly — the week closes the following Saturday at
 // midnight), or the 1st of the month (monthly).
@@ -230,22 +283,26 @@ function chkPeriodCloseLabel(array $cl, string $periodStart): string {
 }
 
 // ── Time-window engine (per-checklist, DB-driven) ─────────
-// The fillable cycle for a checklist, as its anchor date. On a daily
-// checklist rollover_min shifts the boundary: while now's minute-of-day is
-// below rollover_min we still report yesterday (Store rollover_min=120 →
-// before 02:00 counts as the prior day, matching the old hardcoded
-// behavior). Weekly and monthly cycles close on plain calendar boundaries
-// — Saturday midnight and the month's last midnight — so rollover_min,
-// which is a same-day-shift setting, does not apply to them.
+// The one calendar day a checklist is fillable on. rollover_min shifts the
+// boundary: while now's minute-of-day is below rollover_min we still report
+// yesterday (Store rollover_min=120 → before 02:00 counts as the prior day).
+//
+// This is a *day*, not a cycle anchor: a checklist can hold daily, weekly and
+// monthly sections at once, so each task derives its own anchor from this day
+// via chkItemLogDate(). Filling the current day is what keeps every cycle's
+// open period writable.
 function checklistEffectiveDate(array $cl): string {
     $now  = time();
-    $freq = chkFrequency($cl);
-    if ($freq !== 'daily') return chkPeriodStart($freq, date('Y-m-d', $now));
     $minOfDay = (int)date('G', $now) * 60 + (int)date('i', $now);
     if ($minOfDay < (int)($cl['rollover_min'] ?? 0)) {
         return date('Y-m-d', strtotime('-1 day', $now));
     }
     return date('Y-m-d', $now);
+}
+
+// Does this section's band cover the whole day, i.e. gate nothing?
+function chkSectionAllDay(array $section): bool {
+    return (int)($section['start_min'] ?? 0) <= 0 && (int)($section['end_min'] ?? 1440) >= 1440;
 }
 
 // Per-section start / deadline (Unix ts) on the given checklist date, from
@@ -260,30 +317,30 @@ function checklistSectionDeadlineTs(array $section, string $logDate): int {
     return $base === false ? 0 : $base + (int)$section['end_min'] * 60;
 }
 
-// "not_yet_open" | "open" | "closed" for a section on a given period.
-// $section may be null (an item with no section → open all through the
-// effective period). Superadmin bypasses; an un-gated checklist is always
-// open on its effective period, and so is every weekly / monthly one —
-// the per-section bands are minutes-from-midnight of a single day, which
-// says nothing about a cycle that spans a week or a month, so there the
-// sections are grouping headers and the whole period stays fillable.
-function checklistSectionState(?array $section, string $logDate, array $cl): string {
+// "not_yet_open" | "open" | "closed" for a section on a given calendar day.
+// $section may be null (an item with no section → open all day). Superadmin
+// bypasses.
+//
+// The start_min/end_min bands are minutes-from-midnight of a single day, so
+// they only mean something for a daily section: a weekly or monthly section
+// stays open for its whole cycle, which the day gate below already expresses,
+// since every day inside the open week or month is the effective day on the
+// day it is filled.
+function checklistSectionState(?array $section, string $day, array $cl): string {
     if (isSuperadmin()) return 'open';
-    if (empty($cl['time_gated']) || chkFrequency($cl) !== 'daily') {
-        return ($logDate === checklistEffectiveDate($cl)) ? 'open' : 'closed';
-    }
-    if ($logDate !== checklistEffectiveDate($cl)) return 'closed';
-    if ($section === null) return 'open';
+    if ($day !== checklistEffectiveDate($cl)) return 'closed';
+    if ($section === null || empty($cl['time_gated'])) return 'open';
+    if (chkItemFreq($section, $cl) !== 'daily') return 'open';
     $now = time();
-    if ($now < checklistSectionStartTs($section, $logDate))    return 'not_yet_open';
-    if ($now > checklistSectionDeadlineTs($section, $logDate)) return 'closed';
+    if ($now < checklistSectionStartTs($section, $day))    return 'not_yet_open';
+    if ($now > checklistSectionDeadlineTs($section, $day)) return 'closed';
     return 'open';
 }
 
 // True iff the current user may still write answers for the given section
-// on the given checklist day.
-function checklistSectionEditable(?array $section, string $logDate, array $cl): bool {
-    return checklistSectionState($section, $logDate, $cl) === 'open';
+// on the given calendar day.
+function checklistSectionEditable(?array $section, string $day, array $cl): bool {
+    return checklistSectionState($section, $day, $cl) === 'open';
 }
 
 // ── Attachment storage (per response) ─────────────────────
@@ -595,14 +652,12 @@ function doSaveChecklist(): void {
         header("Location: index.php?page=checklist"); exit;
     }
     $isLocMode = chkScopeIsLocation($cl);
-    $freq      = chkFrequency($cl);
-    $logDate   = $_POST['log_date'] ?? checklistEffectiveDate($cl);
     $answers   = $_POST['ans'] ?? [];
-    // Answers are stored against the period anchor, so any day inside the
-    // cycle the form posted back collapses onto the same row.
-    $logDate = preg_match('/^\d{4}-\d{2}-\d{2}$/', $logDate)
-        ? chkPeriodStart($freq, $logDate)
-        : checklistEffectiveDate($cl);
+    // The form posts one calendar day. Each task then resolves its own
+    // log_date from it — the day itself for daily work, that week's Sunday,
+    // the 1st of the month — so a single submit can write three cycles.
+    $day = (string)($_POST['log_date'] ?? '');
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $day)) $day = checklistEffectiveDate($cl);
 
     // Resolve scope (location_id). Employee-mode checklists share one factory
     // copy under location_id = 0; location-mode keeps the per-outlet scope.
@@ -625,12 +680,14 @@ function doSaveChecklist(): void {
 
     $back = "index.php?page=checklist&id={$checklistId}"
           . ($isLocMode ? "&location_id={$locationId}" : '')
-          . "&date={$logDate}";
+          . "&date={$day}";
 
-    // Only the effective checklist period is writable for non-superadmin.
-    if (!isSuperadmin() && $logDate !== checklistEffectiveDate($cl)) {
-        flash('error', 'You can only fill the current checklist ' . chkFreqNoun($freq)
-            . ' (' . chkPeriodLabel($freq, checklistEffectiveDate($cl)) . ').');
+    // Only the current day is writable for non-superadmin. Filling today is
+    // what keeps every cycle's open period writable, since today falls inside
+    // the open week and the open month by definition.
+    if (!isSuperadmin() && $day !== checklistEffectiveDate($cl)) {
+        flash('error', 'You can only fill the current checklist day ('
+            . date('d M Y', strtotime(checklistEffectiveDate($cl))) . ').');
         header("Location: {$back}"); exit;
     }
 
@@ -639,8 +696,9 @@ function doSaveChecklist(): void {
     // time-only submit: the day's tasks may already be filled and the
     // employee is just recording how long each took.
     $hasUploads = !empty($_FILES['attachments']['name']) && is_array($_FILES['attachments']['name']);
-    $times      = chkNormalizeTaskTimes($_POST['task_time'] ?? null);   // itemId => minutes
-    $remarks    = chkHasRemarks() ? chkNormalizeRemarks($_POST['remark'] ?? null) : [];  // itemId => text
+    $tracksTime = chkTracksTime($cl) && chkHasTaskTime();
+    $times      = $tracksTime ? chkNormalizeTaskTimes($_POST['task_time'] ?? null) : [];  // itemId => minutes
+    $remarks    = chkHasRemarks() ? chkNormalizeRemarks($_POST['remark'] ?? null) : [];   // itemId => text
     // Every editable cell posts an ans[] key, blank or not — "did they
     // actually answer something" is a different question from "was ans[] sent".
     $hasRealAnswers = (bool)array_filter($answers, fn($v) => trim((string)$v) !== '');
@@ -651,98 +709,110 @@ function doSaveChecklist(): void {
 
     $db = getDb();
     $allSections = chkGetSections($checklistId);
-
-    // Look up each answered item's section so we can enforce per-section
-    // deadlines server-side, and confirm the item belongs to this checklist.
     $secByItem = [];   // itemId => section row (or null)
     $ownItems  = [];   // itemIds that belong to this checklist
-    chkLoadItemMeta($checklistId, array_keys($answers), $allSections, $ownItems, $secByItem);
+    $touched   = array_values(array_unique(array_map('intval',
+        array_merge(array_keys($answers), array_keys($times), array_keys($remarks)))));
+    chkLoadItemMeta($checklistId, $touched, $allSections, $ownItems, $secByItem);
 
-    // Minutes and remarks are separate optional columns, and a submit may
-    // carry either, both or neither for a given task. Only the ones actually
-    // posted for that task are written: a form that sends minutes but no
-    // remark must leave an existing remark alone, and the reverse. A blank box
-    // that *was* posted means NULL — that is how each is cleared.
-    $hasTaskTime  = chkHasTaskTime();
-    $hasRemarkCol = chkHasRemarks();
-    $extraFor = function (int $itemId) use ($hasTaskTime, $hasRemarkCol, $times, $remarks): array {
+    // Build one write per task before touching the database: which columns this
+    // submit actually carries for it, and which log_date its cycle puts it
+    // under. A column the submit did not carry is left alone; a column it
+    // carried but left blank becomes NULL, which is how each is cleared.
+    $onTime  = chkHasWorkedOn() ? date('Y-m-d') : null;
+    $plan = [];  // itemId => ['log' => date, 'set' => [col => value|null]]
+    $skippedClosed = 0;
+    foreach ($touched as $itemId) {
+        if ($itemId <= 0 || empty($ownItems[$itemId])) continue;
+        $sec = $secByItem[$itemId] ?? null;
         $set = [];
-        if ($hasTaskTime && array_key_exists($itemId, $times)) {
-            $set['time_minutes'] = $times[$itemId] > 0 ? (int)$times[$itemId] : null;
+        if ($tracksTime && array_key_exists($itemId, $times)) {
+            // On a checklist that tracks time the minutes ARE the answer: any
+            // time logged means the task was done, none means it was not. The
+            // answer is still written so every done-count and report that
+            // reads response_value keeps working untouched.
+            $mins = (int)$times[$itemId];
+            $set['response_value'] = $mins > 0 ? 'Yes' : null;
+            $set['time_minutes']   = $mins > 0 ? $mins : null;
+        } else {
+            if (array_key_exists($itemId, $answers) && trim((string)$answers[$itemId]) !== '') {
+                $set['response_value'] = (string)$answers[$itemId];
+            }
+            if ($tracksTime && array_key_exists($itemId, $times)) {
+                $set['time_minutes'] = $times[$itemId] > 0 ? (int)$times[$itemId] : null;
+            }
         }
-        if ($hasRemarkCol && array_key_exists($itemId, $remarks)) {
+        if (chkHasRemarks() && array_key_exists($itemId, $remarks)) {
             $set['remarks'] = $remarks[$itemId] !== '' ? $remarks[$itemId] : null;
         }
-        return $set;
-    };
-    // One prepared statement per column subset, built on first use. There are
-    // at most four, so this stays cheap while keeping the SQL honest.
+        if (!$set) continue;
+        if (!checklistSectionEditable($sec, $day, $cl)) { $skippedClosed++; continue; }
+        $plan[$itemId] = ['log' => chkItemLogDate($sec, $cl, $day), 'set' => $set];
+    }
+
+    // Minutes move to whichever day they were entered on, so any day they move
+    // *off* needs its timesheet entry recomputed too. Collect those before the
+    // writes overwrite them.
+    $syncDays = [];
+    if ($onTime !== null) {
+        $syncDays[$onTime] = true;
+        foreach ($plan as $itemId => $p) {
+            if (!array_key_exists('time_minutes', $p['set'])) continue;
+            try {
+                $q = $db->prepare('SELECT worked_on FROM chk_daily_responses
+                                   WHERE checklist_id = ? AND location_id = ? AND item_id = ?
+                                     AND log_date = ? AND employee_code = ?');
+                $q->execute([$checklistId, $locationId, $itemId, $p['log'], $empCode]);
+                $prev = $q->fetchColumn();
+                if ($prev) $syncDays[(string)$prev] = true;
+            } catch (Exception $e) { /* column absent — nothing to resync */ }
+        }
+    }
+
+    // One prepared statement per column subset, built on first use.
     $stCache = [];
-    $upsertFor = function (array $extra, bool $withAnswer) use (&$stCache, $db) {
-        $names = array_keys($extra);
-        $key   = ($withAnswer ? 'a:' : 'x:') . implode(',', $names);
+    $writeFor = function (array $cols, bool $clear) use (&$stCache, $db) {
+        $key = ($clear ? 'c:' : 'w:') . implode(',', $cols);
         if (!isset($stCache[$key])) {
-            $head = ['checklist_id', 'location_id', 'item_id', 'employee_code', 'log_date'];
-            $cols = array_merge($head, $withAnswer ? ['response_value'] : [], $names);
-            $upd  = array_merge($withAnswer ? ['response_value', 'employee_code'] : [], ['checklist_id'], $names);
-            $stCache[$key] = $db->prepare(
-                'INSERT INTO chk_daily_responses (' . implode(', ', $cols) . ', submitted_at) VALUES ('
-                . implode(', ', array_fill(0, count($cols), '?')) . ', NOW()) ON DUPLICATE KEY UPDATE '
-                . implode(', ', array_map(fn($c) => "{$c} = VALUES({$c})", $upd))
-                . ($withAnswer ? ', submitted_at = NOW()' : ''));
+            $stCache[$key] = $clear
+                ? $db->prepare('UPDATE chk_daily_responses SET '
+                    . implode(', ', array_map(fn($c) => "{$c} = NULL", $cols))
+                    . ' WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND log_date = ? AND employee_code = ?')
+                : $db->prepare('INSERT INTO chk_daily_responses ('
+                    . implode(', ', array_merge(
+                        ['checklist_id', 'location_id', 'item_id', 'employee_code', 'log_date'], $cols))
+                    . ', submitted_at) VALUES ('
+                    . implode(', ', array_fill(0, 5 + count($cols), '?')) . ', NOW()) ON DUPLICATE KEY UPDATE '
+                    . implode(', ', array_map(fn($c) => "{$c} = VALUES({$c})",
+                        array_merge(['checklist_id', 'employee_code'], $cols)))
+                    . ', submitted_at = NOW()');
         }
         return $stCache[$key];
     };
 
-    $saved = 0; $skippedClosed = 0; $remarksSaved = 0;
-    $doneItems = [];   // itemIds whose extras the answer upsert already wrote
+    $saved = 0; $remarksSaved = 0;
     try {
         $db->beginTransaction();
-        foreach ($answers as $itemId => $val) {
-            $itemId = (int)$itemId;
-            if ($val === '' || empty($ownItems[$itemId])) continue;
-            if (!checklistSectionEditable($secByItem[$itemId] ?? null, $logDate, $cl)) {
-                $skippedClosed++;
-                continue;
+        foreach ($plan as $itemId => $p) {
+            $set = $p['set'];
+            // Stamp the day the work was recorded whenever minutes are written,
+            // so the timesheet dates it by when it happened rather than by the
+            // anchor of the cycle it belongs to.
+            if ($onTime !== null && array_key_exists('time_minutes', $set) && ($set['time_minutes'] ?? null) !== null) {
+                $set['worked_on'] = $onTime;
             }
-            $extra = $extraFor($itemId);
-            $upsertFor($extra, true)->execute(array_merge(
-                [$checklistId, $locationId, $itemId, $empCode, $logDate, $val], array_values($extra)));
-            $doneItems[$itemId] = true;
-            if (($remarks[$itemId] ?? '') !== '') $remarksSaved++;
-            $saved++;
-        }
-
-        // Minutes or a remark typed against a task carrying no answer in this
-        // submit (answered earlier in the cycle, or noted before being ticked
-        // off) have no upsert to ride along with. Write the extras alone —
-        // response_value is deliberately absent from the UPDATE list so an
-        // existing answer survives untouched.
-        $extraOnly = array_keys($times + $remarks);
-        if ($extraOnly) {
-            chkLoadItemMeta($checklistId, $extraOnly, $allSections, $ownItems, $secByItem);
-            $clearCache = [];
-            foreach ($extraOnly as $itemId) {
-                if (isset($doneItems[$itemId]) || empty($ownItems[$itemId])) continue;
-                if (!checklistSectionEditable($secByItem[$itemId] ?? null, $logDate, $cl)) continue;
-                $extra = $extraFor($itemId);
-                if (!$extra) continue;
-                if (array_filter($extra, fn($v) => $v !== null)) {
-                    $upsertFor($extra, false)->execute(array_merge(
-                        [$checklistId, $locationId, $itemId, $empCode, $logDate], array_values($extra)));
-                    if (($remarks[$itemId] ?? '') !== '') $remarksSaved++;
-                } else {
-                    // Everything posted for this task was blank. Clear those
-                    // columns with an UPDATE rather than an INSERT: emptying the
-                    // boxes on a task that was never answered must not conjure a
-                    // row whose only content is NULLs.
-                    $key = implode(',', array_keys($extra));
-                    $clearCache[$key] ??= $db->prepare(
-                        'UPDATE chk_daily_responses SET '
-                        . implode(', ', array_map(fn($c) => "{$c} = NULL", array_keys($extra)))
-                        . ' WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND log_date = ? AND employee_code = ?');
-                    $clearCache[$key]->execute([$checklistId, $locationId, $itemId, $logDate, $empCode]);
-                }
+            if (array_filter($set, fn($v) => $v !== null)) {
+                $writeFor(array_keys($set), false)->execute(array_merge(
+                    [$checklistId, $locationId, $itemId, $empCode, $p['log']], array_values($set)));
+                if (($set['response_value'] ?? null) !== null) $saved++;
+                if (($remarks[$itemId] ?? '') !== '') $remarksSaved++;
+            } else {
+                // Everything this submit carried for the task was blank. Clear
+                // those columns with an UPDATE rather than an INSERT: emptying
+                // the boxes on a task never answered must not conjure a row
+                // whose only content is NULLs.
+                $writeFor(array_keys($set), true)
+                    ->execute([$checklistId, $locationId, $itemId, $p['log'], $empCode]);
             }
         }
         $db->commit();
@@ -776,10 +846,13 @@ function doSaveChecklist(): void {
         $attSaved = 0;
         foreach ($attachItemIds as $itemId) {
             if (empty($ownItems[$itemId])) continue;
-            if (!checklistSectionEditable($secByItem[$itemId] ?? null, $logDate, $cl)) continue;
-            $respId = checklistResponseId($checklistId, $locationId, $itemId, $logDate, $empCode);
+            $sec = $secByItem[$itemId] ?? null;
+            if (!checklistSectionEditable($sec, $day, $cl)) continue;
+            // The file hangs off the row for this task's own cycle, not the day.
+            $itemLog = chkItemLogDate($sec, $cl, $day);
+            $respId  = checklistResponseId($checklistId, $locationId, $itemId, $itemLog, $empCode);
             if ($respId === null) continue; // no answer yet → ignore file
-            $attSaved += checklistSaveAttachments($respId, $locationId, $logDate, $itemId, $empCode, $checklistId);
+            $attSaved += checklistSaveAttachments($respId, $locationId, $itemLog, $itemId, $empCode, $checklistId);
         }
         if ($attSaved > 0) {
             $prev = $_SESSION['flash'] ?? null;
@@ -788,10 +861,18 @@ function doSaveChecklist(): void {
         }
     }
 
-    // Mirror this user's time into page=my_time — the per-task minutes they
-    // entered when there are any, else the completed tasks' estimate. The
-    // cycle's remarks ride along as that entry's notes.
-    $logged = chkSyncTimeEntry($checklistId, $empCode, $logDate);
+    // Mirror this user's time into page=my_time. One entry per day worked, so
+    // minutes land on the day they were entered whatever cycle the task runs
+    // on; any day the minutes moved off is recomputed too.
+    $logged = 0;
+    if ($syncDays) {
+        foreach (array_keys($syncDays) as $d) {
+            $n = chkSyncTimeEntry($checklistId, $empCode, $d);
+            if ($d === $onTime) $logged = $n;
+        }
+    } else {
+        $logged = chkSyncTimeEntry($checklistId, $empCode, $day);
+    }
     if (($times || $remarksSaved > 0) && empty($_SESSION['flash'])) {
         // Time- or remark-only submit — say so, otherwise the redirect looks
         // like a no-op.
@@ -920,7 +1001,14 @@ function chkNormalizeTaskTimes($raw): array {
     $out = [];
     foreach ($raw as $itemId => $val) {
         $itemId = (int)$itemId;
-        if ($itemId <= 0 || !is_numeric(trim((string)$val))) continue;
+        if ($itemId <= 0) continue;
+        $val = trim((string)$val);
+        // The empty slot is a real choice, not a missing one: on a checklist
+        // where the duration is the answer, "--" is how a task is marked not
+        // done, so it has to reach the save as an explicit 0 rather than being
+        // dropped the way a malformed value is.
+        if ($val === '')      { $out[$itemId] = 0; continue; }
+        if (!is_numeric($val)) continue;
         $out[$itemId] = max(0, min(8 * 60, (int)$val));
     }
     return $out;
@@ -957,14 +1045,21 @@ function chkLoadItemMeta(int $checklistId, array $itemIds, array $allSections, a
     }
 }
 
-// Minutes this employee typed against the tasks of one checklist+day.
-function chkTaskTimeTotal(int $checklistId, string $empCode, string $logDate): int {
+// The column that says which day a response's minutes belong to. worked_on is
+// the day they were actually entered; log_date is the anchor of the cycle the
+// answer sits under, which is only the same thing for daily work. Falls back
+// to log_date on a database that has not run the migration.
+function chkWorkDayCol(): string { return chkHasWorkedOn() ? 'worked_on' : 'log_date'; }
+
+// Minutes this employee logged on one checklist on one day worked.
+function chkTaskTimeTotal(int $checklistId, string $empCode, string $day): int {
     if (!chkHasTaskTime()) return 0;
+    $col = chkWorkDayCol();
     try {
         $st = getDb()->prepare(
             "SELECT COALESCE(SUM(time_minutes),0) FROM chk_daily_responses
-             WHERE checklist_id = ? AND employee_code = ? AND log_date = ?");
-        $st->execute([$checklistId, $empCode, $logDate]);
+             WHERE checklist_id = ? AND employee_code = ? AND {$col} = ?");
+        $st->execute([$checklistId, $empCode, $day]);
         return (int)$st->fetchColumn();
     } catch (Exception $e) {
         return 0;
@@ -977,17 +1072,18 @@ function chkTaskTimeTotal(int $checklistId, string $empCode, string $logDate): i
 // characters on the Store checklist, so each is trimmed — a note is meant to
 // be read at a glance in a timesheet row. Returns '' when nothing was noted,
 // which leaves the caller's fixed label in place.
-function chkRemarksNote(int $checklistId, string $empCode, string $logDate): string {
+function chkRemarksNote(int $checklistId, string $empCode, string $day): string {
     if (!chkHasRemarks() || $empCode === '') return '';
+    $col = chkWorkDayCol();
     try {
         $st = getDb()->prepare(
             "SELECT i.task_description, r.remarks
              FROM chk_daily_responses r
              JOIN chk_items i ON i.id = r.item_id
-             WHERE r.checklist_id = ? AND r.employee_code = ? AND r.log_date = ?
+             WHERE r.checklist_id = ? AND r.employee_code = ? AND r.{$col} = ?
                AND r.remarks IS NOT NULL AND r.remarks <> ''
              ORDER BY i.id");
-        $st->execute([$checklistId, $empCode, $logDate]);
+        $st->execute([$checklistId, $empCode, $day]);
     } catch (Exception $e) {
         return '';
     }
@@ -1004,15 +1100,28 @@ function chkRemarksNote(int $checklistId, string $empCode, string $logDate): str
     return implode(' · ', $parts);
 }
 
-// Recomputes that single time_entries row from the cycle's responses
-// (delete-then-insert, keyed by employee+checklist+date) and returns the
-// minutes logged. Fails open — returns 0 — so a missing
-// time_entries.checklist_id column never blocks a checklist save.
-function chkSyncTimeEntry(int $checklistId, string $empCode, string $logDate): int {
+// Recomputes the one time_entries row for an employee's day on a checklist
+// (delete-then-insert, keyed by employee+checklist+day) and returns the minutes
+// logged. Fails open — returns 0 — so a missing time_entries.checklist_id
+// column never blocks a checklist save.
+//
+// The day here is the day the work was recorded, not the anchor of the cycle
+// the tasks belong to: a monthly task filled on the 11th logs its time on the
+// 11th, where the person actually spent it, instead of on the 1st. Since each
+// response carries exactly one such day, summing per day cannot double count.
+function chkSyncTimeEntry(int $checklistId, string $empCode, string $day): int {
     if ($empCode === '') return 0;
-    $db = getDb();
+    $db  = getDb();
+    $col = chkWorkDayCol();
     try {
-        $mins  = chkTaskTimeTotal($checklistId, $empCode, $logDate);
+        $cl = chkGetChecklist($checklistId);
+        // A checklist that does not ask how long a task took does not log time.
+        if ($cl && !chkTracksTime($cl)) {
+            $db->prepare("DELETE FROM time_entries WHERE employee_code = ? AND checklist_id = ? AND entry_date = ?")
+               ->execute([$empCode, $checklistId, $day]);
+            return 0;
+        }
+        $mins  = chkTaskTimeTotal($checklistId, $empCode, $day);
         $notes = CHK_TIME_NOTE_ENTERED;
         if ($mins <= 0) {
             // Nothing typed for any task — fall back to the estimates.
@@ -1020,9 +1129,9 @@ function chkSyncTimeEntry(int $checklistId, string $empCode, string $logDate): i
                 "SELECT COALESCE(SUM(i.est_minutes),0)
                  FROM chk_daily_responses r
                  JOIN chk_items i ON i.id = r.item_id
-                 WHERE r.checklist_id = ? AND r.employee_code = ? AND r.log_date = ?
+                 WHERE r.checklist_id = ? AND r.employee_code = ? AND r.{$col} = ?
                    AND r.response_value IS NOT NULL AND r.response_value <> '' AND i.est_minutes > 0");
-            $sumSt->execute([$checklistId, $empCode, $logDate]);
+            $sumSt->execute([$checklistId, $empCode, $day]);
             $mins  = (int)$sumSt->fetchColumn();
             $notes = CHK_TIME_NOTE_AUTO;
         }
@@ -1030,16 +1139,16 @@ function chkSyncTimeEntry(int $checklistId, string $empCode, string $logDate): i
         // What the person actually wrote beats the fixed label. Only when no
         // task carries a remark does the entry fall back to saying where the
         // minutes came from.
-        $remarkNote = chkRemarksNote($checklistId, $empCode, $logDate);
+        $remarkNote = chkRemarksNote($checklistId, $empCode, $day);
         if ($remarkNote !== '') $notes = $remarkNote;
 
         $db->prepare("DELETE FROM time_entries WHERE employee_code = ? AND checklist_id = ? AND entry_date = ?")
-           ->execute([$empCode, $checklistId, $logDate]);
+           ->execute([$empCode, $checklistId, $day]);
         if ($mins > 0) {
             $db->prepare(
                 "INSERT INTO time_entries (employee_code, checklist_id, entry_date, minutes, notes)
                  VALUES (?, ?, ?, ?, ?)")
-               ->execute([$empCode, $checklistId, $logDate, $mins, $notes]);
+               ->execute([$empCode, $checklistId, $day, $mins, $notes]);
         }
         return $mins;
     } catch (Exception $e) {
@@ -1216,6 +1325,9 @@ function doSaveSection(): void {
     $endMin      = chkHhmmToMin($_POST['end_time'] ?? '') ?? 1440;
     if (!empty($_POST['end_next_day'])) $endMin += 1440;
     $sort        = (int)($_POST['sort_order'] ?? 0);
+    $secFreq     = (string)($_POST['frequency'] ?? 'daily');
+    if (!in_array($secFreq, CHK_FREQS, true)) $secFreq = 'daily';
+    $hasSecFreq  = chkHasSectionFreq();
     $back        = chkManageBack($checklistId);
     if ($checklistId <= 0 || $name === '') {
         flash('error', 'Section name required.');
@@ -1223,17 +1335,20 @@ function doSaveSection(): void {
     }
     chkRequireManage($checklistId);
     $db = getDb();
+    $fCol = $hasSecFreq ? ', frequency=?' : '';
+    $fArg = $hasSecFreq ? [$secFreq] : [];
     if ($sectionId > 0) {
-        $db->prepare("UPDATE chk_sections SET name=?, start_min=?, end_min=?, sort_order=? WHERE id=? AND checklist_id=?")
-           ->execute([$name, $startMin, $endMin, $sort, $sectionId, $checklistId]);
+        $db->prepare("UPDATE chk_sections SET name=?, start_min=?, end_min=?, sort_order=?{$fCol} WHERE id=? AND checklist_id=?")
+           ->execute(array_merge([$name, $startMin, $endMin, $sort], $fArg, [$sectionId, $checklistId]));
         // Keep the denormalized copy on chk_items in sync so reports that group
         // by section_name (audit, overview filters, exports) stay aligned with
         // the section's new name instead of drifting to the old label.
         $db->prepare("UPDATE chk_items SET section_name=? WHERE section_id=? AND checklist_id=?")
            ->execute([$name, $sectionId, $checklistId]);
     } else {
-        $db->prepare("INSERT INTO chk_sections (checklist_id, name, start_min, end_min, sort_order) VALUES (?,?,?,?,?)")
-           ->execute([$checklistId, $name, $startMin, $endMin, $sort]);
+        $db->prepare('INSERT INTO chk_sections (checklist_id, name, start_min, end_min, sort_order'
+                   . ($hasSecFreq ? ', frequency' : '') . ') VALUES (?,?,?,?,?' . ($hasSecFreq ? ',?' : '') . ')')
+           ->execute(array_merge([$checklistId, $name, $startMin, $endMin, $sort], $fArg));
     }
     flash('success', 'Section saved.');
     header("Location: {$back}"); exit;
@@ -1365,95 +1480,145 @@ function chkItemTotal(int $checklistId): int {
     $st->execute([$checklistId]);
     return (int)$st->fetchColumn();
 }
-// Distinct answered items for one (checklist, scope, date).
-function chkDoneCount(int $checklistId, int $locationId, string $logDate): int {
-    $st = getDb()->prepare(
-        "SELECT COUNT(DISTINCT item_id) FROM chk_daily_responses
-         WHERE checklist_id = ? AND location_id = ? AND log_date = ?
-           AND response_value IS NOT NULL AND response_value <> ''");
-    $st->execute([$checklistId, $locationId, $logDate]);
-    return (int)$st->fetchColumn();
+
+// SQL fragment resolving a task's cycle from its section, falling back to the
+// checklist's own. Used wherever a count has to stay inside one cycle.
+function chkItemFreqSql(string $itemAlias = 'i', string $secAlias = 'sec', string $clAlias = 'c'): string {
+    return chkHasSectionFreq()
+        ? "COALESCE({$secAlias}.frequency, {$clAlias}.frequency, 'daily')"
+        : "COALESCE({$clAlias}.frequency, 'daily')";
+}
+
+// Active items per cycle: ['daily' => n, 'weekly' => n, 'monthly' => n],
+// omitting cycles the checklist has no tasks for.
+function chkItemTotalByFreq(int $checklistId): array {
+    if (!chkHasFrequency()) return ['daily' => chkItemTotal($checklistId)];
+    $f = chkItemFreqSql();
+    try {
+        $st = getDb()->prepare(
+            "SELECT {$f} AS freq, COUNT(*) AS n
+             FROM chk_items i
+             JOIN chk_checklists c ON c.id = i.checklist_id
+             LEFT JOIN chk_sections sec ON sec.id = i.section_id
+             WHERE i.checklist_id = ? AND i.is_active = 1
+             GROUP BY freq");
+        $st->execute([$checklistId]);
+    } catch (Exception $e) {
+        return ['daily' => chkItemTotal($checklistId)];
+    }
+    $rows = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) $rows[(string)$r['freq']] = (int)$r['n'];
+    // Always shortest cycle first, whatever order the group by came back in.
+    $out = [];
+    foreach (CHK_FREQS as $f) if (isset($rows[$f])) $out[$f] = $rows[$f];
+    return $out ?: ['daily' => 0];
+}
+
+// Distinct answered items for one (checklist, scope, cycle) on the cycle's
+// anchor. The frequency filter is not decoration: on the 1st of a month the
+// daily and monthly anchors are the same date, and on a Sunday so are the
+// daily and weekly ones, so counting by log_date alone would mix cycles.
+function chkDoneCount(int $checklistId, int $locationId, string $logDate, ?string $freq = null): int {
+    if ($freq === null || !chkHasFrequency()) {
+        $st = getDb()->prepare(
+            "SELECT COUNT(DISTINCT item_id) FROM chk_daily_responses
+             WHERE checklist_id = ? AND location_id = ? AND log_date = ?
+               AND response_value IS NOT NULL AND response_value <> ''");
+        $st->execute([$checklistId, $locationId, $logDate]);
+        return (int)$st->fetchColumn();
+    }
+    $f = chkItemFreqSql();
+    try {
+        $st = getDb()->prepare(
+            "SELECT COUNT(DISTINCT r.item_id)
+             FROM chk_daily_responses r
+             JOIN chk_items i ON i.id = r.item_id
+             JOIN chk_checklists c ON c.id = i.checklist_id
+             LEFT JOIN chk_sections sec ON sec.id = i.section_id
+             WHERE r.checklist_id = ? AND r.location_id = ? AND r.log_date = ?
+               AND r.response_value IS NOT NULL AND r.response_value <> ''
+               AND {$f} = ?");
+        $st->execute([$checklistId, $locationId, $logDate, $freq]);
+        return (int)$st->fetchColumn();
+    } catch (Exception $e) {
+        return 0;
+    }
 }
 
 // ── Hub: list every checklist assigned to the user ────────
-// Split into one section per cycle — Daily, Weekly, Monthly — so a store
-// manager sees at a glance what is due today apart from what is due this
-// week or this month. All three headings always render, an empty one
-// saying so rather than silently disappearing.
+// One card per checklist, carrying a line for each cycle it actually holds.
+// A checklist can mix Daily, Weekly and Monthly sections, so grouping the
+// cards by cycle would put the same checklist in three places; the cycles
+// belong on the card instead.
 function pageChecklistHub(): void {
-    $me     = myCode();
-    $groups = ['daily' => [], 'weekly' => [], 'monthly' => []];
-    $any    = false;
+    $me    = myCode();
+    $cards = [];
     foreach (chkActiveChecklists() as $cl) {
         if (!chkCanFill($cl, $me)) continue;
-        $cid    = (int)$cl['id'];
-        $isLoc  = chkScopeIsLocation($cl);
-        $freq   = chkFrequency($cl);
+        $cid   = (int)$cl['id'];
+        $isLoc = chkScopeIsLocation($cl);
         // Progress is scoped to the user's own location; null = none claimed,
         // which the card reports instead of a misleading 0/N.
-        $scopeLoc   = $isLoc ? myLocationId() : 0;
-        $eff        = checklistEffectiveDate($cl);
-        $total      = chkItemTotal($cid);
-        $done       = ($isLoc && $scopeLoc <= 0) ? null : chkDoneCount($cid, $scopeLoc, $eff);
-        $link = "?page=checklist&id={$cid}";
-        $groups[$freq][] = [
-            'cl' => $cl, 'isLoc' => $isLoc, 'freq' => $freq, 'total' => $total,
-            'done' => $done, 'link' => $link, 'period' => chkPeriodLabel($freq, $eff),
+        $scopeLoc = $isLoc ? myLocationId() : 0;
+        $day      = checklistEffectiveDate($cl);
+        $noScope  = ($isLoc && $scopeLoc <= 0);
+        $lines    = [];
+        $doneAll  = 0; $totalAll = 0;
+        foreach (chkItemTotalByFreq($cid) as $freq => $total) {
+            if ($total <= 0) continue;
+            $anchor = chkPeriodStart($freq, $day);
+            $done   = $noScope ? null : chkDoneCount($cid, $scopeLoc, $anchor, $freq);
+            $lines[] = [
+                'freq'   => $freq,
+                'label'  => chkFreqLabel($freq),
+                'total'  => $total,
+                'done'   => $done,
+                'period' => $freq === 'daily' ? 'today' : chkPeriodLabel($freq, $anchor),
+            ];
+            $totalAll += $total;
+            if ($done !== null) $doneAll += $done;
+        }
+        if (!$lines) continue;
+        $cards[] = [
+            'cl' => $cl, 'isLoc' => $isLoc, 'lines' => $lines, 'noScope' => $noScope,
+            'pct' => ($totalAll > 0 && !$noScope) ? (int)round($doneAll * 100 / $totalAll) : 0,
+            'link' => "?page=checklist&id={$cid}",
         ];
-        $any = true;
     }
 ?>
 <div class="page-header"><h2>✅ Checklists</h2></div>
-<?php if (!$any): ?>
+<?php if (!$cards): ?>
 <div class="alert alert-error">No checklists are assigned to you yet.
     <?php if (!isSuperadmin() && myLocationId() <= 0): ?>
     If you fill a store checklist, claim your location under <a href="?page=my_location" style="color:var(--accent)">My Location</a> first.
     <?php endif; ?>
 </div>
 <?php else: ?>
-<?php foreach ($groups as $freq => $cards): ?>
-<div style="margin-bottom:20px">
-    <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:10px">
-        <h3 style="font-size:15px;margin:0"><?= h(chkFreqLabel($freq)) ?></h3>
-        <span class="text-muted" style="font-size:12px">
-            <?php if ($freq === 'weekly'): ?>Sunday to Saturday — closes Saturday midnight
-            <?php elseif ($freq === 'monthly'): ?>1st to the last day — closes on the last day at midnight
-            <?php else: ?>One cycle per day
-            <?php endif; ?>
-        </span>
-    </div>
-    <?php if (empty($cards)): ?>
-    <div class="text-muted" style="font-size:12px;padding:12px 14px;border:1px dashed var(--border);border-radius:8px">
-        No <?= h(strtolower(chkFreqLabel($freq))) ?> checklist is assigned to you.
-    </div>
-    <?php else: ?>
-    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px">
-        <?php foreach ($cards as $c): $cl = $c['cl']; $done = $c['done']; $total = $c['total'];
-            $pct = ($total > 0 && $done !== null) ? (int)round($done * 100 / $total) : 0;
-            $bg  = ($done === null) ? 'var(--border)' : ($done >= $total && $total > 0 ? 'var(--green)' : ($done > 0 ? 'var(--yellow)' : 'var(--red)'));
-        ?>
-        <a href="<?= h($c['link']) ?>" class="table-wrap" style="display:block;padding:16px;text-decoration:none;color:var(--text)">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
-                <strong style="font-size:15px"><?= h($cl['name']) ?></strong>
-                <span class="badge <?= $c['isLoc'] ? 'badge-blue' : 'badge-grey' ?>" style="font-weight:600"><?= $c['isLoc'] ? 'By location' : 'Department' ?></span>
-            </div>
-            <div style="height:8px;border-radius:999px;background:var(--bg);overflow:hidden;margin-bottom:6px">
-                <span style="display:block;height:100%;width:<?= $pct ?>%;background:<?= $bg ?>"></span>
-            </div>
-            <div class="text-muted" style="font-size:12px">
-                <?php if ($done === null): ?>
-                    No location claimed
-                <?php else: ?>
-                    <?= h(chkFreqThis($c['freq'])) ?>: <?= $done ?>/<?= $total ?> done
-                <?php endif; ?>
-            </div>
-            <div class="text-muted" style="font-size:11px;margin-top:2px"><?= h($c['period']) ?></div>
-        </a>
-        <?php endforeach; ?>
-    </div>
-    <?php endif; ?>
+<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px">
+    <?php foreach ($cards as $c): $cl = $c['cl'];
+        $bg = $c['noScope'] ? 'var(--border)'
+            : ($c['pct'] >= 100 ? 'var(--green)' : ($c['pct'] > 0 ? 'var(--yellow)' : 'var(--red)'));
+    ?>
+    <a href="<?= h($c['link']) ?>" class="table-wrap" style="display:block;padding:16px;text-decoration:none;color:var(--text)">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">
+            <strong style="font-size:15px"><?= h($cl['name']) ?></strong>
+            <span class="badge <?= $c['isLoc'] ? 'badge-blue' : 'badge-grey' ?>" style="font-weight:600"><?= $c['isLoc'] ? 'By location' : 'Department' ?></span>
+        </div>
+        <div style="height:8px;border-radius:999px;background:var(--bg);overflow:hidden;margin-bottom:8px">
+            <span style="display:block;height:100%;width:<?= (int)$c['pct'] ?>%;background:<?= $bg ?>"></span>
+        </div>
+        <?php if ($c['noScope']): ?>
+        <div class="text-muted" style="font-size:12px">No location claimed</div>
+        <?php else: foreach ($c['lines'] as $ln): ?>
+        <div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;line-height:1.7">
+            <span><span class="badge <?= $ln['freq'] === 'daily' ? 'badge-grey' : 'badge-blue' ?>" style="font-weight:600"><?= h($ln['label']) ?></span>
+                <span class="text-muted" style="margin-left:6px"><?= h($ln['period']) ?></span></span>
+            <strong<?= $ln['done'] >= $ln['total'] ? ' style="color:var(--green)"' : '' ?>><?= (int)$ln['done'] ?>/<?= (int)$ln['total'] ?></strong>
+        </div>
+        <?php endforeach; endif; ?>
+    </a>
+    <?php endforeach; ?>
 </div>
-<?php endforeach; ?>
 <?php endif;
 }
 
@@ -1471,17 +1636,16 @@ function pageChecklistFill(int $checklistId): void {
     }
     $isLoc         = chkScopeIsLocation($cl);
     $freq          = chkFrequency($cl);
+    $timeTracked   = chkTracksTime($cl);
     $effectiveDate = checklistEffectiveDate($cl);
-    // ?date= may name any day inside a cycle (a bookmark, a report link);
-    // it always resolves to that cycle's anchor, which is what the answers
-    // are stored against.
+    // ?date= names a calendar day. Each section then resolves its own period
+    // from it, so picking a day shows that day's daily work alongside the week
+    // and the month containing it.
     $displayDate   = $_GET['date'] ?? $effectiveDate;
-    $displayDate   = preg_match('/^\d{4}-\d{2}-\d{2}$/', $displayDate)
-        ? chkPeriodStart($freq, $displayDate)
-        : $effectiveDate;
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $displayDate)) $displayDate = $effectiveDate;
     $isPast        = ($displayDate < $effectiveDate);
     $isFutureDate  = ($displayDate > $effectiveDate);
-    $periodLabel   = chkPeriodLabel($freq, $displayDate);
+    $periodLabel   = date('d M Y', strtotime($displayDate));
 
     // Resolve scope (location_id) for location-mode. Everyone — admins
     // included — fills against their own employees.location_id; there is no
@@ -1504,49 +1668,28 @@ function pageChecklistFill(int $checklistId): void {
     // When the open cycle stops accepting answers, in words.
     $closeLabel = chkPeriodCloseLabel($cl, $effectiveDate);
 
-    // ── Period picker window ─────────────────────────────
-    // One tile per cycle, paged by the natural container of that cycle:
-    // days of a month (daily), the weeks touching a month (weekly), the
-    // twelve months of a year (monthly). Each tile is keyed by the cycle's
-    // anchor date, which is exactly what log_date holds.
+    // ── Day picker ───────────────────────────────────────
+    // One tile per day of the month. Picking a day drives every section: the
+    // daily ones show that day, the weekly and monthly ones the week and month
+    // containing it. The tile figures count daily work only — on the 1st of a
+    // month the daily and monthly anchors are the same date, so counting by
+    // log_date alone would fold monthly tasks into that day's tile.
     $dTs      = strtotime($displayDate);
-    $navFirst = $freq === 'monthly' ? date('Y-01-01', $dTs) : date('Y-m-01', $dTs);
-    $navLast  = $freq === 'monthly' ? date('Y-12-31', $dTs) : date('Y-m-t',  $dTs);
-    $navStep  = $freq === 'monthly' ? 'year' : 'month';
-    // Prev / Next aim at the middle of the neighbouring month rather than its
-    // 1st: a ?date= is re-normalised to its cycle anchor on arrival, and the
-    // week holding the 1st often starts in the month before it — which would
-    // page two months back instead of one. The week holding the 15th never does.
-    $navPin   = $freq === 'weekly' ? 'Y-m-15' : 'Y-m-d';
-    $navPrev  = date($navPin, strtotime("-1 {$navStep}", strtotime($navFirst)));
-    $navNext  = date($navPin, strtotime("+1 {$navStep}", strtotime($navFirst)));
-    $navLabel = $freq === 'monthly' ? date('Y', $dTs) : date('F Y', $dTs);
+    $navFirst = date('Y-m-01', $dTs);
+    $navLast  = date('Y-m-t',  $dTs);
+    $navPrev  = date('Y-m-d', strtotime('-1 month', strtotime($navFirst)));
+    $navNext  = date('Y-m-d', strtotime('+1 month', strtotime($navFirst)));
+    $navLabel = date('F Y', $dTs);
 
     $tiles = [];   // ['start','label']
-    if ($freq === 'weekly') {
-        // Every week that touches this month, so a week straddling the
-        // month boundary is reachable from either side.
-        $cur = chkPeriodStart('weekly', $navFirst);
-        while ($cur <= $navLast) {
-            $end = chkPeriodEnd('weekly', $cur);
-            $tiles[] = ['start' => $cur, 'label' => date('j M', strtotime($cur)) . '–' . date('j M', strtotime($end))];
-            $cur = date('Y-m-d', strtotime('+7 day', strtotime($cur)));
-        }
-    } elseif ($freq === 'monthly') {
-        for ($m = 1; $m <= 12; $m++) {
-            $start = date('Y-m-01', mktime(0, 0, 0, $m, 1, (int)date('Y', $dTs)));
-            $tiles[] = ['start' => $start, 'label' => date('M', strtotime($start))];
-        }
-    } else {
-        $daysInMonth = (int)date('t', $dTs);
-        for ($d = 1; $d <= $daysInMonth; $d++) {
-            $start = date('Y-m-', $dTs) . str_pad($d, 2, '0', STR_PAD_LEFT);
-            $tiles[] = ['start' => $start, 'label' => (string)$d];
-        }
+    $daysInMonth = (int)date('t', $dTs);
+    for ($d = 1; $d <= $daysInMonth; $d++) {
+        $start = date('Y-m-', $dTs) . str_pad($d, 2, '0', STR_PAD_LEFT);
+        $tiles[] = ['start' => $start, 'label' => (string)$d];
     }
-    $tileMin  = $tiles ? $tiles[0]['start'] : $navFirst;
-    $tileMax  = $tiles ? end($tiles)['start'] : $navLast;
-    $tileWide = $freq === 'weekly' ? 104 : ($freq === 'monthly' ? 84 : 72);
+    $tileMin  = $navFirst;
+    $tileMax  = $navLast;
+    $tileWide = 72;
     $locQS    = $isLoc && $locationId > 0 ? "&location_id={$locationId}" : '';
 
     $db = getDb();
@@ -1555,61 +1698,90 @@ function pageChecklistFill(int $checklistId): void {
     $existingCounts = [];
     $totalQ = max(1, chkItemTotal($checklistId));
 
-    if ($haveScope) {
-        // Tile counts (distinct answered items per cycle anchor).
-        $st = $db->prepare(
-            "SELECT log_date, COUNT(DISTINCT item_id) AS done FROM chk_daily_responses
-             WHERE checklist_id = ? AND location_id = ? AND log_date BETWEEN ? AND ?
-               AND response_value IS NOT NULL AND response_value <> ''
-             GROUP BY log_date"
-        );
-        $st->execute([$checklistId, $locationId, $tileMin, $tileMax]);
-        $existingCounts = $st->fetchAll(PDO::FETCH_KEY_PAIR);
+    // The anchor each cycle resolves to for the selected day.
+    $anchors = [];
+    foreach (CHK_FREQS as $f) $anchors[$f] = chkPeriodStart($f, $displayDate);
 
-        // Tasks + this scope's latest answer per item (one row per item).
-        // Per-task minutes come off *this* user's own response row (`mine`),
-        // never the latest one: on a shared location checklist the boxes must
-        // show what I logged, not what a colleague did.
-        // Remarks come off the same `mine` row as the minutes, for the same
-        // reason: on a shared location checklist the box must show what I
-        // wrote, not what a colleague did.
-        $hasTaskTime = chkHasTaskTime();
-        $hasRemarkCol = chkHasRemarks();
-        $mineCols = [];
-        if ($hasTaskTime)  $mineCols[] = 'mine.time_minutes AS my_minutes';
-        if ($hasRemarkCol) $mineCols[] = 'mine.remarks AS my_remarks';
-        $mineSel  = $mineCols ? implode(', ', $mineCols) . ', ' : '';
-        $mineJoin = $mineCols
-            ? "LEFT JOIN chk_daily_responses mine
-                      ON mine.item_id = q.id AND mine.checklist_id = ? AND mine.location_id = ?
-                     AND mine.log_date = ? AND mine.employee_code = ?"
-            : '';
+    if ($haveScope) {
+        // Tile counts — daily work only, see the note on the picker above.
+        $fSql = chkItemFreqSql();
+        try {
+            $st = $db->prepare(
+                "SELECT r.log_date, COUNT(DISTINCT r.item_id) AS done
+                 FROM chk_daily_responses r
+                 JOIN chk_items i ON i.id = r.item_id
+                 JOIN chk_checklists c ON c.id = i.checklist_id
+                 LEFT JOIN chk_sections sec ON sec.id = i.section_id
+                 WHERE r.checklist_id = ? AND r.location_id = ? AND r.log_date BETWEEN ? AND ?
+                   AND r.response_value IS NOT NULL AND r.response_value <> ''
+                   AND {$fSql} = 'daily'
+                 GROUP BY r.log_date");
+            $st->execute([$checklistId, $locationId, $tileMin, $tileMax]);
+            $existingCounts = $st->fetchAll(PDO::FETCH_KEY_PAIR);
+        } catch (Exception $e) {
+            $existingCounts = [];
+        }
+
+        // Tasks, each carrying the cycle it runs on so the view can group and
+        // label by it and resolve its answer to the right anchor.
+        $freqSel = chkHasSectionFreq()
+            ? "COALESCE(sec.frequency, c.frequency, 'daily')"
+            : "COALESCE(c.frequency, 'daily')";
         $st = $db->prepare(
             "SELECT q.id, q.task_description, q.input_type, q.section_id, q.section_name, q.est_minutes,
-                    a.response_value, {$mineSel}e.full_name AS submitted_by
+                    COALESCE(sec.name, q.section_name) AS sec_name,
+                    COALESCE(sec.sort_order, 9999) AS sec_sort,
+                    {$freqSel} AS item_freq
              FROM chk_items q
+             LEFT JOIN chk_checklists c ON c.id = q.checklist_id
              LEFT JOIN chk_sections sec ON sec.id = q.section_id
-             LEFT JOIN (
-                 SELECT item_id, MAX(id) AS rid FROM chk_daily_responses
-                 WHERE checklist_id = ? AND location_id = ? AND log_date = ?
-                 GROUP BY item_id
-             ) latest ON latest.item_id = q.id
-             LEFT JOIN chk_daily_responses a ON a.id = latest.rid
-             {$mineJoin}
-             LEFT JOIN employees e ON a.employee_code = e.employee_code
              WHERE q.checklist_id = ? AND q.is_active = 1
-             ORDER BY COALESCE(sec.sort_order, 9999), q.id ASC"
-        );
-        $st->execute(array_merge(
-            [$checklistId, $locationId, $displayDate],
-            $mineCols ? [$checklistId, $locationId, $displayDate, $me] : [],
-            [$checklistId]
-        ));
+             ORDER BY CASE {$freqSel} WHEN 'daily' THEN 1 WHEN 'weekly' THEN 2 ELSE 3 END,
+                      sec_sort, q.id ASC");
+        $st->execute([$checklistId]);
         $tasks = $st->fetchAll(PDO::FETCH_ASSOC);
+
+        // Every response sitting on any of the three anchors, matched to its
+        // task in PHP. One query rather than a correlated per-row anchor join,
+        // and the matching stays somewhere it can be read and tested.
+        // `latest` is whoever answered most recently — that is what the cell
+        // shows; `mine` is this user's own row, which is where the minutes and
+        // the remark come from, so a colleague's entry never appears as theirs.
+        $sel = 'r.item_id, r.log_date, r.id, r.response_value, r.employee_code'
+             . (chkHasTaskTime() ? ', r.time_minutes' : '')
+             . (chkHasRemarks()  ? ', r.remarks' : '');
+        $rs = $db->prepare(
+            "SELECT {$sel}, e.full_name
+             FROM chk_daily_responses r
+             LEFT JOIN employees e ON e.employee_code = r.employee_code
+             WHERE r.checklist_id = ? AND r.location_id = ? AND r.log_date IN (?, ?, ?)
+             ORDER BY r.id ASC");
+        $rs->execute(array_merge([$checklistId, $locationId], array_values($anchors)));
+        $latest = []; $mine = [];
+        foreach ($rs->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $k = (int)$r['item_id'] . '|' . $r['log_date'];
+            $latest[$k] = $r;
+            if ((string)$r['employee_code'] === $me) $mine[$k] = $r;
+        }
+        foreach ($tasks as &$t) {
+            $k = (int)$t['id'] . '|' . ($anchors[$t['item_freq']] ?? $displayDate);
+            $t['log_date']       = $anchors[$t['item_freq']] ?? $displayDate;
+            $t['response_value'] = $latest[$k]['response_value'] ?? null;
+            $t['submitted_by']   = $latest[$k]['full_name'] ?? null;
+            $t['my_minutes']     = $mine[$k]['time_minutes'] ?? null;
+            $t['my_remarks']     = $mine[$k]['remarks'] ?? null;
+        }
+        unset($t);
     }
-    $itemAttachments = $haveScope
-        ? checklistAttachmentsByItem($checklistId, $locationId, $displayDate)
-        : [];
+    // Attachments hang off each task's own anchor, so all three are collected.
+    $itemAttachments = [];
+    if ($haveScope) {
+        foreach (array_unique(array_values($anchors)) as $a) {
+            foreach (checklistAttachmentsByItem($checklistId, $locationId, $a) as $iid => $rows) {
+                $itemAttachments[$iid] = array_merge($itemAttachments[$iid] ?? [], $rows);
+            }
+        }
+    }
     // All-time file counts per task, so a row shows "has a file" even when
     // the file was uploaded on a different day than the one being viewed.
     $itemFileCounts = $haveScope
@@ -1687,7 +1859,7 @@ function pageChecklistFill(int $checklistId): void {
 
 <!-- Checklist Form -->
 <?php if ($isFutureDate): ?>
-<div class="alert alert-error">Future <?= h(chkFreqNoun($freq)) ?>s cannot be filled. The current checklist <?= h(chkFreqNoun($freq)) ?> is <strong><?= h(chkPeriodLabel($freq, $effectiveDate)) ?></strong>.</div>
+<div class="alert alert-error">Future days cannot be filled. The current checklist day is <strong><?= h(date('d M Y', strtotime($effectiveDate))) ?></strong>.</div>
 <?php elseif (!empty($tasks)): ?>
 <?php
 // Per-section editability for this displayed period — used to gate inputs.
@@ -1697,19 +1869,26 @@ function pageChecklistFill(int $checklistId): void {
 // The HH:MM labels only mean something on a daily checklist: a weekly or
 // monthly cycle has no per-day bands, so its sections stay label-less and
 // the badge reads a plain Open / Closed.
-$timeBands     = ($freq === 'daily');
 $sectionStatus = [];
 foreach ($tasks as $t) {
     $sid = (int)($t['section_id'] ?? 0);
     if (!isset($sectionStatus[$sid])) {
-        $secRow = $sid ? ($sections[$sid] ?? null) : null;
-        $state  = checklistSectionState($secRow, $displayDate, $cl);
+        $secRow  = $sid ? ($sections[$sid] ?? null) : null;
+        $state   = checklistSectionState($secRow, $displayDate, $cl);
+        $sFreq   = (string)($t['item_freq'] ?? 'daily');
+        // The HH:MM bands describe one day, so they only mean anything on a
+        // daily section; a weekly or monthly one is labelled with its period.
+        $bands   = ($sFreq === 'daily');
         $sectionStatus[$sid] = [
             'state'         => $state,
             'open'          => $state === 'open',
+            'freq'          => $sFreq,
+            'period'        => chkPeriodLabel($sFreq, $anchors[$sFreq] ?? $displayDate),
             'name'          => $secRow['name'] ?? ($t['section_name'] ?: 'General'),
-            'startLabel'    => ($secRow && $timeBands) ? date('h:i A', checklistSectionStartTs($secRow, $displayDate))    : '',
-            'deadlineLabel' => ($secRow && $timeBands) ? date('h:i A', checklistSectionDeadlineTs($secRow, $displayDate)) : '',
+            // A band running the whole day is not a window anyone needs told
+            // about — only a genuine slice of the day earns the label.
+            'startLabel'    => ($secRow && $bands && !chkSectionAllDay($secRow)) ? date('h:i A', checklistSectionStartTs($secRow, $displayDate))    : '',
+            'deadlineLabel' => ($secRow && $bands && !chkSectionAllDay($secRow)) ? date('h:i A', checklistSectionDeadlineTs($secRow, $displayDate)) : '',
         ];
     }
 }
@@ -1728,7 +1907,7 @@ $readOnly = $isPast || !$anyOpenSection;
 // Per-task time entry needs the chk_daily_responses.time_minutes column and
 // fmtMinutes() from the time tracking module; without either, the time boxes
 // simply don't render and the est_minutes fallback carries on as before.
-$timeUi      = chkHasTaskTime() && function_exists('fmtMinutes');
+$timeUi      = $timeTracked && chkHasTaskTime() && function_exists('fmtMinutes');
 $remarkUi    = chkHasRemarks();
 $timeRow     = $timeUi ? chkTimeEntryRow($checklistId, $me, $displayDate) : null;
 $loggedMins  = (int)($timeRow['minutes'] ?? 0);
@@ -1740,22 +1919,23 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
 ?>
 <?php if ($timeUi && $loggedMins > 0): ?>
 <div class="alert" style="margin-bottom:10px;background:rgba(99,102,241,.10);color:var(--text);border:1px solid rgba(99,102,241,.30)">
-    <?= chkClockIcon(14) ?> <strong><?= h(fmtMinutes($loggedMins)) ?></strong> logged for this <?= h(chkFreqNoun($freq)) ?> in
+    <?= chkClockIcon(14) ?> <strong><?= h(fmtMinutes($loggedMins)) ?></strong> logged for this day in
     <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a><?= $timeEntered ? '' : ' (estimated from the tasks you completed)' ?>.
 </div>
 <?php elseif ($timeUi && !$readOnly): ?>
 <div class="text-muted" style="font-size:12px;margin-bottom:10px">
-    <?= chkClockIcon(13) ?> Enter the minutes you spent next to each task — they add up into one
-    <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a> entry for this <?= h(chkFreqNoun($freq)) ?>.
+    <?= chkClockIcon(13) ?> Pick how long each task took — the minutes add up into one
+    <a href="<?= h($myTimeUrl) ?>" style="color:var(--accent)">My Time</a> entry for the day you enter them,
+    whichever cycle the task belongs to.
 </div>
 <?php endif; ?>
 <?php if ($isPast): ?>
-<div class="alert" style="margin-bottom:10px;background:rgba(107,114,128,.12);color:#9ca3af;border:1px solid rgba(107,114,128,.3)">Viewing a past <?= h(chkFreqNoun($freq)) ?> — read-only.</div>
+<div class="alert" style="margin-bottom:10px;background:rgba(107,114,128,.12);color:#9ca3af;border:1px solid rgba(107,114,128,.3)">Viewing a past day — read-only.</div>
 <?php elseif (!$anyOpenSection && $anyUpcoming): ?>
 <div class="alert" style="margin-bottom:10px;background:rgba(201,168,0,.10);color:var(--yellow);border:1px solid rgba(201,168,0,.30)">No section is open right now. The next section opens later today — check back at the time shown on each section header.</div>
 <?php elseif (!$anyOpenSection): ?>
 <div class="alert" style="margin-bottom:10px;background:rgba(107,114,128,.12);color:#9ca3af;border:1px solid rgba(107,114,128,.3)">
-    All sections for today are closed. The <?= h(chkFreqNoun($freq)) ?> rolls over <?= h($closeLabel) ?>.
+    All sections for today are closed. The day rolls over <?= h($closeLabel) ?>.
 </div>
 <?php endif; ?>
 <form method="POST" enctype="multipart/form-data" id="chkForm"<?= $readOnly ? ' onsubmit="return false"' : '' ?>>
@@ -1773,13 +1953,18 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
             $currentSection = null; $sr = 1;
             foreach ($tasks as $t):
                 $sid = (int)($t['section_id'] ?? 0);
-                $secInfo = $sectionStatus[$sid] ?? ['state' => 'closed', 'open' => false, 'name' => 'General', 'startLabel' => '', 'deadlineLabel' => ''];
+                $secInfo = $sectionStatus[$sid] ?? ['state' => 'closed', 'open' => false, 'name' => 'General',
+                                                    'startLabel' => '', 'deadlineLabel' => '', 'freq' => 'daily', 'period' => ''];
                 $cellEditable = !$readOnly && $secInfo['open'];
                 if ($sid !== $currentSection):
                     $currentSection = $sid;
             ?>
                 <tr><td colspan="3" class="chk-section" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px">
                     <?= h($secInfo['name'] ?: 'General') ?>
+                    <span class="badge badge-blue" style="margin-left:8px;font-weight:600"><?= h(chkFreqLabel($secInfo['freq'])) ?></span>
+                    <?php if ($secInfo['period'] !== ''): ?>
+                        <span class="text-muted" style="margin-left:6px;font-weight:400"><?= h($secInfo['period']) ?></span>
+                    <?php endif; ?>
                     <?php if ($isPast): ?>
                         <span class="badge badge-grey" style="margin-left:8px;font-weight:600">Read-only (past)</span>
                     <?php elseif ($secInfo['state'] === 'not_yet_open'): ?>
@@ -1816,19 +2001,41 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                         // the cell stays two lines tall (answer + files).
                         $myMin = (int)($t['my_minutes'] ?? 0);
                         ?>
+                        <?php
+                            $cellMsg = $isPast
+                                ? 'Not filled'
+                                : ($secInfo['state'] === 'not_yet_open'
+                                    ? ('Opens at ' . ($secInfo['startLabel'] ?: '—'))
+                                    : ($secInfo['freq'] === 'daily' ? 'Section closed' : 'Closed'));
+                        ?>
                         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                        <?php if ($timeUi): ?>
+                        <?php
+                        // On a checklist that tracks time the duration IS the
+                        // answer — how long it took says it was done, and
+                        // nothing says it was not. So there is no separate
+                        // Yes/No to keep in step with the minutes.
+                        ?>
+                            <?php if ($cellEditable): ?>
+                            <span style="display:inline-flex;align-items:center;gap:5px">
+                                <span class="text-muted" style="display:inline-flex" title="How long this task took"><?= chkClockIcon(13) ?></span>
+                                <?= durationSelect('task_time[' . (int)$t['id'] . ']', $myMin, false, 'chk-task-time', 'width:110px;padding:3px 6px;font-size:12px') ?>
+                            </span>
+                            <?php if (!empty($t['response_value'])): ?>
+                                <span class="text-muted" style="font-size:11px">By: <?= h($t['submitted_by'] ?? 'Unknown') ?></span>
+                            <?php endif; ?>
+                            <?php elseif ($myMin > 0 || !empty($t['response_value'])): ?>
+                            <span class="badge badge-green">&#10003; <?= $myMin > 0 ? h(fmtMinutes($myMin)) : h($t['response_value']) ?></span>
+                            <span class="text-muted" style="font-size:11px">By: <?= h($t['submitted_by'] ?? 'Unknown') ?></span>
+                            <?php else: ?>
+                            <span class="text-muted" style="font-size:12px">— <?= h($cellMsg) ?> —</span>
+                            <?php endif; ?>
+                        <?php else: ?>
                         <div>
                         <?php if (!empty($t['response_value'])): ?>
                             <span class="badge badge-green">&#10003; <?= h($t['response_value']) ?></span>
                             <div class="text-muted" style="margin-top:2px">By: <?= h($t['submitted_by'] ?? 'Unknown') ?></div>
                         <?php elseif (!$cellEditable): ?>
-                            <?php
-                                $cellMsg = $isPast
-                                    ? 'Not filled'
-                                    : ($secInfo['state'] === 'not_yet_open'
-                                        ? ('Opens at ' . ($secInfo['startLabel'] ?: '—'))
-                                        : ($timeBands ? 'Section closed' : 'Closed'));
-                            ?>
                             <span class="text-muted" style="font-size:12px">— <?= h($cellMsg) ?> —</span>
                         <?php else: ?>
                             <?php if ($t['input_type'] === 'time'): ?>
@@ -1846,23 +2053,6 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                             <?php endif; ?>
                         <?php endif; ?>
                         </div>
-                        <?php
-                        // Per-task time, sitting beside the answer. Editable
-                        // while the section is open — including on an already
-                        // answered task, so the minutes can be filled in after
-                        // the fact. It rolls up into the day's My Time entry.
-                        if ($timeUi && $cellEditable): ?>
-                            <span style="display:inline-flex;align-items:center;gap:4px">
-                                <span class="text-muted" style="display:inline-flex" title="Minutes you spent on this task"><?= chkClockIcon(13) ?></span>
-                                <input type="number" name="task_time[<?= (int)$t['id'] ?>]" class="form-control chk-task-time"
-                                       min="0" max="480" step="5" inputmode="numeric" placeholder="0"
-                                       value="<?= $myMin > 0 ? $myMin : '' ?>"
-                                       aria-label="Minutes spent on this task"
-                                       style="width:58px;padding:3px 6px;font-size:12px">
-                                <span class="text-muted" style="font-size:11px">min</span>
-                            </span>
-                        <?php elseif ($timeUi && $myMin > 0): ?>
-                            <span class="text-muted" style="font-size:11px;white-space:nowrap"><?= chkClockIcon(12) ?> <?= h(fmtMinutes($myMin)) ?></span>
                         <?php endif; ?>
                         </div>
                         <?php
@@ -1942,7 +2132,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
     if ($hasFillable || $hasAttachable): ?>
     <div class="form-actions" style="position:sticky;bottom:0;margin-top:10px;padding:10px 0;background:var(--bg);border-top:1px solid var(--border);z-index:20">
         <button type="submit" class="btn btn-success">
-            <?= $hasFillable ? 'Submit ' . h(chkFreqLabel($freq)) . ' Progress' : 'Save Attachments' ?>
+            <?= $hasFillable ? 'Submit Progress' : 'Save Attachments' ?>
         </button>
         <?php if ($timeUi): ?>
         <span class="text-muted" style="font-size:12px;margin-left:10px">
@@ -1977,12 +2167,14 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
     Array.prototype.forEach.call(boxes, function (b) { b.addEventListener('input', sum); });
     sum();
 })();
-// A remark only reaches My Time through the cycle's time entry, and that
-// needs minutes. Flag it inline as soon as a remark is typed against a task
-// with an empty minutes box, rather than only after the round trip.
+<?php if ($timeUi): ?>
+// A remark only reaches My Time through the day's time entry, and that needs
+// minutes. Flag it inline as soon as a remark is typed against a task with no
+// duration picked, rather than only after the round trip. Skipped entirely on
+// a checklist that does not ask for time — there is nothing to add there.
 (function () {
     var remarks = document.querySelectorAll('.chk-task-remark');
-    if (!remarks.length) return;
+    if (!remarks.length || !document.querySelector('.chk-task-time')) return;
     function cellOf(el) { return el.closest ? el.closest('td') : null; }
     function hintFor(box) {
         var cell = cellOf(box);
@@ -2013,6 +2205,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
         check(box);
     });
 })();
+<?php endif; ?>
 </script>
 <!-- Hidden form for attachment delete (one form, item-id-less by design — uses att_id only) -->
 <form id="chkAttDelForm" method="POST" style="display:none">
@@ -2457,10 +2650,10 @@ function pageManageTasks(): void {
     <?php endif; ?>
     <div class="table-wrap" data-stack style="margin-bottom:10px">
         <table class="table" style="font-size:13px">
-            <thead><tr><th style="width:50px">Sort</th><th>Name</th><th style="width:120px">Window</th><th style="width:160px">Actions</th></tr></thead>
+            <thead><tr><th style="width:50px">Sort</th><th>Name</th><th style="width:90px">Cycle</th><th style="width:120px">Window</th><th style="width:160px">Actions</th></tr></thead>
             <tbody>
             <?php if (empty($sections)): ?>
-            <tr><td colspan="4" class="empty-row">No sections — tasks will be open all day.</td></tr>
+            <tr><td colspan="5" class="empty-row">No sections — tasks will be open all day.</td></tr>
             <?php else: foreach ($sections as $s):
                 $sm = (int)$s['start_min']; $em = (int)$s['end_min'];
                 $startTxt = sprintf('%02d:%02d', intdiv($sm,60)%24, $sm%60);
@@ -2470,9 +2663,10 @@ function pageManageTasks(): void {
             <tr>
                 <td><?= (int)$s['sort_order'] ?></td>
                 <td><?= h($s['name']) ?></td>
-                <td><?= h($startTxt) ?>–<?= h($endTxt) ?><?= $nextDay ? ' <span class="badge badge-grey">+1d</span>' : '' ?></td>
+                <td><span class="badge badge-blue" style="font-weight:600"><?= h(chkFreqLabel(chkItemFreq($s, $cl))) ?></span></td>
+                <td><?= chkItemFreq($s, $cl) === 'daily' ? h($startTxt) . '–' . h($endTxt) . ($nextDay ? ' <span class="badge badge-grey">+1d</span>' : '') : '<span class="text-muted">whole cycle</span>' ?></td>
                 <td class="actions" style="display:flex;gap:4px;flex-wrap:wrap">
-                    <button type="button" class="btn btn-primary btn-sm" onclick="editSec(<?= (int)$s['id'] ?>,<?= h(json_encode($s['name'])) ?>,'<?= h($startTxt) ?>','<?= h(sprintf('%02d:%02d', intdiv($em,60)%24, $em%60)) ?>',<?= $nextDay ? 1 : 0 ?>,<?= (int)$s['sort_order'] ?>)">Edit</button>
+                    <button type="button" class="btn btn-primary btn-sm" onclick="editSec(<?= (int)$s['id'] ?>,<?= h(json_encode($s['name'])) ?>,'<?= h($startTxt) ?>','<?= h(sprintf('%02d:%02d', intdiv($em,60)%24, $em%60)) ?>',<?= $nextDay ? 1 : 0 ?>,<?= (int)$s['sort_order'] ?>,'<?= h(chkItemFreq($s, $cl)) ?>')">Edit</button>
                     <form method="POST" class="inline-form" onsubmit="return confirm('Delete this section? Its tasks become un-sectioned.')">
                         <input type="hidden" name="action" value="del_section">
                         <input type="hidden" name="checklist_id" value="<?= $selId ?>">
@@ -2490,6 +2684,12 @@ function pageManageTasks(): void {
         <input type="hidden" name="checklist_id" value="<?= $selId ?>">
         <input type="hidden" name="section_id" id="secId" value="0">
         <div class="form-group" style="margin:0"><label>Section name</label><input type="text" name="name" id="secName" class="form-control" style="width:160px" required></div>
+        <div class="form-group" style="margin:0"><label>Cycle</label>
+            <select name="frequency" id="secFreq" class="form-control" style="width:110px"<?= chkHasSectionFreq() ? '' : ' disabled' ?>>
+                <option value="daily">Daily</option>
+                <option value="weekly">Weekly</option>
+                <option value="monthly">Monthly</option>
+            </select></div>
         <div class="form-group" style="margin:0"><label>Start</label><input type="time" name="start_time" id="secStart" class="form-control" value="00:00"></div>
         <div class="form-group" style="margin:0"><label>End</label><input type="time" name="end_time" id="secEnd" class="form-control" value="00:00"></div>
         <div class="form-group" style="margin:0"><label>&nbsp;</label><label style="display:flex;gap:6px;align-items:center;font-size:12px"><input type="checkbox" name="end_next_day" id="secNext" value="1"> End next day</label></div>
@@ -2562,13 +2762,14 @@ function cancelEdit() {
     document.getElementById('taskSubmitBtn').textContent = 'Add Task';
     document.getElementById('taskCancelBtn').style.display = 'none';
 }
-function editSec(id, name, start, end, nextDay, sort) {
+function editSec(id, name, start, end, nextDay, sort, freq) {
     document.getElementById('secId').value = id;
     document.getElementById('secName').value = name;
     document.getElementById('secStart').value = start;
     document.getElementById('secEnd').value = end;
     document.getElementById('secNext').checked = !!nextDay;
     document.getElementById('secSort').value = sort;
+    document.getElementById('secFreq').value = freq || 'daily';
     document.getElementById('secSubmit').textContent = 'Update Section';
 }
 function secReset() {
@@ -2578,6 +2779,7 @@ function secReset() {
     document.getElementById('secEnd').value = '00:00';
     document.getElementById('secNext').checked = false;
     document.getElementById('secSort').value = 0;
+    document.getElementById('secFreq').value = 'daily';
     document.getElementById('secSubmit').textContent = 'Add Section';
 }
 function clMeta(id, name, assign, gated, rollover, sort, freq) {

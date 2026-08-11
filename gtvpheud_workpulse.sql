@@ -313,6 +313,7 @@ CREATE TABLE `chk_daily_responses` (
   `item_id` int(10) UNSIGNED NOT NULL,
   `employee_code` varchar(20) NOT NULL,
   `log_date` date NOT NULL,
+  `worked_on` date DEFAULT NULL,
   `response_value` varchar(255) DEFAULT NULL,
   `time_minutes` smallint(5) UNSIGNED DEFAULT NULL,
   `remarks` varchar(500) DEFAULT NULL,
@@ -364,6 +365,7 @@ CREATE TABLE `chk_sections` (
   `id` int(10) UNSIGNED NOT NULL,
   `checklist_id` int(10) UNSIGNED NOT NULL,
   `name` varchar(100) NOT NULL,
+  `frequency` enum('daily','weekly','monthly') NOT NULL DEFAULT 'daily',
   `start_min` int(11) NOT NULL DEFAULT 0,
   `end_min` int(11) NOT NULL DEFAULT 1440,
   `sort_order` int(11) NOT NULL DEFAULT 0
