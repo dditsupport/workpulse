@@ -574,9 +574,13 @@ function pageChecklistAudit(): void {
         // does not). Grouping by the live name keeps items aligned with the
         // section rows this report renders; fall back to the stored name for
         // items with no section_id (legacy / unassigned).
+        $freqSel = (function_exists('chkHasSectionFreq') && chkHasSectionFreq())
+            ? "COALESCE(sec.frequency, c.frequency, 'daily')" : "COALESCE(c.frequency, 'daily')";
         $itemSql = "SELECT i.id, i.task_description,
-                           COALESCE(sec.name, i.section_name, 'General') AS section_name
+                           COALESCE(sec.name, i.section_name, 'General') AS section_name,
+                           {$freqSel} AS item_freq
                     FROM chk_items i
+                    LEFT JOIN chk_checklists c ON c.id = i.checklist_id
                     LEFT JOIN chk_sections sec ON sec.id = i.section_id
                     WHERE i.is_active = 1 AND i.checklist_id = ?";
         $itemParams = [$checklistId];
@@ -597,18 +601,31 @@ function pageChecklistAudit(): void {
             $itemsBySection[$sec][] = $it;
         }
 
-        // Responses for the chosen day, indexed by [locId][itemId].
+        // Responses for the chosen day, indexed by [locId][itemId]. A weekly or
+        // monthly task's answer sits on its cycle's anchor, not on the day being
+        // audited, so all three anchors are fetched and each task is matched to
+        // the one its own cycle resolves to — otherwise every non-daily task
+        // would read unanswered on all but one day of its period.
+        $anchors = [];
+        foreach (['daily', 'weekly', 'monthly'] as $f) {
+            $anchors[$f] = function_exists('chkPeriodStart') ? chkPeriodStart($f, $filterDate) : $filterDate;
+        }
+        $freqOfItem = [];
+        foreach ($allItems as $it) $freqOfItem[(int)$it['id']] = (string)($it['item_freq'] ?? 'daily');
         $respSt = $db->prepare(
-            'SELECT a.location_id, a.item_id, a.response_value, a.submitted_at,'
+            'SELECT a.location_id, a.item_id, a.log_date, a.response_value, a.submitted_at,'
             . ($auditRemarks ? ' a.remarks,' : '') .
             '       e.full_name AS staff_member, e.employee_code AS staff_code
              FROM chk_daily_responses a
              LEFT JOIN employees e ON a.employee_code = e.employee_code
-             WHERE a.checklist_id = ? AND a.log_date = ?'
+             WHERE a.checklist_id = ? AND a.log_date IN (?, ?, ?)'
         );
-        $respSt->execute([$checklistId, $filterDate]);
+        $respSt->execute(array_merge([$checklistId], array_values($anchors)));
         foreach ($respSt->fetchAll(PDO::FETCH_ASSOC) as $row) {
-            $responsesByLoc[(int)$row['location_id']][(int)$row['item_id']] = $row;
+            $iid  = (int)$row['item_id'];
+            $want = $anchors[$freqOfItem[$iid] ?? 'daily'] ?? $filterDate;
+            if ((string)$row['log_date'] !== $want) continue;
+            $responsesByLoc[(int)$row['location_id']][$iid] = $row;
         }
 
         // Minutes noted against each task that day. Several people can answer
@@ -1668,17 +1685,37 @@ function pageChecklistValidate(): void {
         foreach ($locations as $loc) {
             if ((int)$loc['location_id'] === $locationId) { $locationName = $loc['location_name']; break; }
         }
-        $is = $db->prepare("SELECT id, task_description, section_name FROM chk_items WHERE is_active = 1 AND checklist_id = ? ORDER BY section_name, id ASC");
+        $vFreqSel = (function_exists('chkHasSectionFreq') && chkHasSectionFreq())
+            ? "COALESCE(sec.frequency, c.frequency, 'daily')" : "COALESCE(c.frequency, 'daily')";
+        $is = $db->prepare("SELECT i.id, i.task_description,
+                                   COALESCE(sec.name, i.section_name) AS section_name,
+                                   {$vFreqSel} AS item_freq
+                            FROM chk_items i
+                            LEFT JOIN chk_checklists c ON c.id = i.checklist_id
+                            LEFT JOIN chk_sections sec ON sec.id = i.section_id
+                            WHERE i.is_active = 1 AND i.checklist_id = ?
+                            ORDER BY section_name, i.id ASC");
         $is->execute([$checklistId]);
         $items = $is->fetchAll(PDO::FETCH_ASSOC);
 
-        $rs = $db->prepare('SELECT item_id, response_value' . ($remarkCol ? ', remarks' : '')
-            . ' FROM chk_daily_responses WHERE checklist_id = ? AND location_id = ? AND log_date = ?');
-        $rs->execute([$checklistId, $locationId, $logDate]);
+        // Each task's answer sits on its own cycle's anchor, so all three are
+        // fetched and matched per task — see the note in pageChecklistAudit().
+        $vAnchors = [];
+        foreach (['daily', 'weekly', 'monthly'] as $f) {
+            $vAnchors[$f] = function_exists('chkPeriodStart') ? chkPeriodStart($f, $logDate) : $logDate;
+        }
+        $vFreqOf = [];
+        foreach ($items as $it) $vFreqOf[(int)$it['id']] = (string)($it['item_freq'] ?? 'daily');
+        $rs = $db->prepare('SELECT item_id, log_date, response_value' . ($remarkCol ? ', remarks' : '')
+            . ' FROM chk_daily_responses WHERE checklist_id = ? AND location_id = ? AND log_date IN (?, ?, ?)');
+        $rs->execute(array_merge([$checklistId, $locationId], array_values($vAnchors)));
         foreach ($rs->fetchAll(PDO::FETCH_ASSOC) as $r) {
-            $responses[(int)$r['item_id']] = $r['response_value'];
+            $iid  = (int)$r['item_id'];
+            $want = $vAnchors[$vFreqOf[$iid] ?? 'daily'] ?? $logDate;
+            if ((string)$r['log_date'] !== $want) continue;
+            $responses[$iid] = $r['response_value'];
             if ($remarkCol && trim((string)($r['remarks'] ?? '')) !== '') {
-                $staffRemarks[(int)$r['item_id']] = (string)$r['remarks'];
+                $staffRemarks[$iid] = (string)$r['remarks'];
             }
         }
 
