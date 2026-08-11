@@ -971,25 +971,32 @@ function chkHasRemarks(): bool {
     }
 }
 
-// The longest a task description may run inside a My Time note before it is
-// trimmed. Descriptions go up to 500 characters on the Store checklist, which
-// would bury the remark it is meant to label.
-define('CHK_REMARK_TASK_MAX', 40);
+// Is time_entries.chk_item_id there? Without it a day's entries cannot name
+// their task, so they are written as one row per checklist as before.
+function chkTimeEntryHasItem(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    try {
+        $r = getDb()->query('SELECT chk_item_id FROM time_entries LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
 
-// The single checklist-linked time entry for one employee+checklist+day,
-// or null. Fails open (returns null) when time_entries.checklist_id is not
-// there yet, so that column stays optional too.
-function chkTimeEntryRow(int $checklistId, string $empCode, string $logDate): ?array {
-    if ($checklistId <= 0 || $empCode === '') return null;
+// Minutes this employee has logged against one checklist on one day, across
+// however many task entries that day produced. Fails open (returns 0) when
+// time_entries.checklist_id is not there yet, so that column stays optional.
+function chkTimeEntryMinutes(int $checklistId, string $empCode, string $logDate): int {
+    if ($checklistId <= 0 || $empCode === '') return 0;
     try {
         $st = getDb()->prepare(
-            "SELECT id, minutes, notes FROM time_entries
-             WHERE employee_code = ? AND checklist_id = ? AND entry_date = ?
-             ORDER BY id DESC LIMIT 1");
+            "SELECT COALESCE(SUM(minutes),0) FROM time_entries
+             WHERE employee_code = ? AND checklist_id = ? AND entry_date = ?");
         $st->execute([$empCode, $checklistId, $logDate]);
-        return $st->fetch(PDO::FETCH_ASSOC) ?: null;
+        return (int)$st->fetchColumn();
     } catch (Exception $e) {
-        return null;
+        return 0;
     }
 }
 
@@ -1066,44 +1073,14 @@ function chkTaskTimeTotal(int $checklistId, string $empCode, string $day): int {
     }
 }
 
-// The cycle's remarks, as the notes line for its My Time entry: each remark
-// labelled with the task it belongs to, joined by the same " · " My Time
-// already uses when it renders notes inline. Task descriptions run to 500
-// characters on the Store checklist, so each is trimmed — a note is meant to
-// be read at a glance in a timesheet row. Returns '' when nothing was noted,
-// which leaves the caller's fixed label in place.
-function chkRemarksNote(int $checklistId, string $empCode, string $day): string {
-    if (!chkHasRemarks() || $empCode === '') return '';
-    $col = chkWorkDayCol();
-    try {
-        $st = getDb()->prepare(
-            "SELECT i.task_description, r.remarks
-             FROM chk_daily_responses r
-             JOIN chk_items i ON i.id = r.item_id
-             WHERE r.checklist_id = ? AND r.employee_code = ? AND r.{$col} = ?
-               AND r.remarks IS NOT NULL AND r.remarks <> ''
-             ORDER BY i.id");
-        $st->execute([$checklistId, $empCode, $day]);
-    } catch (Exception $e) {
-        return '';
-    }
-    $parts = [];
-    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
-        $task = trim(preg_replace('/\s+/', ' ', (string)$r['task_description']));
-        if (mb_strlen($task) > CHK_REMARK_TASK_MAX) {
-            $task = rtrim(mb_substr($task, 0, CHK_REMARK_TASK_MAX - 1)) . '…';
-        }
-        $note = trim(preg_replace('/\s+/', ' ', (string)$r['remarks']));
-        if ($note === '') continue;
-        $parts[] = $task === '' ? $note : ($task . ': ' . $note);
-    }
-    return implode(' · ', $parts);
-}
-
-// Recomputes the one time_entries row for an employee's day on a checklist
-// (delete-then-insert, keyed by employee+checklist+day) and returns the minutes
-// logged. Fails open — returns 0 — so a missing time_entries.checklist_id
-// column never blocks a checklist save.
+// Recomputes an employee's timesheet entries for one checklist on one day:
+// delete what was there, then write one row per task that carried time, each
+// naming its task and carrying that task's own remark as its notes. Returns
+// the day's total. Fails open — returns 0 — so a missing
+// time_entries.checklist_id column never blocks a checklist save.
+//
+// One row per task rather than per checklist is what lets My Time say what was
+// done instead of only which department was worked on.
 //
 // The day here is the day the work was recorded, not the anchor of the cycle
 // the tasks belong to: a monthly task filled on the 11th logs its time on the
@@ -1114,43 +1091,65 @@ function chkSyncTimeEntry(int $checklistId, string $empCode, string $day): int {
     $db  = getDb();
     $col = chkWorkDayCol();
     try {
+        $wipe = $db->prepare(
+            "DELETE FROM time_entries WHERE employee_code = ? AND checklist_id = ? AND entry_date = ?");
         $cl = chkGetChecklist($checklistId);
         // A checklist that does not ask how long a task took does not log time.
         if ($cl && !chkTracksTime($cl)) {
-            $db->prepare("DELETE FROM time_entries WHERE employee_code = ? AND checklist_id = ? AND entry_date = ?")
-               ->execute([$empCode, $checklistId, $day]);
+            $wipe->execute([$empCode, $checklistId, $day]);
             return 0;
         }
-        $mins  = chkTaskTimeTotal($checklistId, $empCode, $day);
-        $notes = CHK_TIME_NOTE_ENTERED;
-        if ($mins <= 0) {
-            // Nothing typed for any task — fall back to the estimates.
-            $sumSt = $db->prepare(
-                "SELECT COALESCE(SUM(i.est_minutes),0)
+
+        // What the person actually noted against each task, or — when nobody
+        // typed a duration all day — the estimate for each task they completed,
+        // which is how this worked before per-task entry existed.
+        $remarkSel = chkHasRemarks() ? 'r.remarks' : 'NULL AS remarks';
+        $rows = [];
+        if (chkHasTaskTime()) {
+            $st = $db->prepare(
+                "SELECT r.item_id, r.time_minutes AS mins, {$remarkSel}
+                 FROM chk_daily_responses r
+                 WHERE r.checklist_id = ? AND r.employee_code = ? AND r.{$col} = ?
+                   AND r.time_minutes > 0
+                 ORDER BY r.item_id");
+            $st->execute([$checklistId, $empCode, $day]);
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+        }
+        $entered = (bool)$rows;
+        if (!$entered) {
+            $st = $db->prepare(
+                "SELECT r.item_id, i.est_minutes AS mins, {$remarkSel}
                  FROM chk_daily_responses r
                  JOIN chk_items i ON i.id = r.item_id
                  WHERE r.checklist_id = ? AND r.employee_code = ? AND r.{$col} = ?
-                   AND r.response_value IS NOT NULL AND r.response_value <> '' AND i.est_minutes > 0");
-            $sumSt->execute([$checklistId, $empCode, $day]);
-            $mins  = (int)$sumSt->fetchColumn();
-            $notes = CHK_TIME_NOTE_AUTO;
+                   AND r.response_value IS NOT NULL AND r.response_value <> '' AND i.est_minutes > 0
+                 ORDER BY r.item_id");
+            $st->execute([$checklistId, $empCode, $day]);
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
         }
 
-        // What the person actually wrote beats the fixed label. Only when no
-        // task carries a remark does the entry fall back to saying where the
-        // minutes came from.
-        $remarkNote = chkRemarksNote($checklistId, $empCode, $day);
-        if ($remarkNote !== '') $notes = $remarkNote;
+        $wipe->execute([$empCode, $checklistId, $day]);
+        if (!$rows) return 0;
 
-        $db->prepare("DELETE FROM time_entries WHERE employee_code = ? AND checklist_id = ? AND entry_date = ?")
-           ->execute([$empCode, $checklistId, $day]);
-        if ($mins > 0) {
-            $db->prepare(
-                "INSERT INTO time_entries (employee_code, checklist_id, entry_date, minutes, notes)
-                 VALUES (?, ?, ?, ?, ?)")
-               ->execute([$empCode, $checklistId, $day, $mins, $notes]);
+        $hasItemCol = chkTimeEntryHasItem();
+        $ins = $db->prepare(
+            'INSERT INTO time_entries (employee_code, checklist_id, '
+            . ($hasItemCol ? 'chk_item_id, ' : '') . 'entry_date, minutes, notes)'
+            . ' VALUES (?, ?, ' . ($hasItemCol ? '?, ' : '') . '?, ?, ?)');
+        $total = 0;
+        foreach ($rows as $r) {
+            $mins = (int)$r['mins'];
+            if ($mins <= 0) continue;
+            // The remark the person wrote beats the fixed label; without one the
+            // entry says where its minutes came from.
+            $note = trim((string)($r['remarks'] ?? ''));
+            if ($note === '') $note = $entered ? CHK_TIME_NOTE_ENTERED : CHK_TIME_NOTE_AUTO;
+            $args = [$empCode, $checklistId];
+            if ($hasItemCol) $args[] = (int)$r['item_id'];
+            $ins->execute(array_merge($args, [$day, $mins, $note]));
+            $total += $mins;
         }
-        return $mins;
+        return $total;
     } catch (Exception $e) {
         // time_entries.checklist_id not present yet — ignore.
         return 0;
@@ -1919,12 +1918,11 @@ $readOnly = $isPast || !$anyOpenSection;
 // simply don't render and the est_minutes fallback carries on as before.
 $timeUi      = $timeTracked && chkHasTaskTime() && function_exists('fmtMinutes');
 $remarkUi    = chkHasRemarks();
-$timeRow     = $timeUi ? chkTimeEntryRow($checklistId, $me, $displayDate) : null;
-$loggedMins  = (int)($timeRow['minutes'] ?? 0);
+$loggedMins  = $timeUi ? chkTimeEntryMinutes($checklistId, $me, $displayDate) : 0;
 // Whether the minutes were typed rather than estimated. Read from the
 // responses, not from the notes text — notes now carry the cycle's remarks
 // when there are any, so the old string compare would always miss.
-$timeEntered = $timeRow && chkTaskTimeTotal($checklistId, $me, $displayDate) > 0;
+$timeEntered = $loggedMins > 0 && chkTaskTimeTotal($checklistId, $me, $displayDate) > 0;
 $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunday') ? weekStartSunday($displayDate) : $displayDate);
 ?>
 <?php if ($timeUi && $loggedMins > 0): ?>
