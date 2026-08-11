@@ -1609,13 +1609,23 @@ function pageChecklistHub(): void {
         </div>
         <?php if ($c['noScope']): ?>
         <div class="text-muted" style="font-size:12px">No location claimed</div>
-        <?php else: foreach ($c['lines'] as $ln): ?>
-        <div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;line-height:1.7">
-            <span><span class="badge <?= $ln['freq'] === 'daily' ? 'badge-grey' : 'badge-blue' ?>" style="font-weight:600"><?= h($ln['label']) ?></span>
-                <span class="text-muted" style="margin-left:6px"><?= h($ln['period']) ?></span></span>
-            <strong<?= $ln['done'] >= $ln['total'] ? ' style="color:var(--green)"' : '' ?>><?= (int)$ln['done'] ?>/<?= (int)$ln['total'] ?></strong>
+        <?php else: ?>
+        <?php
+        // A column gap rather than line-height: the cycle badges carry their own
+        // padding, so leading alone leaves their boxes all but touching.
+        ?>
+        <div style="display:flex;flex-direction:column;gap:7px">
+            <?php foreach ($c['lines'] as $ln): ?>
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:12px">
+                <span style="display:inline-flex;align-items:center;gap:7px;min-width:0">
+                    <span class="badge <?= $ln['freq'] === 'daily' ? 'badge-grey' : 'badge-blue' ?>" style="font-weight:600"><?= h($ln['label']) ?></span>
+                    <span class="text-muted" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= h($ln['period']) ?></span>
+                </span>
+                <strong style="white-space:nowrap<?= $ln['done'] >= $ln['total'] ? ';color:var(--green)' : '' ?>"><?= (int)$ln['done'] ?>/<?= (int)$ln['total'] ?></strong>
+            </div>
+            <?php endforeach; ?>
         </div>
-        <?php endforeach; endif; ?>
+        <?php endif; ?>
     </a>
     <?php endforeach; ?>
 </div>
@@ -1997,8 +2007,9 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                     </td>
                     <td class="chk-answer">
                         <?php
-                        // Answer control and the minutes box share one row —
-                        // the cell stays two lines tall (answer + files).
+                        // Two lines: the duration (or, on a location checklist,
+                        // the answer control) with the attachments beside it,
+                        // then the remark on its own line underneath.
                         $myMin = (int)($t['my_minutes'] ?? 0);
                         ?>
                         <?php
@@ -2054,9 +2065,49 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                         <?php endif; ?>
                         </div>
                         <?php endif; ?>
+                        <?php
+                        // Attachments sit beside the duration rather than under it:
+                        // choosing a file belongs with saying how long the task took,
+                        // and stacking them made every row three lines tall. Chips for
+                        // files already on the task flow along the same line and wrap
+                        // when there are several.
+                        $attList   = $itemAttachments[(int)$t['id']] ?? [];
+                        // Allow file input alongside an unanswered editable
+                        // input too — the save handler upserts the answer
+                        // first then attaches, so a single submit covers both.
+                        $canAttach = $cellEditable;
+                        if ($attList || $canAttach):
+                        ?>
+                            <span class="chk-att-wrap" style="display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">
+                                <?php foreach ($attList as $att): ?>
+                                    <span style="display:inline-flex;align-items:center;gap:4px">
+                                        <a class="chk-att-chip" target="_blank"
+                                           href="?page=download_checklist_attachment&att_id=<?= (int)$att['id'] ?>"
+                                           title="<?= h($att['uploader_name'] ?? $att['uploaded_by']) . ' · ' . h($att['uploaded_at']) ?>"
+                                           style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border:1px solid var(--border);border-radius:999px;font-size:11px;color:var(--text);text-decoration:none;background:rgba(255,255,255,.04)">
+                                            <?= $att['is_image'] ? chkImageIcon(12) : chkClipIcon(12) ?>
+                                            <span style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= h($att['filename']) ?></span>
+                                        </a>
+                                        <?php if ($cellEditable && (string)$att['uploaded_by'] === myCode()): ?>
+                                            <button type="button" class="btn-ghost-x"
+                                                onclick="if(confirm('Delete this file?')){document.getElementById('chkAttDelId').value='<?= (int)$att['id'] ?>';document.getElementById('chkAttDelForm').submit();}"
+                                                style="border:none;background:transparent;color:var(--muted);cursor:pointer;font-size:14px;line-height:1;padding:0 2px"
+                                                title="Delete">×</button>
+                                        <?php endif; ?>
+                                    </span>
+                                <?php endforeach; ?>
+                                <?php if ($canAttach): ?>
+                                    <input type="file" class="form-control chk-files"
+                                           name="attachments[<?= (int)$t['id'] ?>][]"
+                                           accept="image/*,application/pdf,.doc,.docx,.xls,.xlsx"
+                                           multiple capture="environment"
+                                           style="font-size:11px;max-width:190px">
+                                <?php endif; ?>
+                            </span>
+                        <?php endif; ?>
                         </div>
                         <?php
-                        // Per-task remark, on its own line under the answer.
+                        // Per-task remark, the cell's second line.
                         // Editable on the same terms as the minutes box, so a
                         // note can be added to a task ticked off earlier. The
                         // cycle's remarks become the notes of its My Time entry.
@@ -2072,42 +2123,6 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                         <?php elseif ($remarkUi && $myRemark !== ''): ?>
                             <div class="text-muted" style="margin-top:4px;font-size:11px;white-space:normal;word-break:break-word">
                                 &ldquo;<?= h($myRemark) ?>&rdquo;
-                            </div>
-                        <?php endif; ?>
-                        <?php
-                        $attList    = $itemAttachments[(int)$t['id']] ?? [];
-                        $hasAnswer  = !empty($t['response_value']);
-                        // Allow file input alongside an unanswered editable
-                        // input too — the save handler upserts the answer
-                        // first then attaches, so a single submit covers both.
-                        $canAttach  = $cellEditable;
-                        if ($attList || $canAttach):
-                        ?>
-                            <div class="chk-att-wrap" style="margin-top:6px;display:flex;flex-direction:column;gap:4px">
-                                <?php foreach ($attList as $att): ?>
-                                    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-                                        <a class="chk-att-chip" target="_blank"
-                                           href="?page=download_checklist_attachment&att_id=<?= (int)$att['id'] ?>"
-                                           title="<?= h($att['uploader_name'] ?? $att['uploaded_by']) . ' · ' . h($att['uploaded_at']) ?>"
-                                           style="display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border:1px solid var(--border);border-radius:999px;font-size:11px;color:var(--text);text-decoration:none;background:rgba(255,255,255,.04)">
-                                            <?= $att['is_image'] ? chkImageIcon(12) : chkClipIcon(12) ?>
-                                            <span style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?= h($att['filename']) ?></span>
-                                        </a>
-                                        <?php if ($cellEditable && (string)$att['uploaded_by'] === myCode()): ?>
-                                            <button type="button" class="btn-ghost-x"
-                                                onclick="if(confirm('Delete this file?')){document.getElementById('chkAttDelId').value='<?= (int)$att['id'] ?>';document.getElementById('chkAttDelForm').submit();}"
-                                                style="border:none;background:transparent;color:var(--muted);cursor:pointer;font-size:14px;line-height:1;padding:0 2px"
-                                                title="Delete">×</button>
-                                        <?php endif; ?>
-                                    </div>
-                                <?php endforeach; ?>
-                                <?php if ($canAttach): ?>
-                                    <input type="file" class="form-control chk-files"
-                                           name="attachments[<?= (int)$t['id'] ?>][]"
-                                           accept="image/*,application/pdf,.doc,.docx,.xls,.xlsx"
-                                           multiple capture="environment"
-                                           style="font-size:11px;margin-top:2px">
-                                <?php endif; ?>
                             </div>
                         <?php endif; ?>
                     </td>
@@ -2238,7 +2253,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
         if (!node || !node.classList || !node.classList.contains('chk-att-status')) {
             node = document.createElement('div');
             node.className = 'chk-att-status';
-            node.style.cssText = 'font-size:10px;margin-top:2px;color:var(--muted);min-height:12px';
+            node.style.cssText = 'font-size:10px;margin-top:2px;color:var(--muted);min-height:12px;flex-basis:100%';
             input.parentNode.insertBefore(node, input.nextSibling);
         }
         return node;
