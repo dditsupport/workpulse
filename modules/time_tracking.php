@@ -57,6 +57,19 @@ function ttChecklistFreqCol(): string {
         ? ', cc.frequency AS checklist_freq' : '';
 }
 
+// Same for time_entries.chk_item_id, which names the checklist task an entry
+// came from. The name is joined rather than stored on the entry: task_label is
+// nulled whenever an entry is edited, so a copy kept there would not survive
+// someone correcting a duration.
+function ttChkTaskCol(): string {
+    return (function_exists('chkTimeEntryHasItem') && chkTimeEntryHasItem())
+        ? ', ci.task_description AS chk_task_name' : '';
+}
+function ttChkTaskJoin(): string {
+    return (function_exists('chkTimeEntryHasItem') && chkTimeEntryHasItem())
+        ? ' LEFT JOIN chk_items ci ON ci.id = t.chk_item_id' : '';
+}
+
 // Display label for an entry: "WP-12 — summary" when tied to a ticket,
 // the created task's name when tied to a task, else the legacy free-text
 // label (rows logged before tasks became first-class).
@@ -72,7 +85,11 @@ function timeEntryLabel(array $e): string {
         $name = (string)($e['checklist_name'] ?? ('#' . (int)$e['checklist_id']));
         $freq = (string)($e['checklist_freq'] ?? 'daily');
         if ($freq !== 'daily' && function_exists('chkFreqLabel')) $name .= ' — ' . chkFreqLabel($freq);
-        return 'Checklist — ' . $name;
+        // An entry that names its task leads with it — the timesheet is about
+        // the work, and the checklist is the context. Entries written before
+        // chk_item_id existed name no task and keep the old wording.
+        $task = trim((string)($e['chk_task_name'] ?? ''));
+        return $task !== '' ? ($task . ' — ' . $name) : ('Checklist — ' . $name);
     }
     return (string)($e['task_label'] ?? '—');
 }
@@ -193,8 +210,14 @@ function doSaveTimeEntry(): void {
             }
             // Pointing a checklist row at a ticket/task drops the checklist
             // link, so the next checklist sync can't delete it underneath.
+            // Repointing a checklist row at a ticket or task drops its
+            // checklist link, so the task it named goes with it — otherwise the
+            // entry would keep claiming a checklist task it no longer belongs to.
+            $dropItem = (function_exists('chkTimeEntryHasItem') && chkTimeEntryHasItem() && $keepChecklist <= 0)
+                ? ', chk_item_id=NULL' : '';
             $db->prepare(
-                'UPDATE time_entries SET issue_id=?, task_id=?, checklist_id=?, task_label=NULL, entry_date=?, minutes=?, notes=? WHERE id=?'
+                'UPDATE time_entries SET issue_id=?, task_id=?, checklist_id=?, task_label=NULL' . $dropItem
+                . ', entry_date=?, minutes=?, notes=? WHERE id=?'
             )->execute([$issueId, $taskIdSave, ($keepChecklist > 0 ? $keepChecklist : null), $entryDate, $minutes, ($notes !== '' ? $notes : null), $id]);
             flash('success', 'Time entry updated.');
         } else {
@@ -407,11 +430,11 @@ function pageMyTime(): void {
     $edit = null;
     if (!empty($_GET['edit'])) {
         $est = $db->prepare(
-            "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . "
+            "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . ttChkTaskCol() . "
              FROM time_entries t
              LEFT JOIN issues i      ON t.issue_id = i.id
              LEFT JOIN time_tasks tk ON t.task_id  = tk.id
-             LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id
+             LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id" . ttChkTaskJoin() . "
              WHERE t.id = ?"
         );
         $est->execute([(int)$_GET['edit']]);
@@ -420,11 +443,11 @@ function pageMyTime(): void {
     }
 
     $st = $db->prepare(
-        "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . "
+        "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . ttChkTaskCol() . "
          FROM time_entries t
          LEFT JOIN issues i      ON t.issue_id = i.id
          LEFT JOIN time_tasks tk ON t.task_id  = tk.id
-         LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id
+         LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id" . ttChkTaskJoin() . "
          WHERE t.employee_code = ? AND t.entry_date BETWEEN ? AND ?
          ORDER BY t.entry_date ASC, t.created_at ASC"
     );
@@ -445,7 +468,10 @@ function pageMyTime(): void {
     foreach ($entries as $e) {
         if (!empty($e['issue_id']))         $key = 'i' . (int)$e['issue_id'];
         elseif (!empty($e['task_id']))      $key = 'k' . (int)$e['task_id'];
-        elseif (!empty($e['checklist_id'])) $key = 'c' . (int)$e['checklist_id'];
+        // Keyed by task as well as checklist, so each task is its own row.
+        // Entries from before chk_item_id existed have none and still collapse
+        // into one row per checklist, as they were written.
+        elseif (!empty($e['checklist_id'])) $key = 'c' . (int)$e['checklist_id'] . ':' . (int)($e['chk_item_id'] ?? 0);
         else                                $key = 't' . mb_strtolower(trim((string)($e['task_label'] ?? '')));
         if (!isset($grid[$key])) {
             $grid[$key] = [
@@ -455,6 +481,9 @@ function pageMyTime(): void {
                 'task_name'      => $e['task_name'] ?? null,
                 'checklist_id'   => $e['checklist_id'] ?? null,
                 'checklist_name' => $e['checklist_name'] ?? null,
+                'checklist_freq' => $e['checklist_freq'] ?? null,
+                'chk_item_id'    => $e['chk_item_id'] ?? null,
+                'chk_task_name'  => $e['chk_task_name'] ?? null,
                 'task_label'     => $e['task_label'] ?? null,
                 'cells'         => array_fill_keys($days, 0),
                 'total'         => 0,
@@ -811,12 +840,12 @@ function timeReportRows(string $emp, string $from, string $to, string $ticket): 
         if ($tid !== null) { $where[] = 't.issue_id = ?'; $params[] = $tid; }
         else               { $where[] = '1=0'; }
     }
-    $sql = "SELECT t.*, e.full_name AS emp_name, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . "
+    $sql = "SELECT t.*, e.full_name AS emp_name, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . ttChkTaskCol() . "
             FROM time_entries t
             LEFT JOIN employees e  ON t.employee_code = e.employee_code
             LEFT JOIN issues i     ON t.issue_id = i.id
             LEFT JOIN time_tasks tk ON t.task_id = tk.id
-            LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id";
+            LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id" . ttChkTaskJoin() . "";
     if ($where) $sql .= ' WHERE ' . implode(' AND ', $where);
     $sql .= ' ORDER BY t.entry_date DESC, e.full_name ASC, t.created_at ASC LIMIT 1000';
     $st = $db->prepare($sql);

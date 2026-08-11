@@ -1239,6 +1239,7 @@ CREATE TABLE `time_entries` (
   `issue_id` int(10) UNSIGNED DEFAULT NULL,
   `task_id` int(10) UNSIGNED DEFAULT NULL,
   `checklist_id` int(10) UNSIGNED DEFAULT NULL,
+  `chk_item_id` int(10) UNSIGNED DEFAULT NULL,
   `task_label` varchar(200) DEFAULT NULL,
   `entry_date` date NOT NULL,
   `minutes` int(10) UNSIGNED NOT NULL,
