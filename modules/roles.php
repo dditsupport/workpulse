@@ -49,14 +49,41 @@ $txnGroups = [
                            'txn_price_variation_admin' => 'Variation Admin',
                            'txn_inward_item' => 'Inward Item Entry',
                            'txn_inward_validate' => 'Inward Barcode Validator'],
-    'Time Tracking'    => ['txn_time_report' => 'Time Tracking Report'],
+    'Time Tracking'    => ['txn_time_report' => 'Time Tracking Report',
+                           'txn_time_task' => 'Manage Time Tasks'],
 ];
+
+// The txn_* columns `roles` actually has. A permission listed above but not
+// yet migrated would otherwise be written by doSaveRole() into a column that
+// does not exist, and the whole role — every other permission on it — would
+// fail to save with "Unknown column". Fails open: if the probe itself fails,
+// every listed permission is treated as present, which is how this behaved
+// before the check existed.
+function roleTxnColumns(): array {
+    static $cols = null;             // probed once per request; [] = "could not tell"
+    if ($cols !== null) return $cols;
+    $cols = [];
+    try {
+        $rows = getDb()->query("SHOW COLUMNS FROM roles LIKE 'txn\\_%'")->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($rows as $r) $cols[(string)($r['Field'] ?? '')] = true;
+    } catch (Exception $e) {
+        $cols = [];
+    }
+    return $cols;
+}
+
+function roleHasTxnCol(string $col): bool {
+    $cols = roleTxnColumns();
+    return $cols === [] ? true : isset($cols[$col]);
+}
 
 function allTxnCols(): array {
     global $txnGroups;
     $cols = [];
     foreach ($txnGroups as $items) {
-        foreach ($items as $col => $label) $cols[$col] = $label;
+        foreach ($items as $col => $label) {
+            if (roleHasTxnCol($col)) $cols[$col] = $label;
+        }
     }
     return $cols;
 }
@@ -112,6 +139,15 @@ function pageRoles(): void {
     $roles  = getRoles();
     $editId = (int)($_GET['edit'] ?? 0);
     $editR  = $editId ? (array_values(array_filter($roles, fn($r) => (int)$r['id'] === $editId))[0] ?? null) : null;
+
+    // Only offer permissions the database can store — a checkbox for a column
+    // that is not there would silently do nothing on save.
+    $available  = allTxnCols();
+    $txnRendered = [];
+    foreach ($txnGroups as $groupName => $items) {
+        $items = array_intersect_key($items, $available);
+        if ($items) $txnRendered[$groupName] = $items;
+    }
 ?>
 <div class="page-header"><h2>Roles</h2></div>
 <div class="form-card" style="max-width:none;margin-bottom:20px">
@@ -128,7 +164,7 @@ function pageRoles(): void {
             </div>
         </div>
         <div class="form-section-title" style="margin-top:12px">Page Access</div>
-        <?php foreach ($txnGroups as $groupName => $items): ?>
+        <?php foreach ($txnRendered as $groupName => $items): ?>
         <div style="margin-bottom:10px">
             <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:4px"><?= $groupName ?></div>
             <div style="columns:5 180px;column-gap:16px">
@@ -153,7 +189,7 @@ function pageRoles(): void {
     <thead>
         <tr>
             <th>Role Name</th>
-            <?php foreach ($txnGroups as $groupName => $items): ?>
+            <?php foreach ($txnRendered as $groupName => $items): ?>
             <th style="text-align:center;font-size:11px"><?= $groupName ?></th>
             <?php endforeach; ?>
             <th>Actions</th>
@@ -161,11 +197,11 @@ function pageRoles(): void {
     </thead>
     <tbody>
     <?php if (empty($roles)): ?>
-        <tr><td colspan="<?= 1 + count($txnGroups) + 1 ?>" class="empty-row">No roles yet. Add one above.</td></tr>
+        <tr><td colspan="<?= 1 + count($txnRendered) + 1 ?>" class="empty-row">No roles yet. Add one above.</td></tr>
     <?php else: foreach ($roles as $r): ?>
         <tr>
             <td><?= h($r['role_name']) ?></td>
-            <?php foreach ($txnGroups as $groupName => $items):
+            <?php foreach ($txnRendered as $groupName => $items):
                 $on = 0; $total = count($items);
                 foreach ($items as $col => $lbl) { if ($r[$col] ?? 0) $on++; }
             ?>

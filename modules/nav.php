@@ -107,8 +107,9 @@ function buildNav(): array {
         ['page' => 'change_password', 'icon' => navIcon('key'),       'label' => 'Change Password'],
     ];
 
-    // Time Tracking — its own module. My Time + Tasks are personal (every
-    // employee), the cross-employee report is gated by txn_time_report.
+    // Time Tracking — its own module. My Time is personal and Tasks is the
+    // shared task list every employee logs against (adding to it needs
+    // txn_time_task); the cross-employee report is gated by txn_time_report.
     // Company photo wall — deliberately open to everyone, no txn gate.
     $gallery = [
         ['page' => 'event_photos', 'icon' => navIcon('photos'), 'label' => 'Event Photos'],

@@ -3,9 +3,13 @@
 // Time Tracking Module — personal timesheets + admin report
 //
 // Every employee logs blocks of time ("My Time"), optionally against
-// a ticket (issues.id → WP-{id}) or with a free-text task label.
+// a ticket (issues.id → WP-{id}) or against a task from the shared task
+// list. The list is company-wide: adding to it needs txn_time_task, but
+// anybody may log time against anything on it.
 // Duration is stored as whole minutes on `time_entries`. A cross-
-// employee report ("Time Tracking Report") is gated by txn_time_report.
+// employee report ("Time Tracking Report") is gated by txn_time_report and
+// shows the week's timesheets for everybody, each openable as that
+// employee's own My Time view.
 // Mirrors the conventions used across modules/: getDb() (PDO), myCode()
 // for the owner, flash() + header() redirects on POST, h() on output.
 // =========================================================
@@ -48,6 +52,19 @@ function weekStartSunday(string $date): string {
     $dow = (int)date('w', $t); // 0=Sun … 6=Sat
     return date('Y-m-d', strtotime("-{$dow} days", $t));
 }
+
+// The seven day columns (Sun → Sat) of the week starting $weekStart.
+function timeWeekDays(string $weekStart): array {
+    $days = [];
+    for ($d = 0; $d < 7; $d++) $days[] = date('Y-m-d', strtotime($weekStart . " +{$d} days"));
+    return $days;
+}
+
+// ── Tasks are a shared list ──────────────────────────────
+// Creating a task is a permission (txn_time_task); logging time against one
+// is not. Everybody picks from the same list, so the same work carries the
+// same name across employees and the report can add it up.
+function canManageTimeTasks(): bool { return isSuperadmin() || hasTxn('time_task'); }
 
 // chk_checklists.frequency is optional (see chkHasFrequency), so it is only
 // selected when it exists — the timesheet must not break on a database that
@@ -95,22 +112,21 @@ function timeEntryLabel(array $e): string {
 }
 
 // ── AJAX: search tickets + tasks for the reference picker ──
-// Empty keyword returns the user's tasks + most recent tickets; a keyword
+// Empty keyword returns the shared task list + most recent tickets; a keyword
 // filters tasks by name and tickets by WP-number or summary. JSON out.
 function doSearchTimeRefs(): void {
     header('Content-Type: application/json');
     $db   = getDb();
-    $code = myCode();
     $kw   = trim($_POST['kw'] ?? $_GET['kw'] ?? '');
     $out  = [];
 
-    // Own active tasks.
+    // Every active task — the list is company-wide, not per employee.
     if ($kw === '') {
-        $ts = $db->prepare('SELECT id, name FROM time_tasks WHERE employee_code=? AND is_active=1 ORDER BY name LIMIT 25');
-        $ts->execute([$code]);
+        $ts = $db->prepare('SELECT id, name FROM time_tasks WHERE is_active=1 ORDER BY name LIMIT 25');
+        $ts->execute();
     } else {
-        $ts = $db->prepare('SELECT id, name FROM time_tasks WHERE employee_code=? AND is_active=1 AND name LIKE ? ORDER BY name LIMIT 25');
-        $ts->execute([$code, "%{$kw}%"]);
+        $ts = $db->prepare('SELECT id, name FROM time_tasks WHERE is_active=1 AND name LIKE ? ORDER BY name LIMIT 25');
+        $ts->execute(["%{$kw}%"]);
     }
     foreach ($ts->fetchAll(PDO::FETCH_ASSOC) as $t) {
         $out[] = ['kind' => 'task', 'id' => (int)$t['id'], 'title' => $t['name'], 'sub' => 'Task'];
@@ -178,11 +194,12 @@ function doSaveTimeEntry(): void {
             header("Location: $back"); exit;
         }
     } elseif ($taskId > 0) {
-        // The task must exist and belong to this user (superadmin may use any).
-        $tk = $db->prepare('SELECT id FROM time_tasks WHERE id = ? AND is_active = 1' . (isSuperadmin() ? '' : ' AND employee_code = ?'));
-        $tk->execute(isSuperadmin() ? [$taskId] : [$taskId, myCode()]);
+        // Any active task will do — the list is shared, so who created it
+        // does not decide who may log time against it.
+        $tk = $db->prepare('SELECT id FROM time_tasks WHERE id = ? AND is_active = 1');
+        $tk->execute([$taskId]);
         if (!$tk->fetch()) {
-            flash('error', 'Selected task not found. Create it first under Tasks.');
+            flash('error', 'Selected task not found. Ask for it to be added under Tasks.');
             header("Location: $back"); exit;
         }
         $taskIdSave = $taskId;
@@ -190,11 +207,11 @@ function doSaveTimeEntry(): void {
         $cs = $db->prepare('SELECT checklist_id FROM time_entries WHERE id = ?');
         try { $cs->execute([$id]); $keepChecklist = (int)($cs->fetchColumn() ?: 0); } catch (Exception $e) { $keepChecklist = 0; }
         if ($keepChecklist <= 0) {
-            flash('error', 'Choose a task or enter a ticket number. Create tasks under Tasks first.');
+            flash('error', 'Choose a task or enter a ticket number.');
             header("Location: $back"); exit;
         }
     } else {
-        flash('error', 'Choose a task or enter a ticket number. Create tasks under Tasks first.');
+        flash('error', 'Choose a task or enter a ticket number.');
         header("Location: $back"); exit;
     }
 
@@ -257,16 +274,32 @@ function doDeleteTimeEntry(): void {
 }
 
 // ── POST: create a task ──────────────────────────────────
+// Gated by txn_time_task: the list is company-wide, so it is curated by the
+// people who hold that permission rather than grown by everyone who logs time.
 function doSaveTimeTask(): void {
+    $db   = getDb();
     $name = trim($_POST['name'] ?? '');
     $back = 'index.php?page=time_tasks';
+    if (!canManageTimeTasks()) {
+        flash('error', 'You do not have permission to create tasks.');
+        header("Location: $back"); exit;
+    }
     if ($name === '') {
         flash('error', 'Enter a task name.');
         header("Location: $back"); exit;
     }
+    $name = mb_substr($name, 0, 200);
     try {
-        getDb()->prepare('INSERT INTO time_tasks (employee_code, name) VALUES (?,?)')
-               ->execute([myCode(), mb_substr($name, 0, 200)]);
+        // One shared list means one row per name — a second "Query solving"
+        // would split the same work across two report rows.
+        $dup = $db->prepare('SELECT id FROM time_tasks WHERE is_active = 1 AND name = ?');
+        $dup->execute([$name]);
+        if ($dup->fetch()) {
+            flash('error', 'A task with that name already exists.');
+            header("Location: $back"); exit;
+        }
+        $db->prepare('INSERT INTO time_tasks (employee_code, name) VALUES (?,?)')
+           ->execute([myCode(), $name]);
         flash('success', 'Task created.');
     } catch (Exception $e) {
         flash('error', $e->getMessage());
@@ -275,16 +308,20 @@ function doSaveTimeTask(): void {
 }
 
 // ── POST: delete (deactivate) a task ─────────────────────
-// Soft-delete so existing time entries keep their label. Owner-or-superadmin.
+// Soft-delete so existing time entries keep their label. Same permission as
+// creating one — the task belongs to the company, not to whoever added it.
 function doDeleteTimeTask(): void {
     $db   = getDb();
     $id   = (int)($_POST['id'] ?? 0);
     $back = 'index.php?page=time_tasks';
-    $own  = $db->prepare('SELECT employee_code FROM time_tasks WHERE id = ?');
+    if (!canManageTimeTasks()) {
+        flash('error', 'You do not have permission to remove tasks.');
+        header("Location: $back"); exit;
+    }
+    $own = $db->prepare('SELECT id FROM time_tasks WHERE id = ?');
     $own->execute([$id]);
-    $row = $own->fetch(PDO::FETCH_ASSOC);
-    if (!$row || (!isSuperadmin() && $row['employee_code'] !== myCode())) {
-        flash('error', 'Task not found or access denied.');
+    if (!$own->fetch()) {
+        flash('error', 'Task not found.');
         header("Location: $back"); exit;
     }
     try {
@@ -296,19 +333,30 @@ function doDeleteTimeTask(): void {
     header("Location: $back"); exit;
 }
 
-// ── Page: Tasks (create & manage personal tasks) ─────────
+// ── Page: Tasks (the shared task list) ───────────────────
+// Everyone sees the whole list and how much of their own time sits on each
+// task; only txn_time_task holders can add to it or retire a task.
 function pageTimeTasks(): void {
-    $db   = getDb();
-    $code = myCode();
+    $db     = getDb();
+    $code   = myCode();
+    $manage = canManageTimeTasks();
+    // Totals across employees stay behind the report permission — this page
+    // is otherwise about the viewer's own time.
+    $seeAll = isSuperadmin() || hasTxn('time_report');
 
-    // Each task with its logged-entry count + total minutes (own data).
+    // Every active task, with the viewer's own entry count + minutes on it.
+    // The employee_code filter sits in the JOIN, not the WHERE, so a task
+    // nobody has logged time against still lists (with a zero).
     $st = $db->prepare(
-        "SELECT tt.id, tt.name, tt.created_at,
-                COUNT(te.id) AS entry_count, COALESCE(SUM(te.minutes),0) AS total_minutes
+        "SELECT tt.id, tt.name, tt.created_at, tt.employee_code AS created_by,
+                e.full_name AS created_by_name,
+                COUNT(te.id) AS entry_count, COALESCE(SUM(te.minutes),0) AS total_minutes,
+                (SELECT COALESCE(SUM(a.minutes),0) FROM time_entries a WHERE a.task_id = tt.id) AS all_minutes
          FROM time_tasks tt
-         LEFT JOIN time_entries te ON te.task_id = tt.id
-         WHERE tt.employee_code = ? AND tt.is_active = 1
-         GROUP BY tt.id, tt.name, tt.created_at
+         LEFT JOIN employees e     ON e.employee_code = tt.employee_code
+         LEFT JOIN time_entries te ON te.task_id = tt.id AND te.employee_code = ?
+         WHERE tt.is_active = 1
+         GROUP BY tt.id, tt.name, tt.created_at, tt.employee_code, e.full_name
          ORDER BY tt.name"
     );
     $st->execute([$code]);
@@ -334,6 +382,7 @@ function pageTimeTasks(): void {
     <a href="?page=my_time" class="btn btn-ghost btn-sm">Go to My Time</a>
 </div>
 
+<?php if ($manage): ?>
 <div class="form-card" style="margin-bottom:18px">
     <h3 style="font-size:15px;margin-bottom:12px">Create a task</h3>
     <form method="POST" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
@@ -344,15 +393,26 @@ function pageTimeTasks(): void {
         </div>
         <button type="submit" class="btn btn-primary">Add task</button>
     </form>
-    <p class="text-muted" style="font-size:12px;margin-top:8px">Create tasks here, then pick them when logging time on the My Time page. Time tied to a ticket uses the ticket number instead.</p>
+    <p class="text-muted" style="font-size:12px;margin-top:8px">A task created here is available to every employee on their My Time page. Time tied to a ticket uses the ticket number instead.</p>
 </div>
+<?php else: ?>
+<div class="rpt-prompt" style="margin-bottom:18px">These tasks are shared across the company — pick one on <a href="?page=my_time" style="color:var(--accent)">My Time</a> to log time against it. Need a task that isn't listed? Ask a Time Tracking administrator to add it.</div>
+<?php endif; ?>
 
 <?php if (empty($tasks)): ?>
-<div class="rpt-prompt">No tasks yet. Create one above to start logging time against it.</div>
+<div class="rpt-prompt">No tasks yet<?= $manage ? '. Create one above to start logging time against it.' : ' — nothing has been added to the shared list.' ?></div>
 <?php else: ?>
 <div class="table-wrap" data-stack>
     <table class="table" style="font-size:13px">
-        <thead><tr><th>Task</th><th style="width:110px">Entries</th><th style="width:110px">Total</th><th style="width:120px">Created</th><th style="width:100px"></th></tr></thead>
+        <thead><tr>
+            <th>Task</th>
+            <th style="width:110px">My entries</th>
+            <th style="width:110px">My total</th>
+            <?php if ($seeAll): ?><th style="width:120px">All employees</th><?php endif; ?>
+            <th style="width:150px">Created by</th>
+            <th style="width:120px">Created</th>
+            <?php if ($manage): ?><th style="width:100px"></th><?php endif; ?>
+        </tr></thead>
         <tbody>
         <?php foreach ($tasks as $t): $tid = (int)$t['id']; $rows = $byTask[$tid] ?? []; ?>
             <tr class="tk-row" data-tid="<?= $tid ?>" style="cursor:pointer">
@@ -362,19 +422,25 @@ function pageTimeTasks(): void {
                 </td>
                 <td><?= (int)$t['entry_count'] ?></td>
                 <td><?= h(fmtMinutes((int)$t['total_minutes'])) ?></td>
+                <?php if ($seeAll): ?>
+                <td><?= (int)$t['all_minutes'] > 0 ? h(fmtMinutes((int)$t['all_minutes'])) : '<span class="text-muted">—</span>' ?></td>
+                <?php endif; ?>
+                <td class="text-muted" style="font-size:12px"><?= h($t['created_by_name'] ?? $t['created_by'] ?? '—') ?></td>
                 <td class="text-muted" style="font-size:12px"><?= date('d M Y', strtotime($t['created_at'])) ?></td>
+                <?php if ($manage): ?>
                 <td style="white-space:nowrap">
-                    <form method="POST" class="inline-form" style="display:inline" onsubmit="event.stopPropagation();return confirm('Remove this task? Existing time entries keep their label.')" onclick="event.stopPropagation()">
+                    <form method="POST" class="inline-form" style="display:inline" onsubmit="event.stopPropagation();return confirm('Remove this task? It disappears from everyone\'s picker; existing time entries keep their label.')" onclick="event.stopPropagation()">
                         <input type="hidden" name="action" value="delete_time_task">
                         <input type="hidden" name="id" value="<?= $tid ?>">
                         <button type="submit" class="btn btn-sm badge-red" style="cursor:pointer">Remove</button>
                     </form>
                 </td>
+                <?php endif; ?>
             </tr>
             <tr class="tk-detail tk-detail-<?= $tid ?>" style="display:none;background:var(--bg)">
-                <td colspan="5" style="padding:0">
+                <td colspan="<?= 4 + ($seeAll ? 1 : 0) + ($manage ? 1 : 0) ?>" style="padding:0">
                     <?php if (empty($rows)): ?>
-                    <div class="text-muted" style="padding:10px 16px;font-size:12px">No time logged against this task yet.</div>
+                    <div class="text-muted" style="padding:10px 16px;font-size:12px">You have not logged any time against this task yet.</div>
                     <?php else: ?>
                     <table class="table" style="font-size:12px;margin:0;background:transparent">
                         <thead><tr><th style="width:140px">Day</th><th style="width:90px">Duration</th><th>Notes</th></tr></thead>
@@ -395,7 +461,7 @@ function pageTimeTasks(): void {
         </tbody>
     </table>
 </div>
-<p class="text-muted" style="font-size:12px;margin-top:8px">Click a task to see which day and how much time was logged against it.</p>
+<p class="text-muted" style="font-size:12px;margin-top:8px">Click a task to see which day and how much of your own time was logged against it.</p>
 <script>
 (function () {
     document.querySelectorAll('.tk-row').forEach(function (row) {
@@ -416,33 +482,11 @@ function pageTimeTasks(): void {
 <?php endif; ?>
 <?php }
 
-// ── Page: My Time (personal weekly timesheet) ────────────
-function pageMyTime(): void {
-    $db   = getDb();
-    $code = myCode();
-
-    $weekStart = weekStartSunday($_GET['week'] ?? date('Y-m-d'));
-    $weekEnd   = date('Y-m-d', strtotime($weekStart . ' +6 days'));
-    $prevWeek  = date('Y-m-d', strtotime($weekStart . ' -7 days'));
-    $nextWeek  = date('Y-m-d', strtotime($weekStart . ' +7 days'));
-
-    // Entry under edit (own rows only).
-    $edit = null;
-    if (!empty($_GET['edit'])) {
-        $est = $db->prepare(
-            "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . ttChkTaskCol() . "
-             FROM time_entries t
-             LEFT JOIN issues i      ON t.issue_id = i.id
-             LEFT JOIN time_tasks tk ON t.task_id  = tk.id
-             LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id" . ttChkTaskJoin() . "
-             WHERE t.id = ?"
-        );
-        $est->execute([(int)$_GET['edit']]);
-        $r = $est->fetch(PDO::FETCH_ASSOC);
-        if ($r && ($r['employee_code'] === $code || isSuperadmin())) $edit = $r;
-    }
-
-    $st = $db->prepare(
+// ── Shared: one employee's week ──────────────────────────
+// My Time and the report's per-employee view read the same rows through here,
+// so a timesheet looks the same whoever is looking at it.
+function timeWeekEntries(string $empCode, string $weekStart, string $weekEnd): array {
+    $st = getDb()->prepare(
         "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . ttChkTaskCol() . "
          FROM time_entries t
          LEFT JOIN issues i      ON t.issue_id = i.id
@@ -451,17 +495,15 @@ function pageMyTime(): void {
          WHERE t.employee_code = ? AND t.entry_date BETWEEN ? AND ?
          ORDER BY t.entry_date ASC, t.created_at ASC"
     );
-    $st->execute([$code, $weekStart, $weekEnd]);
-    $entries = $st->fetchAll(PDO::FETCH_ASSOC);
+    $st->execute([$empCode, $weekStart, $weekEnd]);
+    return $st->fetchAll(PDO::FETCH_ASSOC);
+}
 
-    // The seven day columns (Sun → Sat) for this week.
-    $days = [];
-    for ($d = 0; $d < 7; $d++) $days[] = date('Y-m-d', strtotime($weekStart . " +{$d} days"));
-    $today = date('Y-m-d');
-
-    // Build the timesheet grid: one row per task/ticket, minutes summed
-    // into each day column (mirrors the ClickUp Task × Day layout). Also
-    // keep a flat per-entry list for the editable detail table below.
+// Build the timesheet grid: one row per task/ticket, minutes summed into each
+// day column (mirrors the ClickUp Task × Day layout). Also keeps a flat
+// per-entry list per row, for the expandable sub-rows.
+// Returns [grid, dayTotals, weekTotal].
+function timeBuildGrid(array $entries, array $days): array {
     $grid      = [];                       // rowKey => entry fields + ['cells'=>[date=>min],'total']
     $dayTotals = array_fill_keys($days, 0);
     $weekTotal = 0;
@@ -496,6 +538,191 @@ function pageMyTime(): void {
         $dayTotals[$e['entry_date']]           += (int)$e['minutes'];
         $weekTotal                             += (int)$e['minutes'];
     }
+    return [$grid, $dayTotals, $weekTotal];
+}
+
+// Weekly Task/Ticket × day grid. $editable adds the Edit/Delete controls on
+// the expanded entries — the report shows somebody else's week, so it renders
+// the same grid with those controls off.
+function renderTimesheetGrid(array $grid, array $days, array $dayTotals, int $weekTotal, string $weekStart, bool $editable): void {
+    $today = date('Y-m-d');
+?>
+<div class="table-wrap" data-stack style="margin-bottom:18px">
+    <table class="table" style="font-size:13px">
+        <thead>
+            <tr>
+                <th style="min-width:200px">Task / Ticket</th>
+                <?php foreach ($days as $day): ?>
+                <th style="width:84px;text-align:right<?= $day === $today ? ';color:var(--accent)' : '' ?>">
+                    <?= date('D', strtotime($day)) ?><br>
+                    <span style="font-weight:400"><?= date('d M', strtotime($day)) ?></span>
+                </th>
+                <?php endforeach; ?>
+                <th style="width:90px;text-align:right">Total</th>
+            </tr>
+        </thead>
+        <tbody>
+        <?php $gi = 0; foreach ($grid as $row): $gi++; $cnt = count($row['entries']); ?>
+            <tr class="tt-task-row" data-grp="<?= $gi ?>" style="cursor:pointer">
+                <td>
+                    <span class="tt-caret" style="display:inline-block;width:14px;color:var(--muted)">▸</span>
+                    <?php if (!empty($row['issue_id'])): ?>
+                    <a href="?page=view_issue&id=<?= (int)$row['issue_id'] ?>" target="_blank" style="color:var(--accent)" onclick="event.stopPropagation()">WP-<?= (int)$row['issue_id'] ?></a>
+                    <?php if (!empty($row['issue_summary'])): ?><span class="text-muted"> — <?= h($row['issue_summary']) ?></span><?php endif; ?>
+                    <?php else: ?>
+                    <?= h(timeEntryLabel($row)) ?>
+                    <?php endif; ?>
+                    <span class="text-muted" style="font-size:11px;margin-left:6px">(<?= $cnt ?> entr<?= $cnt === 1 ? 'y' : 'ies' ?>)</span>
+                </td>
+                <?php foreach ($days as $day): $m = (int)$row['cells'][$day]; ?>
+                <td style="text-align:right<?= $day === $today ? ';background:rgba(99,102,241,.06)' : '' ?>">
+                    <?= $m > 0 ? h(fmtMinutes($m)) : '<span class="text-muted">—</span>' ?>
+                </td>
+                <?php endforeach; ?>
+                <td style="text-align:right;font-weight:600"><?= h(fmtMinutes((int)$row['total'])) ?></td>
+            </tr>
+            <?php foreach ($row['entries'] as $e): ?>
+            <tr class="tt-entry-row tt-grp-<?= $gi ?>" style="display:none;background:var(--bg)">
+                <td style="padding-left:28px">
+                    <span class="text-muted" style="white-space:nowrap"><?= h(fmtMinutes((int)$e['minutes'])) ?></span>
+                    <?php if (!empty($e['notes'])): ?><span class="text-muted" style="font-size:11px"> · <?= h($e['notes']) ?></span><?php endif; ?>
+                    <?php if ($editable): ?>
+                    <span style="margin-left:8px;white-space:nowrap">
+                        <a href="?page=my_time&week=<?= h($weekStart) ?>&edit=<?= (int)$e['id'] ?>" class="btn btn-ghost btn-sm">Edit</a>
+                        <form method="POST" class="inline-form" style="display:inline" onsubmit="return confirm('Delete this time entry?')">
+                            <input type="hidden" name="action" value="delete_time_entry">
+                            <input type="hidden" name="id" value="<?= (int)$e['id'] ?>">
+                            <input type="hidden" name="week" value="<?= h($weekStart) ?>">
+                            <button type="submit" class="btn btn-sm badge-red" style="cursor:pointer">Delete</button>
+                        </form>
+                    </span>
+                    <?php endif; ?>
+                </td>
+                <?php foreach ($days as $day): ?>
+                <td style="text-align:right<?= $day === $today ? ';background:rgba(99,102,241,.06)' : '' ?>">
+                    <?= $e['entry_date'] === $day ? h(fmtMinutes((int)$e['minutes'])) : '<span class="text-muted">—</span>' ?>
+                </td>
+                <?php endforeach; ?>
+                <td style="text-align:right"><?= h(fmtMinutes((int)$e['minutes'])) ?></td>
+            </tr>
+            <?php endforeach; ?>
+        <?php endforeach; ?>
+        </tbody>
+        <tfoot>
+            <tr>
+                <th style="text-align:right">Daily total</th>
+                <?php foreach ($days as $day): ?>
+                <th style="text-align:right"><?= $dayTotals[$day] > 0 ? h(fmtMinutes((int)$dayTotals[$day])) : '<span class="text-muted">0h</span>' ?></th>
+                <?php endforeach; ?>
+                <th style="text-align:right;color:var(--accent)"><?= h(fmtMinutes($weekTotal)) ?></th>
+            </tr>
+        </tfoot>
+    </table>
+</div>
+
+<p class="text-muted" style="font-size:12px">Click a task row to expand its individual time entries<?= $editable ? ' and edit or delete them' : '' ?>.</p>
+<script>
+(function () {
+    document.querySelectorAll('.tt-task-row').forEach(function (row) {
+        row.addEventListener('click', function () {
+            var g = row.getAttribute('data-grp');
+            var caret = row.querySelector('.tt-caret');
+            var opened = false;
+            document.querySelectorAll('.tt-grp-' + g).forEach(function (sr) {
+                var show = (sr.style.display === 'none');
+                sr.style.display = show ? '' : 'none';
+                opened = show;
+            });
+            if (caret) caret.textContent = opened ? '▾' : '▸';
+        });
+    });
+})();
+</script>
+<?php }
+
+// The same week as a day-grouped list of individual entries.
+function renderTimeEntriesList(array $entries, array $days, string $weekStart, bool $editable): void {
+    $today = date('Y-m-d');
+    foreach ($days as $day):
+        $dayRows = array_values(array_filter($entries, fn($e) => $e['entry_date'] === $day));
+        if (empty($dayRows)) continue;
+        $dayTotal = 0; foreach ($dayRows as $e) $dayTotal += (int)$e['minutes'];
+?>
+<div class="form-card" style="margin-bottom:12px;padding:12px;max-width:none">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <strong style="<?= $day === $today ? 'color:var(--accent)' : '' ?>"><?= date('l, d M', strtotime($day)) ?></strong>
+        <span class="badge badge-grey"><?= h(fmtMinutes($dayTotal)) ?></span>
+    </div>
+    <div class="table-wrap" data-stack>
+        <table class="table" style="font-size:13px;table-layout:fixed;width:100%">
+            <thead><tr>
+                <th style="width:240px">Task / Ticket</th>
+                <th>Description</th>
+                <th style="width:90px">Duration</th>
+                <?php if ($editable): ?><th style="width:130px"></th><?php endif; ?>
+            </tr></thead>
+            <tbody>
+            <?php foreach ($dayRows as $e): ?>
+                <tr>
+                    <td style="word-break:break-word">
+                        <?php if (!empty($e['issue_id'])): ?>
+                        <a href="?page=view_issue&id=<?= (int)$e['issue_id'] ?>" target="_blank" style="color:var(--accent)">WP-<?= (int)$e['issue_id'] ?></a>
+                        <?php if (!empty($e['issue_summary'])): ?><span class="text-muted"> — <?= h($e['issue_summary']) ?></span><?php endif; ?>
+                        <?php else: ?>
+                        <?= h(timeEntryLabel($e)) ?>
+                        <?php endif; ?>
+                    </td>
+                    <td class="text-muted" style="white-space:normal;word-break:break-word"><?= h($e['notes'] ?? '') ?: '—' ?></td>
+                    <td><?= h(fmtMinutes((int)$e['minutes'])) ?></td>
+                    <?php if ($editable): ?>
+                    <td style="white-space:nowrap">
+                        <a href="?page=my_time&week=<?= h($weekStart) ?>&tview=entries&edit=<?= (int)$e['id'] ?>" class="btn btn-ghost btn-sm">Edit</a>
+                        <form method="POST" class="inline-form" style="display:inline" onsubmit="return confirm('Delete this time entry?')">
+                            <input type="hidden" name="action" value="delete_time_entry">
+                            <input type="hidden" name="id" value="<?= (int)$e['id'] ?>">
+                            <input type="hidden" name="week" value="<?= h($weekStart) ?>">
+                            <button type="submit" class="btn btn-sm badge-red" style="cursor:pointer">Delete</button>
+                        </form>
+                    </td>
+                    <?php endif; ?>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+</div>
+<?php endforeach;
+}
+
+// ── Page: My Time (personal weekly timesheet) ────────────
+function pageMyTime(): void {
+    $db   = getDb();
+    $code = myCode();
+
+    $weekStart = weekStartSunday($_GET['week'] ?? date('Y-m-d'));
+    $weekEnd   = date('Y-m-d', strtotime($weekStart . ' +6 days'));
+    $prevWeek  = date('Y-m-d', strtotime($weekStart . ' -7 days'));
+    $nextWeek  = date('Y-m-d', strtotime($weekStart . ' +7 days'));
+
+    // Entry under edit (own rows only).
+    $edit = null;
+    if (!empty($_GET['edit'])) {
+        $est = $db->prepare(
+            "SELECT t.*, i.summary AS issue_summary, tk.name AS task_name, cc.name AS checklist_name" . ttChecklistFreqCol() . ttChkTaskCol() . "
+             FROM time_entries t
+             LEFT JOIN issues i      ON t.issue_id = i.id
+             LEFT JOIN time_tasks tk ON t.task_id  = tk.id
+             LEFT JOIN chk_checklists cc ON t.checklist_id = cc.id" . ttChkTaskJoin() . "
+             WHERE t.id = ?"
+        );
+        $est->execute([(int)$_GET['edit']]);
+        $r = $est->fetch(PDO::FETCH_ASSOC);
+        if ($r && ($r['employee_code'] === $code || isSuperadmin())) $edit = $r;
+    }
+
+    $entries = timeWeekEntries($code, $weekStart, $weekEnd);
+    $days    = timeWeekDays($weekStart);
+    [$grid, $dayTotals, $weekTotal] = timeBuildGrid($entries, $days);
 
     // Form prefill (edit row > ?issue_id deep-link > blank). The reference
     // picker keeps two hidden fields (ticket, task_id) and one display label.
@@ -581,7 +808,7 @@ function pageMyTime(): void {
             </div>
             <input type="hidden" name="ticket"  id="tt-ref-ticket" value="<?= h($prefillTicket) ?>">
             <input type="hidden" name="task_id" id="tt-ref-task"   value="<?= (int)$prefillTaskId ?>">
-            <p class="text-muted" style="font-size:12px;margin-top:4px">Search a ticket (WP-#) or one of your <a href="?page=time_tasks" style="color:var(--accent)">tasks</a> by keyword. Tip: create tasks under <a href="?page=time_tasks" style="color:var(--accent)">Tasks</a>.</p>
+            <p class="text-muted" style="font-size:12px;margin-top:4px">Search a ticket (WP-#) or one of the shared <a href="?page=time_tasks" style="color:var(--accent)">tasks</a> by keyword. Tasks are created by a Time Tracking administrator, so everybody logs the same work under the same name.</p>
         </div>
     </form>
 </div>
@@ -682,148 +909,22 @@ function pageMyTime(): void {
 
 <?php elseif ($view === 'entries'): ?>
 <!-- Time entries view — grouped by day -->
-<?php for ($d = 0; $d < 7; $d++):
-    $day = $days[$d];
-    $dayRows = array_values(array_filter($entries, fn($e) => $e['entry_date'] === $day));
-    if (empty($dayRows)) continue;
-    $dayTotal = 0; foreach ($dayRows as $e) $dayTotal += (int)$e['minutes'];
-?>
-<div class="form-card" style="margin-bottom:12px;padding:12px;max-width:none">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-        <strong style="<?= $day === $today ? 'color:var(--accent)' : '' ?>"><?= date('l, d M', strtotime($day)) ?></strong>
-        <span class="badge badge-grey"><?= h(fmtMinutes($dayTotal)) ?></span>
-    </div>
-    <div class="table-wrap" data-stack>
-        <table class="table" style="font-size:13px;table-layout:fixed;width:100%">
-            <thead><tr>
-                <th style="width:240px">Task / Ticket</th>
-                <th>Description</th>
-                <th style="width:90px">Duration</th>
-                <th style="width:130px"></th>
-            </tr></thead>
-            <tbody>
-            <?php foreach ($dayRows as $e): ?>
-                <tr>
-                    <td style="word-break:break-word">
-                        <?php if (!empty($e['issue_id'])): ?>
-                        <a href="?page=view_issue&id=<?= (int)$e['issue_id'] ?>" target="_blank" style="color:var(--accent)">WP-<?= (int)$e['issue_id'] ?></a>
-                        <?php if (!empty($e['issue_summary'])): ?><span class="text-muted"> — <?= h($e['issue_summary']) ?></span><?php endif; ?>
-                        <?php else: ?>
-                        <?= h(timeEntryLabel($e)) ?>
-                        <?php endif; ?>
-                    </td>
-                    <td class="text-muted" style="white-space:normal;word-break:break-word"><?= h($e['notes'] ?? '') ?: '—' ?></td>
-                    <td><?= h(fmtMinutes((int)$e['minutes'])) ?></td>
-                    <td style="white-space:nowrap">
-                        <a href="?page=my_time&week=<?= h($weekStart) ?>&tview=entries&edit=<?= (int)$e['id'] ?>" class="btn btn-ghost btn-sm">Edit</a>
-                        <form method="POST" class="inline-form" style="display:inline" onsubmit="return confirm('Delete this time entry?')">
-                            <input type="hidden" name="action" value="delete_time_entry">
-                            <input type="hidden" name="id" value="<?= (int)$e['id'] ?>">
-                            <input type="hidden" name="week" value="<?= h($weekStart) ?>">
-                            <button type="submit" class="btn btn-sm badge-red" style="cursor:pointer">Delete</button>
-                        </form>
-                    </td>
-                </tr>
-            <?php endforeach; ?>
-            </tbody>
-        </table>
-    </div>
-</div>
-<?php endfor; ?>
+<?php renderTimeEntriesList($entries, $days, $weekStart, true); ?>
 
 <?php else: ?>
 <!-- Weekly timesheet grid (Task/Ticket × day) -->
-<div class="table-wrap" data-stack style="margin-bottom:18px">
-    <table class="table" style="font-size:13px">
-        <thead>
-            <tr>
-                <th style="min-width:200px">Task / Ticket</th>
-                <?php foreach ($days as $day): ?>
-                <th style="width:84px;text-align:right<?= $day === $today ? ';color:var(--accent)' : '' ?>">
-                    <?= date('D', strtotime($day)) ?><br>
-                    <span style="font-weight:400"><?= date('d M', strtotime($day)) ?></span>
-                </th>
-                <?php endforeach; ?>
-                <th style="width:90px;text-align:right">Total</th>
-            </tr>
-        </thead>
-        <tbody>
-        <?php $gi = 0; foreach ($grid as $row): $gi++; $cnt = count($row['entries']); ?>
-            <tr class="tt-task-row" data-grp="<?= $gi ?>" style="cursor:pointer">
-                <td>
-                    <span class="tt-caret" style="display:inline-block;width:14px;color:var(--muted)">▸</span>
-                    <?php if (!empty($row['issue_id'])): ?>
-                    <a href="?page=view_issue&id=<?= (int)$row['issue_id'] ?>" target="_blank" style="color:var(--accent)" onclick="event.stopPropagation()">WP-<?= (int)$row['issue_id'] ?></a>
-                    <?php if (!empty($row['issue_summary'])): ?><span class="text-muted"> — <?= h($row['issue_summary']) ?></span><?php endif; ?>
-                    <?php else: ?>
-                    <?= h(timeEntryLabel($row)) ?>
-                    <?php endif; ?>
-                    <span class="text-muted" style="font-size:11px;margin-left:6px">(<?= $cnt ?> entr<?= $cnt === 1 ? 'y' : 'ies' ?>)</span>
-                </td>
-                <?php foreach ($days as $day): $m = (int)$row['cells'][$day]; ?>
-                <td style="text-align:right<?= $day === $today ? ';background:rgba(99,102,241,.06)' : '' ?>">
-                    <?= $m > 0 ? h(fmtMinutes($m)) : '<span class="text-muted">—</span>' ?>
-                </td>
-                <?php endforeach; ?>
-                <td style="text-align:right;font-weight:600"><?= h(fmtMinutes((int)$row['total'])) ?></td>
-            </tr>
-            <?php foreach ($row['entries'] as $e): ?>
-            <tr class="tt-entry-row tt-grp-<?= $gi ?>" style="display:none;background:var(--bg)">
-                <td style="padding-left:28px">
-                    <span class="text-muted" style="white-space:nowrap"><?= h(fmtMinutes((int)$e['minutes'])) ?></span>
-                    <?php if (!empty($e['notes'])): ?><span class="text-muted" style="font-size:11px"> · <?= h($e['notes']) ?></span><?php endif; ?>
-                    <span style="margin-left:8px;white-space:nowrap">
-                        <a href="?page=my_time&week=<?= h($weekStart) ?>&edit=<?= (int)$e['id'] ?>" class="btn btn-ghost btn-sm">Edit</a>
-                        <form method="POST" class="inline-form" style="display:inline" onsubmit="return confirm('Delete this time entry?')">
-                            <input type="hidden" name="action" value="delete_time_entry">
-                            <input type="hidden" name="id" value="<?= (int)$e['id'] ?>">
-                            <input type="hidden" name="week" value="<?= h($weekStart) ?>">
-                            <button type="submit" class="btn btn-sm badge-red" style="cursor:pointer">Delete</button>
-                        </form>
-                    </span>
-                </td>
-                <?php foreach ($days as $day): ?>
-                <td style="text-align:right<?= $day === $today ? ';background:rgba(99,102,241,.06)' : '' ?>">
-                    <?= $e['entry_date'] === $day ? h(fmtMinutes((int)$e['minutes'])) : '<span class="text-muted">—</span>' ?>
-                </td>
-                <?php endforeach; ?>
-                <td style="text-align:right"><?= h(fmtMinutes((int)$e['minutes'])) ?></td>
-            </tr>
-            <?php endforeach; ?>
-        <?php endforeach; ?>
-        </tbody>
-        <tfoot>
-            <tr>
-                <th style="text-align:right">Daily total</th>
-                <?php foreach ($days as $day): ?>
-                <th style="text-align:right"><?= $dayTotals[$day] > 0 ? h(fmtMinutes((int)$dayTotals[$day])) : '<span class="text-muted">0h</span>' ?></th>
-                <?php endforeach; ?>
-                <th style="text-align:right;color:var(--accent)"><?= h(fmtMinutes($weekTotal)) ?></th>
-            </tr>
-        </tfoot>
-    </table>
-</div>
-
-<p class="text-muted" style="font-size:12px">Click a task row to expand its individual time entries (start–end) and edit or delete them.</p>
-<script>
-(function () {
-    document.querySelectorAll('.tt-task-row').forEach(function (row) {
-        row.addEventListener('click', function () {
-            var g = row.getAttribute('data-grp');
-            var caret = row.querySelector('.tt-caret');
-            var opened = false;
-            document.querySelectorAll('.tt-grp-' + g).forEach(function (sr) {
-                var show = (sr.style.display === 'none');
-                sr.style.display = show ? '' : 'none';
-                opened = show;
-            });
-            if (caret) caret.textContent = opened ? '▾' : '▸';
-        });
-    });
-})();
-</script>
+<?php renderTimesheetGrid($grid, $days, $dayTotals, $weekTotal, $weekStart, true); ?>
 <?php endif; ?>
 <?php }
+
+// The report's ticket box takes "WP-11" or "11"; null means it was typed as
+// something that can never match an issue, which the callers turn into a
+// filter that selects nothing rather than one they silently ignore.
+function timeTicketFilterId(string $ticket): ?int {
+    if (preg_match('/^WP-?(\d+)$/i', $ticket, $m)) return (int)$m[1];
+    if (ctype_digit($ticket))                      return (int)$ticket;
+    return null;
+}
 
 // ── Shared query for the report + its CSV export ─────────
 function timeReportRows(string $emp, string $from, string $to, string $ticket): array {
@@ -834,9 +935,7 @@ function timeReportRows(string $emp, string $from, string $to, string $ticket): 
     if ($from !== '') { $where[] = 't.entry_date >= ?';   $params[] = $from; }
     if ($to !== '')   { $where[] = 't.entry_date <= ?';   $params[] = $to; }
     if ($ticket !== '') {
-        $tid = null;
-        if (preg_match('/^WP-?(\d+)$/i', $ticket, $m)) $tid = (int)$m[1];
-        elseif (ctype_digit($ticket))                  $tid = (int)$ticket;
+        $tid = timeTicketFilterId($ticket);
         if ($tid !== null) { $where[] = 't.issue_id = ?'; $params[] = $tid; }
         else               { $where[] = '1=0'; }
     }
@@ -856,7 +955,45 @@ function timeReportRows(string $emp, string $from, string $to, string $ticket): 
     return [$rows, $total];
 }
 
+// ── Per-employee day totals for one week ─────────────────
+// One grouped query for the whole company, keyed employee_code => date =>
+// minutes. Rows for employees who logged nothing simply do not come back.
+function timeReportDayTotals(string $from, string $to, string $ticket): array {
+    $where  = ['t.entry_date BETWEEN ? AND ?'];
+    $params = [$from, $to];
+    if ($ticket !== '') {
+        $tid = timeTicketFilterId($ticket);
+        if ($tid !== null) { $where[] = 't.issue_id = ?'; $params[] = $tid; }
+        else               { $where[] = '1=0'; }
+    }
+    $st = getDb()->prepare(
+        'SELECT t.employee_code, t.entry_date, SUM(t.minutes) AS minutes
+         FROM time_entries t
+         WHERE ' . implode(' AND ', $where) . '
+         GROUP BY t.employee_code, t.entry_date'
+    );
+    $st->execute($params);
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $out[(string)$r['employee_code']][(string)$r['entry_date']] = (int)$r['minutes'];
+    }
+    return $out;
+}
+
+// Initials for the people list, e.g. "Pradhyuman Solanki" → "PS".
+function timeInitials(string $name): string {
+    $parts = preg_split('/\s+/', trim($name)) ?: [];
+    $parts = array_values(array_filter($parts, fn($p) => $p !== ''));
+    if (!$parts) return '?';
+    $first = mb_strtoupper(mb_substr($parts[0], 0, 1));
+    $last  = count($parts) > 1 ? mb_strtoupper(mb_substr($parts[count($parts) - 1], 0, 1)) : '';
+    return $first . $last;
+}
+
 // ── Page: Time Tracking Report (cross-employee) ──────────
+// Two views behind one page: the week's timesheets for everybody (People ×
+// day, the default), and one employee's week opened from it — which renders
+// through the same grid as My Time, read-only.
 function pageTimeReport(): void {
     if (!hasTxn('time_report')) {
         flash('error', 'Access denied.');
@@ -864,6 +1001,7 @@ function pageTimeReport(): void {
     }
     $emp    = trim($_GET['emp'] ?? '');
     $ticket = trim($_GET['ticket'] ?? '');
+    $idle   = !empty($_GET['idle']);   // also list employees with no time this week
 
     // Week filter (Sun–Sat) drives the from/to range.
     $weekStart = weekStartSunday($_GET['week'] ?? date('Y-m-d'));
@@ -874,25 +1012,29 @@ function pageTimeReport(): void {
     $weekLabel = date('d M', strtotime($weekStart)) . ' – ' . date('d M Y', strtotime($weekEnd));
     $from = $weekStart;
     $to   = $weekEnd;
+    $days  = timeWeekDays($weekStart);
+    $today = date('Y-m-d');
 
-    $hasFilters = isset($_GET['view']);
-    $rows = []; $total = 0;
-    if ($hasFilters) {
-        [$rows, $total] = timeReportRows($emp, $from, $to, $ticket);
-    }
     $employees = getEmployeesLite();
-    $empName = '';
+    $empName   = '';
     foreach ($employees as $e) { if ($e['employee_code'] === $emp) { $empName = $e['full_name']; break; } }
+    if ($emp !== '' && $empName === '') $empName = $emp;   // code with no employee row
 
-    // Nav links / export preserve the applied employee + ticket filters.
-    $navBase   = '?page=time_report&view=1'
+    // Nav links / export preserve the applied filters.
+    $navBase   = '?page=time_report'
         . ($emp !== ''    ? '&emp=' . urlencode($emp) : '')
-        . ($ticket !== '' ? '&ticket=' . urlencode($ticket) : '');
+        . ($ticket !== '' ? '&ticket=' . urlencode($ticket) : '')
+        . ($idle ? '&idle=1' : '');
     $exportUrl = '?page=export_time_report&from_date=' . urlencode($from) . '&to_date=' . urlencode($to)
         . ($emp !== ''    ? '&emp=' . urlencode($emp) : '')
         . ($ticket !== '' ? '&ticket=' . urlencode($ticket) : '');
 ?>
-<div class="page-header"><h2>Time Tracking Report</h2></div>
+<div class="page-header">
+    <h2><?= $emp !== '' ? 'Timesheet · ' . h($empName) : 'All Timesheets' ?></h2>
+    <?php if ($emp !== ''): ?>
+    <a href="?page=time_report&week=<?= h($weekStart) ?><?= $ticket !== '' ? '&ticket=' . urlencode($ticket) : '' ?><?= $idle ? '&idle=1' : '' ?>" class="btn btn-ghost btn-sm">‹ All timesheets</a>
+    <?php endif; ?>
+</div>
 
 <!-- Week navigation -->
 <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap">
@@ -904,19 +1046,19 @@ function pageTimeReport(): void {
         <span class="text-muted" style="font-size:12px">📅 Jump to week</span>
         <input type="date" id="trWeekPick" class="form-control" value="<?= h($weekStart) ?>" style="width:160px">
     </span>
+    <a href="<?= $exportUrl ?>" class="btn btn-ghost btn-sm" target="_blank" style="margin-left:auto">Export CSV</a>
 </div>
 
 <!-- Filters -->
 <form method="GET" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px">
     <input type="hidden" name="page" value="time_report">
-    <input type="hidden" name="view" value="1">
     <input type="hidden" name="week" value="<?= h($weekStart) ?>">
     <div class="form-group" style="margin:0">
         <label>Employee</label>
         <span class="input-clear-wrap" style="display:flex;width:240px">
             <input type="hidden" name="emp" id="trEmpId" value="<?= h($emp) ?>">
             <input type="text" id="trEmpSearch" class="form-control" placeholder="All employees — type to search"
-                   value="<?= h($empName) ?>" autocomplete="off">
+                   value="<?= h($emp !== '' ? $empName : '') ?>" autocomplete="off">
             <button type="button" id="trEmpClear" class="input-clear-btn" data-no-auto aria-label="Clear" tabindex="-1">&times;</button>
             <div id="trEmpList" style="position:absolute;top:100%;left:0;right:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-top:2px;max-height:280px;overflow-y:auto;display:none;z-index:100;box-shadow:0 6px 18px rgba(0,0,0,.35)"></div>
         </span>
@@ -925,10 +1067,13 @@ function pageTimeReport(): void {
         <label>Ticket</label>
         <input type="text" name="ticket" class="form-control" style="width:140px" value="<?= h($ticket) ?>" placeholder="e.g. WP-11">
     </div>
-    <button type="submit" class="btn btn-primary">View</button>
-    <?php if ($hasFilters): ?>
-    <a href="<?= $exportUrl ?>" class="btn btn-ghost btn-sm" target="_blank">Export CSV</a>
+    <?php if ($emp === ''): ?>
+    <label class="checkbox-label" style="font-size:13px;display:flex;align-items:center;gap:6px;margin:0 0 6px">
+        <input type="checkbox" name="idle" value="1" <?= $idle ? 'checked' : '' ?>>
+        Show employees with no time
+    </label>
     <?php endif; ?>
+    <button type="submit" class="btn btn-primary">Apply</button>
 </form>
 <script>
 (function () {
@@ -970,44 +1115,163 @@ function pageTimeReport(): void {
     if (clearBtn) clearBtn.addEventListener('click', function () { search.value = ''; hidden.value = ''; search.focus(); render(''); });
 })();
 </script>
+<?php
+    if ($emp !== '') {
+        timeReportEmployeeView($emp, $empName, $weekStart, $weekEnd, $days, $ticket);
+        return;
+    }
 
-<?php if (!$hasFilters): ?>
-<div class="rpt-prompt">Choose filters and click <strong>View</strong> to load time entries.</div>
-<?php elseif (empty($rows)): ?>
-<div class="rpt-prompt">No time entries match the selected filters.</div>
+    // ── People × day, the week's timesheets for everybody ──
+    $totals = timeReportDayTotals($from, $to, $ticket);
+
+    // Departments give each row a subtitle, the way the reference layout
+    // carries one under the name.
+    $deptNames = [];
+    foreach (getDepartments() as $d) $deptNames[(int)$d['id']] = (string)$d['department_name'];
+
+    $people = [];
+    foreach ($employees as $e) {
+        $code  = (string)$e['employee_code'];
+        $cells = $totals[$code] ?? [];
+        // Inactive employees who logged time that week still belong in the
+        // week's numbers; the ones who did not are hidden with the rest.
+        $hasTime = !empty($cells);
+        if (!$hasTime && (!$idle || (int)$e['is_active'] === 0)) continue;
+        $row = ['code' => $code, 'name' => (string)$e['full_name'],
+                'dept' => $deptNames[(int)($e['department_id'] ?? 0)] ?? '',
+                'inactive' => (int)$e['is_active'] === 0,
+                'cells' => [], 'total' => 0];
+        foreach ($days as $day) {
+            $m = (int)($cells[$day] ?? 0);
+            $row['cells'][$day] = $m;
+            $row['total'] += $m;
+        }
+        $people[] = $row;
+        unset($totals[$code]);
+    }
+    // Time logged by a code with no employee row (deleted staff) would other-
+    // wise vanish from the week's totals, so it gets a row of its own.
+    foreach ($totals as $code => $cells) {
+        $row = ['code' => (string)$code, 'name' => (string)$code, 'dept' => '', 'inactive' => true,
+                'cells' => [], 'total' => 0];
+        foreach ($days as $day) {
+            $m = (int)($cells[$day] ?? 0);
+            $row['cells'][$day] = $m;
+            $row['total'] += $m;
+        }
+        $people[] = $row;
+    }
+    usort($people, fn($a, $b) => strcasecmp($a['name'], $b['name']));
+
+    $dayTotals = array_fill_keys($days, 0);
+    $weekTotal = 0;
+    foreach ($people as $p) {
+        foreach ($days as $day) $dayTotals[$day] += $p['cells'][$day];
+        $weekTotal += $p['total'];
+    }
+    $linkBase = '?page=time_report&week=' . urlencode($weekStart)
+        . ($ticket !== '' ? '&ticket=' . urlencode($ticket) : '')
+        . ($idle ? '&idle=1' : '');
+?>
+<?php if (empty($people)): ?>
+<div class="rpt-prompt">No time logged in this week<?= $ticket !== '' ? ' against ' . h($ticket) : '' ?>. Tick <strong>Show employees with no time</strong> to list everybody anyway.</div>
 <?php else: ?>
-<div class="table-count" style="margin:8px 0 10px"><?= count($rows) ?> entr<?= count($rows) === 1 ? 'y' : 'ies' ?> · total <?= h(fmtMinutes($total)) ?></div>
+<div style="display:flex;align-items:center;gap:10px;margin:8px 0 10px;flex-wrap:wrap">
+    <div class="table-count" style="margin:0"><?= count($people) ?> <?= count($people) === 1 ? 'person' : 'people' ?> · total <?= h(fmtMinutes($weekTotal)) ?></div>
+    <input type="text" id="trPeopleFilter" class="form-control" placeholder="Filter people…" style="width:220px;margin-left:auto">
+</div>
 <div class="table-wrap" data-stack>
-    <table class="table">
+    <table class="table" style="font-size:13px">
         <thead>
             <tr>
-                <th style="width:100px">Date</th>
-                <th style="width:160px">Employee</th>
-                <th>Task / Ticket</th>
-                <th style="width:90px">Duration</th>
-                <th>Notes</th>
+                <th style="min-width:220px">People (<?= count($people) ?>)</th>
+                <th style="width:110px"></th>
+                <?php foreach ($days as $day): ?>
+                <th style="width:84px;text-align:right<?= $day === $today ? ';color:var(--accent)' : '' ?>">
+                    <?= date('D', strtotime($day)) ?><br>
+                    <span style="font-weight:400"><?= date('d M', strtotime($day)) ?></span>
+                </th>
+                <?php endforeach; ?>
+                <th style="width:90px;text-align:right">Total</th>
             </tr>
         </thead>
         <tbody>
-        <?php foreach ($rows as $r): ?>
-            <tr>
-                <td style="white-space:nowrap"><?= date('d M Y', strtotime($r['entry_date'])) ?></td>
-                <td><?= h($r['emp_name'] ?? $r['employee_code']) ?></td>
+        <?php foreach ($people as $p): $open = $linkBase . '&emp=' . urlencode($p['code']); ?>
+            <tr class="tr-person" data-name="<?= h(mb_strtolower($p['name'] . ' ' . $p['code'] . ' ' . $p['dept'])) ?>">
                 <td>
-                    <?php if (!empty($r['issue_id'])): ?>
-                    <a href="?page=view_issue&id=<?= (int)$r['issue_id'] ?>" target="_blank" style="color:var(--accent)">WP-<?= (int)$r['issue_id'] ?></a>
-                    <?php if (!empty($r['issue_summary'])): ?><span class="text-muted"> — <?= h($r['issue_summary']) ?></span><?php endif; ?>
-                    <?php else: ?>
-                    <?= h(timeEntryLabel($r)) ?>
-                    <?php endif; ?>
+                    <span style="display:inline-flex;align-items:center;gap:8px">
+                        <span style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;background:var(--accent);color:#fff;font-size:11px;font-weight:600;flex:none"><?= h(timeInitials($p['name'])) ?></span>
+                        <span>
+                            <a href="<?= $open ?>" style="color:inherit;font-weight:600"><?= h($p['name']) ?></a>
+                            <?php if ($p['inactive']): ?><span class="badge badge-grey" style="margin-left:6px;font-size:10px">inactive</span><?php endif; ?>
+                            <?php if ($p['dept'] !== ''): ?><br><span class="text-muted" style="font-size:11px"><?= h($p['dept']) ?></span><?php endif; ?>
+                        </span>
+                    </span>
                 </td>
-                <td><?= h(fmtMinutes((int)$r['minutes'])) ?></td>
-                <td class="text-muted" style="font-size:12px"><?= h($r['notes'] ?? '') ?></td>
+                <td><a href="<?= $open ?>" class="btn btn-ghost btn-sm">Open →</a></td>
+                <?php foreach ($days as $day): $m = (int)$p['cells'][$day]; ?>
+                <td style="text-align:right<?= $day === $today ? ';background:rgba(99,102,241,.06)' : '' ?>">
+                    <?= $m > 0 ? h(fmtMinutes($m)) : '<span class="text-muted">0h</span>' ?>
+                </td>
+                <?php endforeach; ?>
+                <td style="text-align:right;font-weight:600"><?= $p['total'] > 0 ? h(fmtMinutes((int)$p['total'])) : '<span class="text-muted">0h</span>' ?></td>
             </tr>
         <?php endforeach; ?>
         </tbody>
+        <tfoot>
+            <tr>
+                <th style="text-align:right" colspan="2">Daily total</th>
+                <?php foreach ($days as $day): ?>
+                <th style="text-align:right"><?= $dayTotals[$day] > 0 ? h(fmtMinutes((int)$dayTotals[$day])) : '<span class="text-muted">0h</span>' ?></th>
+                <?php endforeach; ?>
+                <th style="text-align:right;color:var(--accent)"><?= h(fmtMinutes($weekTotal)) ?></th>
+            </tr>
+        </tfoot>
     </table>
 </div>
+<p class="text-muted" style="font-size:12px;margin-top:8px">Open a person to see their week the way they see it on My Time.</p>
+<script>
+(function () {
+    var box = document.getElementById('trPeopleFilter');
+    if (!box) return;
+    box.addEventListener('input', function () {
+        var q = this.value.trim().toLowerCase();
+        document.querySelectorAll('.tr-person').forEach(function (row) {
+            row.style.display = (q === '' || row.getAttribute('data-name').indexOf(q) !== -1) ? '' : 'none';
+        });
+    });
+})();
+</script>
+<?php endif;
+}
+
+// One employee's week, rendered through the same grid as My Time but with
+// the editing controls off — the report reads other people's timesheets.
+function timeReportEmployeeView(string $emp, string $empName, string $weekStart, string $weekEnd, array $days, string $ticket): void {
+    $entries = timeWeekEntries($emp, $weekStart, $weekEnd);
+    [$grid, $dayTotals, $weekTotal] = timeBuildGrid($entries, $days);
+    $view = ($_GET['tview'] ?? '') === 'entries' ? 'entries' : 'timesheet';
+    $base = '?page=time_report&emp=' . urlencode($emp) . '&week=' . urlencode($weekStart)
+        . ($ticket !== '' ? '&ticket=' . urlencode($ticket) : '');
+?>
+<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
+    <span class="badge badge-blue" style="font-size:13px">Week total: <?= h(fmtMinutes($weekTotal)) ?></span>
+    <span style="margin-left:auto;display:inline-flex;gap:0;border:1px solid var(--border);border-radius:6px;overflow:hidden">
+        <a href="<?= $base ?>&tview=timesheet" class="btn btn-sm <?= $view === 'timesheet' ? 'btn-primary' : 'btn-ghost' ?>" style="border-radius:0;border:0">Timesheet</a>
+        <a href="<?= $base ?>&tview=entries"   class="btn btn-sm <?= $view === 'entries'   ? 'btn-primary' : 'btn-ghost' ?>" style="border-radius:0;border:0">Time entries</a>
+    </span>
+</div>
+
+<?php if ($ticket !== ''): ?>
+<p class="text-muted" style="font-size:12px;margin:-6px 0 12px">Showing the whole week — the <?= h($ticket) ?> filter narrows the people list, not an opened timesheet.</p>
+<?php endif; ?>
+
+<?php if (empty($entries)): ?>
+<div class="rpt-prompt"><?= h($empName) ?> logged no time in this week.</div>
+<?php elseif ($view === 'entries'): ?>
+<?php renderTimeEntriesList($entries, $days, $weekStart, false); ?>
+<?php else: ?>
+<?php renderTimesheetGrid($grid, $days, $dayTotals, $weekTotal, $weekStart, false); ?>
 <?php endif; ?>
 <?php }
 

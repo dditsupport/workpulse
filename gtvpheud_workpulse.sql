@@ -1155,6 +1155,7 @@ CREATE TABLE `roles` (
   `txn_policy_admin` tinyint(1) NOT NULL DEFAULT 0,
   `txn_checklist_validate` tinyint(1) NOT NULL DEFAULT 0,
   `txn_time_report` tinyint(1) NOT NULL DEFAULT 0,
+  `txn_time_task` tinyint(1) NOT NULL DEFAULT 0,
   `txn_ticket_scheduler` tinyint(1) NOT NULL DEFAULT 0,
   `txn_event_photo_upload` tinyint(1) NOT NULL DEFAULT 0,
   `txn_inward_item` tinyint(1) NOT NULL DEFAULT 0,
