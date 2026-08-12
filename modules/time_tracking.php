@@ -1163,12 +1163,8 @@ function pageTimeReport(): void {
     }
     usort($people, fn($a, $b) => strcasecmp($a['name'], $b['name']));
 
-    $dayTotals = array_fill_keys($days, 0);
     $weekTotal = 0;
-    foreach ($people as $p) {
-        foreach ($days as $day) $dayTotals[$day] += $p['cells'][$day];
-        $weekTotal += $p['total'];
-    }
+    foreach ($people as $p) $weekTotal += $p['total'];
     $linkBase = '?page=time_report&week=' . urlencode($weekStart)
         . ($ticket !== '' ? '&ticket=' . urlencode($ticket) : '')
         . ($idle ? '&idle=1' : '');
@@ -1218,15 +1214,6 @@ function pageTimeReport(): void {
             </tr>
         <?php endforeach; ?>
         </tbody>
-        <tfoot>
-            <tr>
-                <th style="text-align:right" colspan="2">Daily total</th>
-                <?php foreach ($days as $day): ?>
-                <th style="text-align:right"><?= $dayTotals[$day] > 0 ? h(fmtMinutes((int)$dayTotals[$day])) : '<span class="text-muted">0h</span>' ?></th>
-                <?php endforeach; ?>
-                <th style="text-align:right;color:var(--accent)"><?= h(fmtMinutes($weekTotal)) ?></th>
-            </tr>
-        </tfoot>
     </table>
 </div>
 <p class="text-muted" style="font-size:12px;margin-top:8px">Open a person to see their week the way they see it on My Time.</p>
