@@ -87,28 +87,82 @@ function ttChkTaskJoin(): string {
         ? ' LEFT JOIN chk_items ci ON ci.id = t.chk_item_id' : '';
 }
 
-// Display label for an entry: "WP-12 — summary" when tied to a ticket,
-// the created task's name when tied to a task, else the legacy free-text
-// label (rows logged before tasks became first-class).
-function timeEntryLabel(array $e): string {
+// Which of the three things an entry is against. Same order of precedence as
+// timeEntryLabel(): a ticket wins, then a task, then a checklist; 'other' is
+// a legacy free-text row from before tasks became first-class.
+function timeEntryKind(array $e): string {
+    if (!empty($e['issue_id']))     return 'ticket';
+    if (!empty($e['task_id']))      return 'task';
+    if (!empty($e['checklist_id'])) return 'checklist';
+    return 'other';
+}
+
+// The checklist an entry came from, cycle included: "Admin - HO",
+// "Operation - Paresh — Monthly". Two cycles of one department share a name,
+// so the cycle is what tells them apart.
+function timeChecklistName(array $e): string {
+    $name = (string)($e['checklist_name'] ?? ('#' . (int)($e['checklist_id'] ?? 0)));
+    $freq = (string)($e['checklist_freq'] ?? 'daily');
+    if ($freq !== 'daily' && function_exists('chkFreqLabel')) $name .= ' — ' . chkFreqLabel($freq);
+    return $name;
+}
+
+// Display label for an entry: "WP-12 — summary" when tied to a ticket, the
+// task's name when tied to a task or to a checklist task, else the legacy
+// free-text label (rows logged before tasks became first-class).
+//
+// The checklist's own name is deliberately not in the label: a timesheet row
+// is about the work, and "Reconcile petty cash — Admin - HO" repeated down a
+// week is mostly the same eleven characters. Which list the row came from is
+// carried by timeEntryIcon()'s tooltip instead — and $withSource brings it
+// back for the CSV export, where there is no icon to hover.
+function timeEntryLabel(array $e, bool $withSource = false): string {
     if (!empty($e['issue_id'])) {
         $s = trim((string)($e['issue_summary'] ?? ''));
         return 'WP-' . (int)$e['issue_id'] . ($s !== '' ? ' — ' . $s : '');
     }
     if (!empty($e['task_id'])) return (string)($e['task_name'] ?? ('Task #' . (int)$e['task_id']));
     if (!empty($e['checklist_id'])) {
-        // Two cycles of one department share a name — "Operation - Paresh" is
-        // both a daily and a monthly checklist — so the cycle goes in the label.
-        $name = (string)($e['checklist_name'] ?? ('#' . (int)$e['checklist_id']));
-        $freq = (string)($e['checklist_freq'] ?? 'daily');
-        if ($freq !== 'daily' && function_exists('chkFreqLabel')) $name .= ' — ' . chkFreqLabel($freq);
-        // An entry that names its task leads with it — the timesheet is about
-        // the work, and the checklist is the context. Entries written before
-        // chk_item_id existed name no task and keep the old wording.
+        $name = timeChecklistName($e);
+        // Entries written before chk_item_id existed name no task, so the
+        // checklist is all they have to go on and it stays in the label.
         $task = trim((string)($e['chk_task_name'] ?? ''));
-        return $task !== '' ? ($task . ' — ' . $name) : ('Checklist — ' . $name);
+        if ($task === '')  return 'Checklist — ' . $name;
+        return $withSource ? ($task . ' — ' . $name) : $task;
     }
     return (string)($e['task_label'] ?? '—');
+}
+
+// ── Row icons ────────────────────────────────────────────
+// Ticket / task / checklist glyphs for the timesheet rows, drawn from the
+// same set as the sidebar (navIcon 'issues', 'tasks', 'checklist') so a row
+// reads as the thing its nav entry does. Inline SVG rather than an emoji so
+// it inherits the surrounding text colour, matching chkClockIcon().
+function timeKindIcon(string $kind, int $px = 14, string $title = ''): string {
+    $body = [
+        'ticket'    => '<path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/>'
+                     . '<polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/>'
+                     . '<line x1="9" y1="15" x2="15" y2="15"/>',
+        'task'      => '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>'
+                     . '<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>',
+        'checklist' => '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>'
+                     . '<polyline points="22 4 12 14.01 9 11.01"/>',
+    ][$kind] ?? '';
+    if ($body === '') return '';
+    $t = $title !== '' ? '<title>' . htmlspecialchars($title, ENT_QUOTES, 'UTF-8') . '</title>' : '';
+    return '<svg width="' . $px . '" height="' . $px . '" viewBox="0 0 24 24" fill="none" stroke="currentColor"'
+         . ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" role="img"'
+         . ' style="vertical-align:-2px;flex:none;color:var(--muted);margin-right:6px">' . $t . $body . '</svg>';
+}
+
+// The icon for one entry (or one grid row), titled with what it is — and for
+// a checklist row, with the list its task belongs to, which the label above
+// no longer spells out.
+function timeEntryIcon(array $e, int $px = 14): string {
+    $kind = timeEntryKind($e);
+    $title = ['ticket' => 'Ticket', 'task' => 'Task', 'checklist' => 'Checklist'][$kind] ?? '';
+    if ($kind === 'checklist') $title .= ' — ' . timeChecklistName($e);
+    return timeKindIcon($kind, $px, $title);
 }
 
 // ── AJAX: search tickets + tasks for the reference picker ──
@@ -566,6 +620,7 @@ function renderTimesheetGrid(array $grid, array $days, array $dayTotals, int $we
             <tr class="tt-task-row" data-grp="<?= $gi ?>" style="cursor:pointer">
                 <td>
                     <span class="tt-caret" style="display:inline-block;width:14px;color:var(--muted)">▸</span>
+                    <?= timeEntryIcon($row) ?>
                     <?php if (!empty($row['issue_id'])): ?>
                     <a href="?page=view_issue&id=<?= (int)$row['issue_id'] ?>" target="_blank" style="color:var(--accent)" onclick="event.stopPropagation()">WP-<?= (int)$row['issue_id'] ?></a>
                     <?php if (!empty($row['issue_summary'])): ?><span class="text-muted"> — <?= h($row['issue_summary']) ?></span><?php endif; ?>
@@ -665,6 +720,7 @@ function renderTimeEntriesList(array $entries, array $days, string $weekStart, b
             <?php foreach ($dayRows as $e): ?>
                 <tr>
                     <td style="word-break:break-word">
+                        <?= timeEntryIcon($e) ?>
                         <?php if (!empty($e['issue_id'])): ?>
                         <a href="?page=view_issue&id=<?= (int)$e['issue_id'] ?>" target="_blank" style="color:var(--accent)">WP-<?= (int)$e['issue_id'] ?></a>
                         <?php if (!empty($e['issue_summary'])): ?><span class="text-muted"> — <?= h($e['issue_summary']) ?></span><?php endif; ?>
@@ -730,7 +786,9 @@ function pageMyTime(): void {
     if ($edit && $edit['issue_id'])                 $prefillTicket = 'WP-' . (int)$edit['issue_id'];
     elseif (!$edit && !empty($_GET['issue_id']))    $prefillTicket = 'WP-' . (int)$_GET['issue_id'];
     $prefillTaskId = $edit ? (int)($edit['task_id'] ?? 0) : 0;
-    if ($edit)                                      $prefillRefLabel = timeEntryLabel($edit);
+    // The picker field is one line of text with no icon beside it, so a
+    // checklist row names its list here even though the grid rows do not.
+    if ($edit)                                      $prefillRefLabel = timeEntryLabel($edit, true);
     elseif ($prefillTicket !== '')                  $prefillRefLabel = $prefillTicket;
     else                                            $prefillRefLabel = '';
     $prefillDate     = $edit['entry_date'] ?? date('Y-m-d');
@@ -839,6 +897,8 @@ function pageMyTime(): void {
     var ticketHid = document.getElementById('tt-ref-ticket');
     var taskHid   = document.getElementById('tt-ref-task');
     var timer = null;
+    var ICON_TICKET = <?= json_encode(timeKindIcon('ticket', 14, 'Ticket'), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+    var ICON_TASK   = <?= json_encode(timeKindIcon('task',   14, 'Task'),   JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
 
     function esc(s) {
         return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
@@ -860,9 +920,12 @@ function pageMyTime(): void {
                     return;
                 }
                 resultsEl.innerHTML = d.items.map(function (it) {
-                    var badge = it.kind === 'ticket'
-                        ? '<span class="badge badge-blue" style="margin-right:6px">Ticket</span>'
-                        : '<span class="badge badge-grey" style="margin-right:6px">Task</span>';
+                    // Same glyphs the timesheet rows carry, so a result reads
+                    // as the row it will become.
+                    var badge = (it.kind === 'ticket' ? ICON_TICKET : ICON_TASK)
+                        + (it.kind === 'ticket'
+                            ? '<span class="badge badge-blue" style="margin-right:6px">Ticket</span>'
+                            : '<span class="badge badge-grey" style="margin-right:6px">Task</span>');
                     return '<div class="tt-res" data-kind="' + it.kind + '" data-id="' + it.id +
                         '" data-title="' + esc(it.title) + '" data-sub="' + esc(it.sub) +
                         '" style="padding:10px 12px;border-radius:6px;cursor:pointer">' +
@@ -1281,7 +1344,7 @@ function exportTimeReport(): void {
             $r['employee_code'],
             $r['emp_name'] ?? '',
             !empty($r['issue_id']) ? 'WP-' . (int)$r['issue_id'] : '',
-            !empty($r['issue_id']) ? ($r['issue_summary'] ?? '') : timeEntryLabel($r),
+            !empty($r['issue_id']) ? ($r['issue_summary'] ?? '') : timeEntryLabel($r, true),
             fmtMinutes((int)$r['minutes']),
             (int)$r['minutes'],
             $r['notes'] ?? '',
