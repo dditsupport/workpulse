@@ -48,7 +48,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','policy_heartbeat','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','policy_heartbeat','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
