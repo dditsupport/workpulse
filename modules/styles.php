@@ -189,6 +189,23 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 .chk-file-badge:hover{border-color:var(--accent);color:var(--accent)}
 .chk-file-badge.has-files{background:rgba(26,143,227,.14);border-color:rgba(26,143,227,.45);color:#9ed1f6}
 .chk-file-badge.has-files:hover{background:rgba(26,143,227,.24);color:#cbe7ff;border-color:var(--accent)}
+/* Checklist: the attach controls. The file inputs are visually hidden and
+   clicked through their labels — the native widget's "No file chosen" text
+   cannot be styled away, and it repeats in every task row. Hidden rather than
+   display:none so the input still takes keyboard focus; the label picks up
+   the focus ring on its behalf, which is why the input precedes it. */
+.chk-att-input{position:absolute;width:1px;height:1px;padding:0;margin:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.chk-att-btn{flex:0 0 auto;cursor:pointer;font-size:11px;padding:3px 8px}
+.chk-att-btn:hover{border-color:var(--accent);color:var(--accent)}
+.chk-att-input:focus+.chk-att-btn{border-color:var(--accent);color:var(--accent);outline:2px solid var(--accent);outline-offset:1px}
+/* A button holding files reads as filled, so a row that has something staged
+   is obvious before the submit. */
+.chk-att-btn.has-picked{background:rgba(26,143,227,.14);border-color:rgba(26,143,227,.45);color:#9ed1f6}
+/* capture="environment" does nothing on a desktop pointer — there the Camera
+   button would just open the same picker as Attach, so it is dropped. The
+   input goes with it: left in, it would be a tab stop with nothing to show,
+   and one more empty part in every submit. */
+@media (pointer: fine){.chk-att-cam{display:none}}
 /* Monthly report cell that carries an attachment: dot in the corner, whole
    cell links through to that day's files. */
 .rpt-has-att{position:relative}

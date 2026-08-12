@@ -937,6 +937,11 @@ function chkImageIcon(int $px = 12): string {
     return chkSvgIcon('<rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>'
                     . '<circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>', $px);
 }
+// Camera = "take a photo now", as opposed to the paperclip's "pick a file".
+function chkCameraIcon(int $px = 12): string {
+    return chkSvgIcon('<path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>'
+                    . '<circle cx="12" cy="13" r="4"/>', $px);
+}
 function chkDocIcon(int $px = 12): string {
     return chkSvgIcon('<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>'
                     . '<polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/>'
@@ -2094,12 +2099,37 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                                         <?php endif; ?>
                                     </span>
                                 <?php endforeach; ?>
-                                <?php if ($canAttach): ?>
-                                    <input type="file" class="form-control chk-files"
-                                           name="attachments[<?= (int)$t['id'] ?>][]"
-                                           accept="image/*,application/pdf,.doc,.docx,.xls,.xlsx"
-                                           multiple capture="environment"
-                                           style="font-size:11px;flex:1 1 120px;min-width:0">
+                                <?php if ($canAttach): $aid = (int)$t['id']; ?>
+                                    <?php
+                                    // Two controls rather than one. A single input carrying
+                                    // capture="environment" makes several Android browsers open the
+                                    // camera and drop the "choose a file" option altogether, so a
+                                    // phone could not attach a PDF or a photo already in the gallery.
+                                    // Files (no capture) is the general one; Camera is the shortcut,
+                                    // hidden on fine-pointer devices where capture does nothing.
+                                    //
+                                    // The inputs are visually hidden and driven by their labels: the
+                                    // native widget draws its own "No file chosen" text, which no CSS
+                                    // can remove, and 28 rows of it is most of the column. Both keep
+                                    // the chk-files class and the attachments[ID][] name, so the
+                                    // compression handler and checklistSaveAttachments() see them
+                                    // exactly as they saw the one input — PHP appends both into the
+                                    // same per-item array, and an untouched input posts nothing.
+                                    ?>
+                                    <input type="file" id="chkatt<?= $aid ?>" class="chk-files chk-att-input"
+                                           name="attachments[<?= $aid ?>][]"
+                                           accept="image/*,application/pdf,.doc,.docx,.xls,.xlsx" multiple>
+                                    <label class="btn btn-ghost btn-sm chk-att-btn" for="chkatt<?= $aid ?>"
+                                           title="Attach photos or documents">
+                                        <?= chkClipIcon(12) ?><span class="chk-att-txt" data-idle="Attach">Attach</span>
+                                    </label>
+                                    <input type="file" id="chkcam<?= $aid ?>" class="chk-files chk-att-input chk-att-cam"
+                                           name="attachments[<?= $aid ?>][]"
+                                           accept="image/*" capture="environment">
+                                    <label class="btn btn-ghost btn-sm chk-att-btn chk-att-cam" for="chkcam<?= $aid ?>"
+                                           title="Take a photo">
+                                        <?= chkCameraIcon(12) ?><span class="chk-att-txt" data-idle="Camera">Camera</span>
+                                    </label>
                                 <?php endif; ?>
                             </span>
                         <?php endif; ?>
@@ -2246,15 +2276,34 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
         return (b / 1024 / 1024).toFixed(2) + ' MB';
     }
     function setSubmitDisabled(d) { submitBtns.forEach(function (b) { b.disabled = d; }); }
+    // One status line per row, appended to the end of the attach wrap. It used
+    // to sit right after the input; with the input hidden and its label next in
+    // the flow, inserting there would push the buttons onto the following line.
     function statusNodeFor(input) {
-        var node = input.nextElementSibling;
-        if (!node || !node.classList || !node.classList.contains('chk-att-status')) {
+        var wrap = input.closest ? input.closest('.chk-att-wrap') : null;
+        if (!wrap) wrap = input.parentNode;
+        var node = wrap.querySelector('.chk-att-status');
+        if (!node) {
             node = document.createElement('div');
             node.className = 'chk-att-status';
             node.style.cssText = 'font-size:10px;margin-top:2px;color:var(--muted);min-height:12px;flex-basis:100%';
-            input.parentNode.insertBefore(node, input.nextSibling);
+            wrap.appendChild(node);
         }
         return node;
+    }
+    // The label that fires this input — it sits immediately after it, and its
+    // text carries the count so a staged row is legible without the status
+    // line ("Attach" → "2 files").
+    function labelFor(input) {
+        var el = input.nextElementSibling;
+        return (el && el.classList && el.classList.contains('chk-att-btn')) ? el : null;
+    }
+    function setPicked(input, n) {
+        var label = labelFor(input);
+        if (!label) return;
+        var txt = label.querySelector('.chk-att-txt');
+        if (txt) txt.textContent = n > 0 ? (n + (n === 1 ? ' file' : ' files')) : (txt.dataset.idle || 'Attach');
+        label.classList.toggle('has-picked', n > 0);
     }
     function setFiles(input, arr) {
         try { var dt = new DataTransfer(); arr.forEach(function (f) { dt.items.add(f); }); input.files = dt.files; return true; }
@@ -2296,6 +2345,7 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
         if (!e.target.matches || !e.target.matches('.chk-files')) return;
         var input = e.target, status = statusNodeFor(input);
         var files = Array.from(input.files || []);
+        setPicked(input, files.length);
         if (!files.length) { status.textContent = ''; return; }
         var origTotal = files.reduce(function (n, f) { return n + f.size; }, 0);
         var any = files.some(function (f) { return IMAGE_RE.test(f.type) && f.size > SKIP_BELOW; });
@@ -2303,8 +2353,10 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
         inflight++; setSubmitDisabled(true);
         status.style.color = 'var(--muted)'; status.textContent = 'Compressing photo(s)…';
         Promise.all(files.map(compressOne)).then(function (out) {
-            var newTotal = out.reduce(function (n, f) { return n + f.size; }, 0);
-            if (!setFiles(input, out)) {
+            var newTotal  = out.reduce(function (n, f) { return n + f.size; }, 0);
+            var replaced  = setFiles(input, out);
+            if (replaced) setPicked(input, out.length);
+            if (!replaced) {
                 status.style.color = 'var(--yellow)';
                 status.textContent = 'Could not replace files — uploading originals (' + fmtSize(origTotal) + ').';
             } else if (newTotal < origTotal) {
