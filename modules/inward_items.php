@@ -56,9 +56,42 @@ function inwHasTable(): bool {
     return $cached;
 }
 
+// Separate check for the qty column, because the table can exist from the
+// first migration while the qty one hasn't been applied. Without this the
+// symptom is opaque: the tree quietly reports qty 0 for everything and any
+// import dies on "Unknown column 'qty'" from deep inside a transaction.
+function inwHasQtyCol(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        getDb()->query('SELECT qty FROM inward_items LIMIT 0')->fetch();
+        $cached = true;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
 function inwMigrationNotice(): string {
-    return '<div class="alert alert-error">Inward barcode register is not enabled — '
-         . 'run migration_2026_08_06_inward_items.sql.</div>';
+    if (!inwHasTable()) {
+        return '<div class="alert alert-error">Inward barcode register is not enabled — '
+             . 'run migration_2026_08_06_inward_items.sql.</div>';
+    }
+    return '<div class="alert alert-error">Quantity tracking is not enabled — '
+         . 'run migration_2026_08_06_inward_qty.sql. Until then quantities show as 0 '
+         . 'and imports are blocked.</div>';
+}
+
+// Plain-text twin of inwMigrationNotice(), for flash()/redirect paths.
+function inwSchemaFlash(): string {
+    return inwHasTable()
+        ? 'Quantity tracking is not enabled — run migration_2026_08_06_inward_qty.sql.'
+        : 'Inward barcode register is not enabled — run migration_2026_08_06_inward_items.sql.';
+}
+
+// Both page and write paths gate on this pair.
+function inwSchemaReady(): bool {
+    return inwHasTable() && inwHasQtyCol();
 }
 
 // ── Field parsing / validation ───────────────────────────
@@ -493,7 +526,7 @@ function inwInsertRows(array $rows, string $source): int {
 function doInwardItemAdd(): void {
     $back = 'index.php?page=inward_item_new';
     if (!inwCanCreate())  { flash('error', 'Access denied.');   header('Location: index.php?page=inward_items'); exit; }
-    if (!inwHasTable())   { flash('error', 'Inward barcode register is not enabled — run migration_2026_08_06_inward_items.sql.');
+    if (!inwSchemaReady()) { flash('error', inwSchemaFlash());
                             header('Location: index.php?page=inward_items'); exit; }
 
     $codes    = $_POST['item_code'] ?? [];
@@ -557,6 +590,7 @@ function doInwardItemAdd(): void {
 
     try {
         $ins = inwInsertRows($rows, 'form');
+        inwNotifyNewBatches($rows, 'form');
         flash('success', "Saved {$ins} batch row(s).");
         header('Location: index.php?page=inward_items&view=1'); exit;
     } catch (Exception $e) {
@@ -575,7 +609,7 @@ function doInwardItemAdd(): void {
 function doInwardItemImport(): void {
     $back = 'index.php?page=inward_items&view=1';
     if (!inwCanCreate()) { flash('error', 'Access denied.'); header('Location: ' . $back); exit; }
-    if (!inwHasTable())  { flash('error', 'Inward barcode register is not enabled — run migration_2026_08_06_inward_items.sql.');
+    if (!inwSchemaReady()) { flash('error', inwSchemaFlash());
                            header('Location: ' . $back); exit; }
 
     if (!isset($_FILES['csv']) || $_FILES['csv']['error'] !== UPLOAD_ERR_OK) {
@@ -715,6 +749,10 @@ function doInwardItemImport(): void {
 
     try {
         $ins = inwInsertRows($rows, 'import');
+        // After the commit — a mail problem must never lose an import that
+        // already landed. sendSmtpEmailQuiet queues and drains after the
+        // response, so the user isn't held up by SMTP either.
+        inwNotifyNewBatches($rows, 'import');
         flash('success', "Imported {$ins} batch row(s).");
     } catch (Exception $e) {
         flash('error', 'Import failed: ' . $e->getMessage());
@@ -951,6 +989,80 @@ function inwBuildDigestEmail(array $today, array $overdue): string {
          . '</div>';
 }
 
+// ── New-batch notification ───────────────────────────────
+// Fired once per import or form save, never once per row: a 52-row sheet
+// produces one email, not 52. Until this existed the only sign that work
+// had arrived was the dashboard widget, which a validator only sees if
+// they happen to log in and look.
+//
+// Sent after the rows are committed and deliberately never blocks the
+// entry: a mail failure must not lose an import that already succeeded.
+function inwNotifyNewBatches(array $rows, string $source): void {
+    if (!$rows) return;
+    $emails = inwGetNotifyEmails();
+    if (!$emails) {
+        error_log('[inward_items] ' . count($rows) . ' new batch row(s) but InwardBarcodeNotifyEmails is empty');
+        return;
+    }
+
+    // Roll the lines up by item code so the mail reads as a summary rather
+    // than a dump — the detail is a click away in the pending queue.
+    $byCode = [];
+    $totalQty = 0;
+    foreach ($rows as $r) {
+        $code = (string)$r['item_code'];
+        if (!isset($byCode[$code])) {
+            $byCode[$code] = ['name' => (string)($r['item_name'] ?? ''), 'batches' => 0, 'qty' => 0];
+        }
+        if ($byCode[$code]['name'] === '' && trim((string)($r['item_name'] ?? '')) !== '') {
+            $byCode[$code]['name'] = (string)$r['item_name'];
+        }
+        $byCode[$code]['batches']++;
+        $byCode[$code]['qty'] += (int)$r['qty'];
+        $totalQty             += (int)$r['qty'];
+    }
+    ksort($byCode);
+
+    $n    = count($rows);
+    $who  = trim(myName()) !== '' ? myName() : myCode();
+    $verb = $source === 'import' ? 'imported' : 'entered';
+    $base = rtrim((string)getSetting('AppBaseUrl', ''), '/');
+
+    $subject = $n . ' inward barcode' . ($n === 1 ? '' : 's') . ' awaiting ERP update';
+
+    $body = "<div style='font:14px/1.6 Arial,sans-serif;color:#222'>"
+          . "<h2 style='font:600 18px/1.4 Arial,sans-serif;margin:0 0 6px'>New inward barcodes to enter in the ERP</h2>"
+          . "<p style='margin:0 0 14px;color:#555'>"
+          . h($who) . ' ' . h($verb) . ' <b>' . $n . '</b> batch row' . ($n === 1 ? '' : 's')
+          . ' (total qty <b>' . $totalQty . '</b>) on ' . h(date('d M Y')) . '. '
+          . '<b>' . count($byCode) . '</b> item code' . (count($byCode) === 1 ? '' : 's')
+          . ', all awaiting ERP entry.</p>'
+          . "<table cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;font:13px/1.5 Arial,sans-serif'>"
+          . "<thead><tr style='background:#fafafa'>"
+          . "<th style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'>Code</th>"
+          . "<th style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'>Item</th>"
+          . "<th style='padding:6px 8px;text-align:right;border-bottom:1px solid #ddd'>Batches</th>"
+          . "<th style='padding:6px 8px;text-align:right;border-bottom:1px solid #ddd'>Qty</th>"
+          . '</tr></thead><tbody>';
+    foreach ($byCode as $code => $g) {
+        $body .= '<tr>'
+               . "<td style='padding:5px 8px;border-bottom:1px solid #eee;font-family:monospace'>" . h($code) . '</td>'
+               . "<td style='padding:5px 8px;border-bottom:1px solid #eee'>" . (h($g['name']) ?: '—') . '</td>'
+               . "<td style='padding:5px 8px;border-bottom:1px solid #eee;text-align:right'>" . (int)$g['batches'] . '</td>'
+               . "<td style='padding:5px 8px;border-bottom:1px solid #eee;text-align:right'>" . (int)$g['qty'] . '</td>'
+               . '</tr>';
+    }
+    $body .= '</tbody></table>';
+    if ($base !== '') {
+        $body .= "<p style='margin:16px 0 0'><a href='"
+               . h($base . '/index.php?page=inward_items&view=1&due=&status=pending')
+               . "' style='color:#1a8fe3'>Open the pending queue</a></p>";
+    }
+    $body .= "<p style='margin:22px 0 0;color:#888;font-size:12px'>Work Pulse · Price Variation › Inward Items</p></div>";
+
+    foreach ($emails as $e) sendSmtpEmailQuiet($e, $subject, $body);
+}
+
 // Returns the number of barcodes reported. 0 means nothing to report, or
 // no recipients configured — in the latter case nothing is stamped, so
 // the rows stay queued for the next run once the setting is filled in.
@@ -1052,7 +1164,7 @@ function inwPageStyles(): void {
 // ── Page: list ───────────────────────────────────────────
 function pageInwardItems(): void {
     if (!inwCanEnter()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
-    if (!inwHasTable()) { echo inwMigrationNotice(); return; }
+    if (!inwSchemaReady()) { echo inwMigrationNotice(); return; }
 
     $f      = inwResolveFilter();
     $res    = inwGetTree($f);
@@ -1297,7 +1409,7 @@ document.querySelectorAll('.inw-tree .inw-head.inw-due').forEach(function(h){
 // ── Page: entry form ─────────────────────────────────────
 function pageInwardItemNew(): void {
     if (!inwCanCreate()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
-    if (!inwHasTable()) { echo inwMigrationNotice(); return; }
+    if (!inwSchemaReady()) { echo inwMigrationNotice(); return; }
     inwPageStyles();
 ?>
 <div class="page-header" style="display:flex;align-items:center;gap:12px">
@@ -1422,7 +1534,7 @@ inwAddRow();
 // ── Page: detail + validator actions ─────────────────────
 function pageInwardItemDetail(): void {
     if (!inwCanEnter()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
-    if (!inwHasTable()) { echo inwMigrationNotice(); return; }
+    if (!inwSchemaReady()) { echo inwMigrationNotice(); return; }
 
     $r = inwGetItem((int)($_GET['id'] ?? 0));
     if (!$r) { echo '<div class="alert alert-error">Record not found.</div>'; return; }
