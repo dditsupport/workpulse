@@ -356,7 +356,7 @@ function allowedPages(): array {
         $pages[] = 'audit_approve';
     }
     if (isSuperadmin() || hasTxn('audit_operation')) {
-        $pages[] = 'audit_operation_review';
+        $pages = array_merge($pages, ['audit_operation_review', 'location_managers', 'export_location_managers']);
     }
     if (isSuperadmin() || hasTxn('audit_management')) {
         $pages[] = 'audit_management_review';
@@ -883,6 +883,7 @@ function dispatchPage(string $page): void {
         case 'audit_annotation_thread': if (function_exists('pageAuditAnnotationThread')) pageAuditAnnotationThread(); break;
         case 'audit_templates':   if (function_exists('pageAuditTemplates'))  pageAuditTemplates();  break;
         case 'location_managers': if (function_exists('pageLocationManagers')) pageLocationManagers(); break;
+        case 'export_location_managers': if (function_exists('exportLocationManagersCsv')) exportLocationManagersCsv(); break;
         case 'audit_categories':  if (function_exists('pageAuditCategories')) pageAuditCategories(); break;
         case 'audit_parameters':  if (function_exists('pageAuditParameters')) pageAuditParameters(); break;
         case 'audit_param_history': if (function_exists('pageAuditParamHistory')) pageAuditParamHistory(); break;
