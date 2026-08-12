@@ -56,9 +56,42 @@ function inwHasTable(): bool {
     return $cached;
 }
 
+// Separate check for the qty column, because the table can exist from the
+// first migration while the qty one hasn't been applied. Without this the
+// symptom is opaque: the tree quietly reports qty 0 for everything and any
+// import dies on "Unknown column 'qty'" from deep inside a transaction.
+function inwHasQtyCol(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        getDb()->query('SELECT qty FROM inward_items LIMIT 0')->fetch();
+        $cached = true;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
 function inwMigrationNotice(): string {
-    return '<div class="alert alert-error">Inward barcode register is not enabled — '
-         . 'run migration_2026_08_06_inward_items.sql.</div>';
+    if (!inwHasTable()) {
+        return '<div class="alert alert-error">Inward barcode register is not enabled — '
+             . 'run migration_2026_08_06_inward_items.sql.</div>';
+    }
+    return '<div class="alert alert-error">Quantity tracking is not enabled — '
+         . 'run migration_2026_08_06_inward_qty.sql. Until then quantities show as 0 '
+         . 'and imports are blocked.</div>';
+}
+
+// Plain-text twin of inwMigrationNotice(), for flash()/redirect paths.
+function inwSchemaFlash(): string {
+    return inwHasTable()
+        ? 'Quantity tracking is not enabled — run migration_2026_08_06_inward_qty.sql.'
+        : 'Inward barcode register is not enabled — run migration_2026_08_06_inward_items.sql.';
+}
+
+// Both page and write paths gate on this pair.
+function inwSchemaReady(): bool {
+    return inwHasTable() && inwHasQtyCol();
 }
 
 // ── Field parsing / validation ───────────────────────────
@@ -493,7 +526,7 @@ function inwInsertRows(array $rows, string $source): int {
 function doInwardItemAdd(): void {
     $back = 'index.php?page=inward_item_new';
     if (!inwCanCreate())  { flash('error', 'Access denied.');   header('Location: index.php?page=inward_items'); exit; }
-    if (!inwHasTable())   { flash('error', 'Inward barcode register is not enabled — run migration_2026_08_06_inward_items.sql.');
+    if (!inwSchemaReady()) { flash('error', inwSchemaFlash());
                             header('Location: index.php?page=inward_items'); exit; }
 
     $codes    = $_POST['item_code'] ?? [];
@@ -575,7 +608,7 @@ function doInwardItemAdd(): void {
 function doInwardItemImport(): void {
     $back = 'index.php?page=inward_items&view=1';
     if (!inwCanCreate()) { flash('error', 'Access denied.'); header('Location: ' . $back); exit; }
-    if (!inwHasTable())  { flash('error', 'Inward barcode register is not enabled — run migration_2026_08_06_inward_items.sql.');
+    if (!inwSchemaReady()) { flash('error', inwSchemaFlash());
                            header('Location: ' . $back); exit; }
 
     if (!isset($_FILES['csv']) || $_FILES['csv']['error'] !== UPLOAD_ERR_OK) {
@@ -1052,7 +1085,7 @@ function inwPageStyles(): void {
 // ── Page: list ───────────────────────────────────────────
 function pageInwardItems(): void {
     if (!inwCanEnter()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
-    if (!inwHasTable()) { echo inwMigrationNotice(); return; }
+    if (!inwSchemaReady()) { echo inwMigrationNotice(); return; }
 
     $f      = inwResolveFilter();
     $res    = inwGetTree($f);
@@ -1297,7 +1330,7 @@ document.querySelectorAll('.inw-tree .inw-head.inw-due').forEach(function(h){
 // ── Page: entry form ─────────────────────────────────────
 function pageInwardItemNew(): void {
     if (!inwCanCreate()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
-    if (!inwHasTable()) { echo inwMigrationNotice(); return; }
+    if (!inwSchemaReady()) { echo inwMigrationNotice(); return; }
     inwPageStyles();
 ?>
 <div class="page-header" style="display:flex;align-items:center;gap:12px">
@@ -1422,7 +1455,7 @@ inwAddRow();
 // ── Page: detail + validator actions ─────────────────────
 function pageInwardItemDetail(): void {
     if (!inwCanEnter()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
-    if (!inwHasTable()) { echo inwMigrationNotice(); return; }
+    if (!inwSchemaReady()) { echo inwMigrationNotice(); return; }
 
     $r = inwGetItem((int)($_GET['id'] ?? 0));
     if (!$r) { echo '<div class="alert alert-error">Record not found.</div>'; return; }
