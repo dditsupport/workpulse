@@ -1,14 +1,43 @@
 <?php
 // =========================================================
 // Location manager mapping — one store manager and one operation
-// manager per location. Maintained by the Operation Review role
-// (txn_audit_operation); audit_new auto-fills the Store Manager from
-// this map. The operation manager is recorded here for reference and
+// manager per location. Every logged-in user reads the list (it is the
+// company's "who runs this store" lookup); only the Operation Review
+// permission edits it. audit_new auto-fills the Store Manager from this
+// map. The operation manager is recorded here for reference and
 // reporting; nothing auto-fills from it yet.
 // =========================================================
 
+// The single permission that unlocks editing on this page. Named once so
+// the page can tell read-only viewers what to ask for.
+const LOCMGR_EDIT_TXN = 'audit_operation';
+
 function locMgrCanManage(): bool {
-    return isSuperadmin() || hasTxn('audit_operation');
+    return isSuperadmin() || hasTxn(LOCMGR_EDIT_TXN);
+}
+
+// The permission's label as the Roles page prints it, so the two pages
+// call the same checkbox by the same name. Falls back to the column name
+// if roles.php ever stops listing it.
+function locMgrEditTxnLabel(): string {
+    global $txnGroups;
+    foreach ((array)$txnGroups as $items) {
+        if (isset($items['txn_' . LOCMGR_EDIT_TXN])) return (string)$items['txn_' . LOCMGR_EDIT_TXN];
+    }
+    return 'txn_' . LOCMGR_EDIT_TXN;
+}
+
+// Active roles holding the edit permission — shown to read-only viewers so
+// "who do I ask?" has an answer on the page. Empty if the column or table
+// is not readable, in which case the page names the permission only.
+function locMgrEditorRoles(): array {
+    try {
+        $rows = getDb()->query('SELECT role_name FROM roles WHERE is_active = 1 AND txn_' . LOCMGR_EDIT_TXN . ' = 1 ORDER BY role_name')
+                       ->fetchAll(PDO::FETCH_COLUMN);
+    } catch (Exception $e) {
+        return [];
+    }
+    return array_map('strval', $rows);
 }
 
 // operation_manager_code arrives with 2026-08-15_location_operation_manager.sql.
@@ -151,7 +180,8 @@ function doDeleteLocationManager(): void {
 
 // ── CSV export of the mapping table (one row per active location) ─
 function exportLocationManagersCsv(): void {
-    if (!locMgrCanManage()) { http_response_code(403); echo 'Access denied.'; return; }
+    // Same data the page shows, and the page is readable by everyone —
+    // the routing gate in allowedPages() is the only check needed.
     $hasOps = locMgrHasOpsColumn();
     $mapped = locMgrMappings();
     try {
@@ -185,31 +215,51 @@ function exportLocationManagersCsv(): void {
 
 // ── Page ─────────────────────────────────────────────────
 function pageLocationManagers(): void {
-    if (!locMgrCanManage()) { echo '<p>Access denied.</p>'; return; }
+    $canEdit   = locMgrCanManage();
     $hasOps    = locMgrHasOpsColumn();
     $locations = getActiveLocations();
-    $employees = array_values(array_filter(getEmployeesLite(), fn($e) => !empty($e['is_active'])));
     $mapped    = locMgrMappings();
 
     // location_id => the two pickers' hidden value + visible label, so
     // picking a location refills the form with what is already mapped
     // instead of silently overwriting the half the user did not touch.
-    $formMap = [];
-    foreach ($mapped as $lid => $m) {
-        $formMap[(string)$lid] = [
-            'sm'      => $m['sm'],
-            'smLabel' => $m['sm'] === '' ? '' : $m['sm_name'] . ' (' . $m['sm'] . ')',
-            'om'      => $m['om'],
-            'omLabel' => $m['om'] === '' ? '' : $m['om_name'] . ' (' . $m['om'] . ')',
-        ];
+    // Only editors get the form, so only they need the employee list.
+    $employees = [];
+    $formMap   = [];
+    if ($canEdit) {
+        $employees = array_values(array_filter(getEmployeesLite(), fn($e) => !empty($e['is_active'])));
+        foreach ($mapped as $lid => $m) {
+            $formMap[(string)$lid] = [
+                'sm'      => $m['sm'],
+                'smLabel' => $m['sm'] === '' ? '' : $m['sm_name'] . ' (' . $m['sm'] . ')',
+                'om'      => $m['om'],
+                'omLabel' => $m['om'] === '' ? '' : $m['om_name'] . ' (' . $m['om'] . ')',
+            ];
+        }
     }
 ?>
 <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
     <h2 style="margin:0">🏬 Store Manager Mapping</h2>
     <a href="?page=export_location_managers" class="btn btn-secondary btn-sm">Export CSV</a>
 </div>
-<p class="text-muted" style="font-size:12px;margin-bottom:12px">Map a store manager<?= $hasOps ? ' and an operation manager' : '' ?> to each location. Create Audit auto-fills the store manager from here (still editable).</p>
+<p class="text-muted" style="font-size:12px;margin-bottom:12px">
+    Who runs each store: a store manager<?= $hasOps ? ' and an operation manager' : '' ?> per location. Create Audit auto-fills the store manager from here (still editable).
+    <?php
+    // Always name the permission that unlocks editing — editors see why they
+    // can, everyone else sees what to ask for and who already has it.
+    $editorRoles = locMgrEditorRoles();
+    $who   = $editorRoles ? ' Held by: ' . h(implode(', ', $editorRoles)) . '.' : '';
+    $txnLb = h(locMgrEditTxnLabel());
+    ?>
+    <br>
+    <?php if ($canEdit): ?>
+        You can edit this list — the <strong><?= $txnLb ?></strong> permission (<code>txn_<?= h(LOCMGR_EDIT_TXN) ?></code>) allows it.<?= $who ?>
+    <?php else: ?>
+        Read-only for you. Editing needs the <strong><?= $txnLb ?></strong> permission (<code>txn_<?= h(LOCMGR_EDIT_TXN) ?></code>) on your role.<?= $who ?>
+    <?php endif; ?>
+</p>
 
+<?php if ($canEdit): ?>
 <div class="form-card" style="margin-bottom:16px;max-width:none">
     <h3 style="font-size:15px;margin-bottom:12px">Set / update mapping</h3>
     <form method="POST" id="lmForm" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
@@ -246,6 +296,7 @@ function pageLocationManagers(): void {
         <button type="submit" class="btn btn-primary">Save mapping</button>
     </form>
 </div>
+<?php endif; ?>
 
 <div class="table-wrap" data-stack>
     <table class="table" style="font-size:13px">
@@ -253,7 +304,7 @@ function pageLocationManagers(): void {
             <th>Location</th>
             <th style="width:280px">Store Manager</th>
             <?php if ($hasOps): ?><th style="width:280px">Operation Manager</th><?php endif; ?>
-            <th style="width:120px"></th>
+            <?php if ($canEdit): ?><th style="width:120px"></th><?php endif; ?>
         </tr></thead>
         <tbody>
         <?php foreach ($locations as $l): $lid = (int)$l['location_id']; $m = $mapped[$lid] ?? null; ?>
@@ -263,6 +314,7 @@ function pageLocationManagers(): void {
                 <?php if ($hasOps): ?>
                 <td><?= ($m && $m['om'] !== '') ? h($m['om_name']) . ' <span class="text-muted">(' . h($m['om']) . ')</span>' : '<span class="text-muted">— not set —</span>' ?></td>
                 <?php endif; ?>
+                <?php if ($canEdit): ?>
                 <td style="white-space:nowrap">
                     <button type="button" class="btn btn-ghost btn-sm" onclick="lmEdit(<?= $lid ?>)"><?= $m ? 'Edit' : 'Set' ?></button>
                     <?php if ($m): ?>
@@ -273,12 +325,14 @@ function pageLocationManagers(): void {
                     </form>
                     <?php endif; ?>
                 </td>
+                <?php endif; ?>
             </tr>
         <?php endforeach; ?>
         </tbody>
     </table>
 </div>
 
+<?php if ($canEdit): ?>
 <script>
 (function () {
     var data = <?= json_encode(array_map(fn($e) => ['code' => (string)$e['employee_code'], 'name' => (string)$e['full_name']], $employees), JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
@@ -357,4 +411,5 @@ function pageLocationManagers(): void {
     };
 })();
 </script>
+<?php endif; ?>
 <?php }
