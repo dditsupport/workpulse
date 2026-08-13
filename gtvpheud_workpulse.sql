@@ -844,6 +844,20 @@ CREATE TABLE `locations` (
 -- --------------------------------------------------------
 
 --
+-- Table structure for table `location_executives`
+--
+
+CREATE TABLE `location_executives` (
+  `location_id` int(11) NOT NULL,
+  `employee_code` varchar(20) NOT NULL,
+  `sort_order` tinyint(3) UNSIGNED NOT NULL DEFAULT 0,
+  `updated_by` varchar(20) DEFAULT NULL,
+  `updated_at` datetime DEFAULT current_timestamp() ON UPDATE current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
 -- Table structure for table `location_managers`
 --
 
@@ -1773,6 +1787,13 @@ ALTER TABLE `issue_status_logs`
 ALTER TABLE `locations`
   ADD PRIMARY KEY (`location_id`),
   ADD UNIQUE KEY `uq_location_name` (`location_name`);
+
+--
+-- Indexes for table `location_executives`
+--
+ALTER TABLE `location_executives`
+  ADD PRIMARY KEY (`location_id`,`employee_code`),
+  ADD KEY `idx_loc_exec_order` (`location_id`,`sort_order`);
 
 --
 -- Indexes for table `location_managers`
