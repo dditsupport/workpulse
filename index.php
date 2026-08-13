@@ -121,6 +121,7 @@ function routePost(string $a): void {
         // Store manager mapping
         case 'save_location_manager':   if (function_exists('doSaveLocationManager'))   doSaveLocationManager();   break;
         case 'delete_location_manager': if (function_exists('doDeleteLocationManager')) doDeleteLocationManager(); break;
+        case 'import_location_managers': if (function_exists('doImportLocationManagers')) doImportLocationManagers(); break;
         // Time tracking
         case 'save_time_entry':   if (function_exists('doSaveTimeEntry'))   doSaveTimeEntry();   break;
         case 'delete_time_entry': if (function_exists('doDeleteTimeEntry')) doDeleteTimeEntry(); break;

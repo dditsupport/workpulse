@@ -312,6 +312,213 @@ function exportLocationManagersCsv(): void {
     exit;
 }
 
+// ── CSV import — same shape the export writes ────────────
+// Roles as the export spells them: "Store Manager", "Operation Manager",
+// "Store Executive N". Returns 'sm' | 'om' | 'exec' | '' (unrecognised),
+// and the executive's position when the role carries one.
+function locMgrParseRole(string $raw, ?int &$pos = null): string {
+    $pos = null;
+    $r = strtolower(trim(preg_replace('/\s+/', ' ', $raw)));
+    $r = trim($r, ".:-");
+    if ($r === '') return '';
+    if (in_array($r, ['store manager', 'storemanager', 'sm', 'manager'], true)) return 'sm';
+    if (in_array($r, ['operation manager', 'operations manager', 'operation', 'om'], true)) return 'om';
+    if (preg_match('/^(?:store )?exec(?:utive)?\s*(\d+)?$/', $r, $mm)) {
+        if (isset($mm[1]) && $mm[1] !== '') $pos = (int)$mm[1];
+        return 'exec';
+    }
+    return '';
+}
+
+function doImportLocationManagers(): void {
+    $back = 'index.php?page=location_managers';
+    if (!locMgrCanManage()) { flash('error', 'Access denied.'); header('Location: index.php'); exit; }
+    if (!locMgrHasExecTable() || !locMgrHasOpsColumn()) {
+        flash('error', 'Run the pending database migrations before importing.');
+        header("Location: $back"); exit;
+    }
+    if (empty($_FILES['csv']['name']) || $_FILES['csv']['error'] !== UPLOAD_ERR_OK) {
+        flash('error', 'No file uploaded or upload error.'); header("Location: $back"); exit;
+    }
+    $fh = @fopen($_FILES['csv']['tmp_name'], 'r');
+    if (!$fh) { flash('error', 'Could not read uploaded file.'); header("Location: $back"); exit; }
+
+    $fail = function (string $msg) use ($fh, $back) {
+        if (is_resource($fh)) fclose($fh);
+        flash('error', $msg);
+        header("Location: $back"); exit;
+    };
+
+    // Header row — lowercase keys, BOM stripped, so a file straight out of
+    // Excel lines up with the export's own column names.
+    $header = fgetcsv($fh, 0, ',', '"', '');
+    if (!$header) $fail('File is empty or unreadable.');
+    $header[0] = preg_replace('/^\xEF\xBB\xBF/', '', (string)$header[0]);
+    $idx = [];
+    foreach ($header as $i => $col) {
+        $key = strtolower(trim((string)$col));
+        if ($key !== '') $idx[$key] = $i;
+    }
+    if (!isset($idx['location']) && !isset($idx['location code'])) {
+        $fail('Missing a "Location" or "Location Code" column. Export CSV first to get the expected format.');
+    }
+    if (!isset($idx['role'])) $fail('Missing the "Role" column. Export CSV first to get the expected format.');
+    if (!isset($idx['employee code']) && !isset($idx['employee'])) {
+        $fail('Missing an "Employee Code" or "Employee" column. Export CSV first to get the expected format.');
+    }
+
+    $db = getDb();
+    // Lookups: locations by code and by name, employees by code and by name.
+    // Names are matched case-insensitively and only when unambiguous.
+    $locByCode = []; $locByName = [];
+    foreach ($db->query('SELECT location_id, location_code, location_name FROM locations')->fetchAll(PDO::FETCH_ASSOC) as $l) {
+        $c = strtolower(trim((string)($l['location_code'] ?? '')));
+        $n = strtolower(trim((string)$l['location_name']));
+        if ($c !== '') $locByCode[$c] = (int)$l['location_id'];
+        if ($n !== '') $locByName[$n][] = (int)$l['location_id'];
+    }
+    $empActive = []; $empByName = [];
+    foreach ($db->query('SELECT employee_code, full_name, is_active FROM employees')->fetchAll(PDO::FETCH_ASSOC) as $e) {
+        $code = trim((string)$e['employee_code']);
+        if ($code === '') continue;
+        $empActive[$code] = (int)($e['is_active'] ?? 0);
+        $n = strtolower(trim((string)$e['full_name']));
+        if ($n !== '') $empByName[$n][] = $code;
+    }
+
+    // Parse the whole file before touching anything, so a bad line on row
+    // 400 does not leave the first 399 applied.
+    $plan     = [];   // location_id => ['sm'=>, 'om'=>, 'execs'=>[[pos,idx,code],…]]
+    $order    = [];   // location_id => first line seen, for the summary
+    $inactive = [];   // employee codes accepted but no longer active
+    $line = 1; $seq = 0;
+    while (($r = fgetcsv($fh, 0, ',', '"', '')) !== false) {
+        $line++;
+        if (count($r) === 1 && trim((string)$r[0]) === '') continue; // blank line
+        $get = fn(string $k) => isset($idx[$k]) && isset($r[$idx[$k]]) ? trim((string)$r[$idx[$k]]) : '';
+
+        $lCode = $get('location code');
+        $lName = $get('location');
+        $roleR = $get('role');
+        $eName = $get('employee');
+        $eCode = $get('employee code');
+
+        // Resolve the location: code wins, name is the fallback.
+        $lid = null;
+        if ($lCode !== '' && isset($locByCode[strtolower($lCode)])) {
+            $lid = $locByCode[strtolower($lCode)];
+        } elseif ($lName !== '') {
+            $hits = $locByName[strtolower($lName)] ?? [];
+            if (count($hits) === 1) $lid = $hits[0];
+            elseif (count($hits) > 1) $fail("Line {$line}: more than one location is named \"{$lName}\" — use the Location Code column.");
+        }
+        if ($lid === null) {
+            $what = $lCode !== '' ? "code \"{$lCode}\"" : "name \"{$lName}\"";
+            $fail("Line {$line}: no location matches {$what}.");
+        }
+        if (!isset($plan[$lid])) { $plan[$lid] = ['sm' => '', 'om' => '', 'execs' => []]; $order[$lid] = $line; }
+
+        // A row with no role and no person is the export's placeholder for
+        // an unassigned store — it means "this store has nobody", not an error.
+        if ($roleR === '' && $eName === '' && $eCode === '') continue;
+
+        $pos  = null;
+        $role = locMgrParseRole($roleR, $pos);
+        if ($role === '') $fail("Line {$line}: unrecognised Role \"{$roleR}\". Use Store Manager, Operation Manager, or Store Executive.");
+
+        // Resolve the employee: code wins, name is the fallback.
+        $code = '';
+        if ($eCode !== '' && isset($empActive[$eCode])) {
+            $code = $eCode;
+        } elseif ($eCode !== '') {
+            $fail("Line {$line}: no employee has the code \"{$eCode}\".");
+        } elseif ($eName !== '') {
+            $hits = $empByName[strtolower($eName)] ?? [];
+            if (count($hits) === 1) $code = $hits[0];
+            elseif (count($hits) > 1) $fail("Line {$line}: more than one employee is named \"{$eName}\" — use the Employee Code column.");
+            else $fail("Line {$line}: no employee is named \"{$eName}\".");
+        } else {
+            $fail("Line {$line}: Role \"{$roleR}\" has no employee against it.");
+        }
+        // Deactivated staff are accepted: an export of a store whose manager
+        // has since left must stay importable. They are counted and reported.
+        if (!$empActive[$code]) $inactive[$code] = true;
+
+        if ($role === 'sm') {
+            if ($plan[$lid]['sm'] !== '') $fail("Line {$line}: two Store Manager rows for the same location.");
+            $plan[$lid]['sm'] = $code;
+        } elseif ($role === 'om') {
+            if ($plan[$lid]['om'] !== '') $fail("Line {$line}: two Operation Manager rows for the same location.");
+            $plan[$lid]['om'] = $code;
+        } else {
+            foreach ($plan[$lid]['execs'] as $x) {
+                if ($x[2] === $code) $fail("Line {$line}: \"{$code}\" is listed twice as a store executive for the same location.");
+            }
+            // Numbered roles ("Store Executive 3") order the tree; unnumbered
+            // ones keep file order behind them.
+            $plan[$lid]['execs'][] = [$pos ?? PHP_INT_MAX, $seq++, $code];
+        }
+    }
+    fclose($fh);
+    if (!$plan) { flash('error', 'No data rows found in file.'); header("Location: $back"); exit; }
+
+    // Whole-file checks that only make sense once a location's rows are all in.
+    foreach ($plan as $lid => $p) {
+        if (count($p['execs']) > LOCMGR_MAX_EXECS) {
+            $fail('Location on line ' . $order[$lid] . ' has ' . count($p['execs']) . ' store executives; the limit is ' . LOCMGR_MAX_EXECS . '.');
+        }
+        foreach ($p['execs'] as $x) {
+            if ($p['sm'] !== '' && $x[2] === $p['sm']) {
+                $fail('Location on line ' . $order[$lid] . ': "' . $p['sm'] . '" is both the store manager and a store executive.');
+            }
+        }
+    }
+
+    $saved = 0; $cleared = 0;
+    try {
+        $db->beginTransaction();
+        $up = $db->prepare(
+            'INSERT INTO location_managers (location_id, store_manager_code, operation_manager_code, updated_by)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE store_manager_code = VALUES(store_manager_code),
+                                     operation_manager_code = VALUES(operation_manager_code),
+                                     updated_by = VALUES(updated_by)'
+        );
+        $delMgr  = $db->prepare('DELETE FROM location_managers WHERE location_id = ?');
+        $delExec = $db->prepare('DELETE FROM location_executives WHERE location_id = ?');
+        $insExec = $db->prepare('INSERT INTO location_executives (location_id, employee_code, sort_order, updated_by) VALUES (?, ?, ?, ?)');
+
+        foreach ($plan as $lid => $p) {
+            // Sort by the role's number, then by the order read from the file.
+            usort($p['execs'], fn($a, $b) => [$a[0], $a[1]] <=> [$b[0], $b[1]]);
+            $delExec->execute([$lid]);
+            if ($p['sm'] === '' && $p['om'] === '' && !$p['execs']) {
+                // The file lists this store with nobody on it — same outcome
+                // as the Clear button.
+                $delMgr->execute([$lid]);
+                $cleared++;
+                continue;
+            }
+            $up->execute([$lid, $p['sm'], ($p['om'] === '' ? null : $p['om']), myCode()]);
+            foreach ($p['execs'] as $i => $x) $insExec->execute([$lid, $x[2], $i, myCode()]);
+            $saved++;
+        }
+        $db->commit();
+    } catch (Exception $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        flash('error', 'Import failed, nothing was changed: ' . $e->getMessage());
+        header("Location: $back"); exit;
+    }
+
+    $msg = "Imported {$saved} location" . ($saved === 1 ? '' : 's');
+    if ($cleared) $msg .= ", cleared {$cleared}";
+    $msg .= '. Locations absent from the file were left alone.';
+    if ($inactive) $msg .= ' ' . count($inactive) . ' mapped employee(s) are no longer active: ' . h(implode(', ', array_keys($inactive))) . '.';
+    $msg .= ' The Mobile column is read-only here — update numbers on the Employees page.';
+    flash('success', $msg);
+    header("Location: $back"); exit;
+}
+
 // ── Page ─────────────────────────────────────────────────
 function pageLocationManagers(): void {
     $canEdit   = locMgrCanManage();
@@ -377,8 +584,47 @@ function pageLocationManagers(): void {
 </style>
 <div class="page-header" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
     <h2 style="margin:0">🏬 Store Manager Mapping</h2>
-    <a href="?page=export_location_managers" class="btn btn-secondary btn-sm">Export CSV</a>
+    <div style="display:flex;gap:8px;align-items:center">
+        <a href="?page=export_location_managers" class="btn btn-secondary btn-sm">Export CSV</a>
+        <?php if ($canEdit && $hasExec && $hasOps): ?>
+        <button type="button" class="btn btn-primary btn-sm" onclick="lmToggleImport()">Import CSV</button>
+        <?php endif; ?>
+    </div>
 </div>
+
+<?php if ($canEdit && $hasExec && $hasOps): ?>
+<div class="form-card" id="lmImportCard" style="display:none;margin-bottom:16px;max-width:none">
+    <h3 style="font-size:15px;margin-bottom:4px">Import mapping (CSV)</h3>
+    <p class="text-muted" style="font-size:12px;margin:0 0 12px">
+        Takes the file <a href="?page=export_location_managers">Export CSV</a> produces — one row per person, columns
+        <code>Location Code, Location, Role, Employee, Employee Code, Mobile</code>.
+        Export it, edit it, import it back.
+    </p>
+    <ul class="text-muted" style="font-size:12px;margin:0 0 12px;padding-left:18px;line-height:1.7">
+        <li><strong>Role</strong> must read <code>Store Manager</code>, <code>Operation Manager</code> or <code>Store Executive</code> (a trailing number orders the tree).</li>
+        <li>Each location in the file is <strong>replaced by its rows</strong> — delete a person's row to unassign them. A location listed with no people is cleared.</li>
+        <li><strong>Locations missing from the file are left untouched</strong>, so you can import a few stores at a time.</li>
+        <li><code>Employee Code</code> identifies people; <code>Employee</code> name is used only when the code is blank, and must be unique. Same for <code>Location Code</code> / <code>Location</code>.</li>
+        <li>The <code>Mobile</code> column is <strong>ignored</strong> — phone numbers belong to the employee record, so change them on the Employees page.</li>
+        <li>Nothing is written unless the whole file is valid; the first bad line is reported with its line number.</li>
+    </ul>
+    <form method="POST" enctype="multipart/form-data" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
+        <input type="hidden" name="action" value="import_location_managers">
+        <div class="form-group" style="margin:0">
+            <label>CSV file</label>
+            <input type="file" name="csv" accept=".csv,text/csv" required class="form-control" style="width:320px">
+        </div>
+        <button type="submit" class="btn btn-primary">Import</button>
+        <button type="button" class="btn btn-secondary" onclick="lmToggleImport()">Cancel</button>
+    </form>
+</div>
+<script>
+function lmToggleImport() {
+    var c = document.getElementById('lmImportCard');
+    if (c) c.style.display = c.style.display === 'none' ? '' : 'none';
+}
+</script>
+<?php endif; ?>
 <?php if ($canEdit): ?>
 <div class="form-card" style="margin-bottom:16px;max-width:none">
     <h3 style="font-size:15px;margin-bottom:12px">Set / update mapping</h3>
