@@ -1169,6 +1169,7 @@ CREATE TABLE `roles` (
   `txn_dependencies` tinyint(1) NOT NULL DEFAULT 0,
   `txn_dept_roles` tinyint(1) NOT NULL DEFAULT 0,
   `txn_price_tags` tinyint(1) NOT NULL DEFAULT 0,
+  `txn_manager_mapping` tinyint(1) NOT NULL DEFAULT 0,
   `txn_audit_create` tinyint(1) NOT NULL DEFAULT 0,
   `txn_audit_approve` tinyint(1) NOT NULL DEFAULT 0,
   `txn_audit_operation` tinyint(1) NOT NULL DEFAULT 0,

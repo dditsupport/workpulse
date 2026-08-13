@@ -181,7 +181,7 @@ function buildNav(): array {
     if (hasTxn('shelf_life'))       $store[] = ['page' => 'shelf_life',       'icon' => navIcon('shelf'),  'label' => 'Shelf Life'];
     if (hasTxn('store_hours'))      $store[] = ['page' => 'store_hours',      'icon' => navIcon('clock'),  'label' => 'Store Hours'];
     if (hasTxn('price_tags'))       $store[] = ['page' => 'price_tags',       'icon' => navIcon('tag'),    'label' => 'Price Tags'];
-    // Who manages which store — everyone reads it, only txn_audit_operation
+    // Who manages which store — everyone reads it, only txn_manager_mapping
     // edits (the page hides the form and row actions for everyone else).
     // Lives here rather than under Audits because it is store reference data
     // that the whole company looks up, not an audit workflow step.

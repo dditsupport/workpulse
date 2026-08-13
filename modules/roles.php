@@ -37,7 +37,10 @@ $txnGroups = [
                            'txn_audit_summary' => 'Audit Summary'],
     'Store Operations' => ['txn_outlet_directory' => 'Outlet Directory', 'txn_shelf_life' => 'Shelf Life',
                            'txn_shelf_life_upload' => 'Shelf Life Upload', 'txn_store_hours' => 'Store Hours',
-                           'txn_price_tags' => 'Price Tags', 'txn_transactions_report' => 'Banking Cash Deposit Report'],
+                           'txn_price_tags' => 'Price Tags',
+                           // Read-only for everyone; this grants editing.
+                           'txn_manager_mapping' => 'Manager Mapping · Edit',
+                           'txn_transactions_report' => 'Banking Cash Deposit Report'],
     'Policy & Violation' => ['txn_policy_admin' => 'Policy Admin',
                               'txn_policy_dashboard' => 'Policy Consent Dashboard',
                               'txn_violations_view' => 'View All Violations',

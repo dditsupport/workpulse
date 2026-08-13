@@ -18,9 +18,12 @@
 // so the cap lives here and is enforced on save and in the form.
 const LOCMGR_MAX_EXECS = 8;
 
-// Editing is gated on txn_audit_operation; reading is open to everyone.
+// Reading is open to every logged-in user; editing needs txn_manager_mapping
+// (Store Operations → "Manager Mapping · Edit" on the Roles page). It used to
+// borrow txn_audit_operation from the audit workflow — 2026-08-17 splits that
+// off and seeds the new flag from the old one so nobody loses access.
 function locMgrCanManage(): bool {
-    return isSuperadmin() || hasTxn('audit_operation');
+    return isSuperadmin() || hasTxn('manager_mapping');
 }
 
 // operation_manager_code arrives with 2026-08-15_location_operation_manager.sql.
