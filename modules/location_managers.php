@@ -8,36 +8,9 @@
 // reporting; nothing auto-fills from it yet.
 // =========================================================
 
-// The single permission that unlocks editing on this page. Named once so
-// the page can tell read-only viewers what to ask for.
-const LOCMGR_EDIT_TXN = 'audit_operation';
-
+// Editing is gated on txn_audit_operation; reading is open to everyone.
 function locMgrCanManage(): bool {
-    return isSuperadmin() || hasTxn(LOCMGR_EDIT_TXN);
-}
-
-// The permission's label as the Roles page prints it, so the two pages
-// call the same checkbox by the same name. Falls back to the column name
-// if roles.php ever stops listing it.
-function locMgrEditTxnLabel(): string {
-    global $txnGroups;
-    foreach ((array)$txnGroups as $items) {
-        if (isset($items['txn_' . LOCMGR_EDIT_TXN])) return (string)$items['txn_' . LOCMGR_EDIT_TXN];
-    }
-    return 'txn_' . LOCMGR_EDIT_TXN;
-}
-
-// Active roles holding the edit permission — shown to read-only viewers so
-// "who do I ask?" has an answer on the page. Empty if the column or table
-// is not readable, in which case the page names the permission only.
-function locMgrEditorRoles(): array {
-    try {
-        $rows = getDb()->query('SELECT role_name FROM roles WHERE is_active = 1 AND txn_' . LOCMGR_EDIT_TXN . ' = 1 ORDER BY role_name')
-                       ->fetchAll(PDO::FETCH_COLUMN);
-    } catch (Exception $e) {
-        return [];
-    }
-    return array_map('strval', $rows);
+    return isSuperadmin() || hasTxn('audit_operation');
 }
 
 // operation_manager_code arrives with 2026-08-15_location_operation_manager.sql.
@@ -242,23 +215,6 @@ function pageLocationManagers(): void {
     <h2 style="margin:0">🏬 Store Manager Mapping</h2>
     <a href="?page=export_location_managers" class="btn btn-secondary btn-sm">Export CSV</a>
 </div>
-<p class="text-muted" style="font-size:12px;margin-bottom:12px">
-    Who runs each store: a store manager<?= $hasOps ? ' and an operation manager' : '' ?> per location. Create Audit auto-fills the store manager from here (still editable).
-    <?php
-    // Always name the permission that unlocks editing — editors see why they
-    // can, everyone else sees what to ask for and who already has it.
-    $editorRoles = locMgrEditorRoles();
-    $who   = $editorRoles ? ' Held by: ' . h(implode(', ', $editorRoles)) . '.' : '';
-    $txnLb = h(locMgrEditTxnLabel());
-    ?>
-    <br>
-    <?php if ($canEdit): ?>
-        You can edit this list — the <strong><?= $txnLb ?></strong> permission (<code>txn_<?= h(LOCMGR_EDIT_TXN) ?></code>) allows it.<?= $who ?>
-    <?php else: ?>
-        Read-only for you. Editing needs the <strong><?= $txnLb ?></strong> permission (<code>txn_<?= h(LOCMGR_EDIT_TXN) ?></code>) on your role.<?= $who ?>
-    <?php endif; ?>
-</p>
-
 <?php if ($canEdit): ?>
 <div class="form-card" style="margin-bottom:16px;max-width:none">
     <h3 style="font-size:15px;margin-bottom:12px">Set / update mapping</h3>
