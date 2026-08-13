@@ -312,7 +312,11 @@ function exportLocationManagersCsv(): void {
     exit;
 }
 
-// ── CSV import — same shape the export writes ────────────
+// ── CSV import — Location, Role, Employee Code ───────────
+// Reads only the three columns that decide the mapping. The export's
+// Employee and Mobile columns are there for people to read and are
+// ignored here: a name is not an identity (two employees share one), and
+// a phone number belongs to the employee record, not to this mapping.
 // Roles as the export spells them: "Store Manager", "Operation Manager",
 // "Store Executive N". Returns 'sm' | 'om' | 'exec' | '' (unrecognised),
 // and the executive's position when the role carries one.
@@ -363,13 +367,13 @@ function doImportLocationManagers(): void {
         $fail('Missing a "Location" or "Location Code" column. Export CSV first to get the expected format.');
     }
     if (!isset($idx['role'])) $fail('Missing the "Role" column. Export CSV first to get the expected format.');
-    if (!isset($idx['employee code']) && !isset($idx['employee'])) {
-        $fail('Missing an "Employee Code" or "Employee" column. Export CSV first to get the expected format.');
+    if (!isset($idx['employee code'])) {
+        $fail('Missing the "Employee Code" column. People are identified by code here, not by name.');
     }
 
     $db = getDb();
-    // Lookups: locations by code and by name, employees by code and by name.
-    // Names are matched case-insensitively and only when unambiguous.
+    // Lookups: locations by code and by name, employees by code only.
+    // Location names are matched case-insensitively and only when unambiguous.
     $locByCode = []; $locByName = [];
     foreach ($db->query('SELECT location_id, location_code, location_name FROM locations')->fetchAll(PDO::FETCH_ASSOC) as $l) {
         $c = strtolower(trim((string)($l['location_code'] ?? '')));
@@ -377,13 +381,10 @@ function doImportLocationManagers(): void {
         if ($c !== '') $locByCode[$c] = (int)$l['location_id'];
         if ($n !== '') $locByName[$n][] = (int)$l['location_id'];
     }
-    $empActive = []; $empByName = [];
-    foreach ($db->query('SELECT employee_code, full_name, is_active FROM employees')->fetchAll(PDO::FETCH_ASSOC) as $e) {
+    $empActive = [];
+    foreach ($db->query('SELECT employee_code, is_active FROM employees')->fetchAll(PDO::FETCH_ASSOC) as $e) {
         $code = trim((string)$e['employee_code']);
-        if ($code === '') continue;
-        $empActive[$code] = (int)($e['is_active'] ?? 0);
-        $n = strtolower(trim((string)$e['full_name']));
-        if ($n !== '') $empByName[$n][] = $code;
+        if ($code !== '') $empActive[$code] = (int)($e['is_active'] ?? 0);
     }
 
     // Parse the whole file before touching anything, so a bad line on row
@@ -400,7 +401,6 @@ function doImportLocationManagers(): void {
         $lCode = $get('location code');
         $lName = $get('location');
         $roleR = $get('role');
-        $eName = $get('employee');
         $eCode = $get('employee code');
 
         // Resolve the location: code wins, name is the fallback.
@@ -418,28 +418,17 @@ function doImportLocationManagers(): void {
         }
         if (!isset($plan[$lid])) { $plan[$lid] = ['sm' => '', 'om' => '', 'execs' => []]; $order[$lid] = $line; }
 
-        // A row with no role and no person is the export's placeholder for
-        // an unassigned store — it means "this store has nobody", not an error.
-        if ($roleR === '' && $eName === '' && $eCode === '') continue;
+        // A row with no role and no code is the export's placeholder for an
+        // unassigned store — it means "this store has nobody", not an error.
+        if ($roleR === '' && $eCode === '') continue;
 
         $pos  = null;
         $role = locMgrParseRole($roleR, $pos);
         if ($role === '') $fail("Line {$line}: unrecognised Role \"{$roleR}\". Use Store Manager, Operation Manager, or Store Executive.");
 
-        // Resolve the employee: code wins, name is the fallback.
-        $code = '';
-        if ($eCode !== '' && isset($empActive[$eCode])) {
-            $code = $eCode;
-        } elseif ($eCode !== '') {
-            $fail("Line {$line}: no employee has the code \"{$eCode}\".");
-        } elseif ($eName !== '') {
-            $hits = $empByName[strtolower($eName)] ?? [];
-            if (count($hits) === 1) $code = $hits[0];
-            elseif (count($hits) > 1) $fail("Line {$line}: more than one employee is named \"{$eName}\" — use the Employee Code column.");
-            else $fail("Line {$line}: no employee is named \"{$eName}\".");
-        } else {
-            $fail("Line {$line}: Role \"{$roleR}\" has no employee against it.");
-        }
+        if ($eCode === '') $fail("Line {$line}: Role \"{$roleR}\" has no Employee Code against it.");
+        if (!isset($empActive[$eCode])) $fail("Line {$line}: no employee has the code \"{$eCode}\".");
+        $code = $eCode;
         // Deactivated staff are accepted: an export of a store whose manager
         // has since left must stay importable. They are counted and reported.
         if (!$empActive[$code]) $inactive[$code] = true;
@@ -514,7 +503,6 @@ function doImportLocationManagers(): void {
     if ($cleared) $msg .= ", cleared {$cleared}";
     $msg .= '. Locations absent from the file were left alone.';
     if ($inactive) $msg .= ' ' . count($inactive) . ' mapped employee(s) are no longer active: ' . h(implode(', ', array_keys($inactive))) . '.';
-    $msg .= ' The Mobile column is read-only here — update numbers on the Employees page.';
     flash('success', $msg);
     header("Location: $back"); exit;
 }
@@ -596,16 +584,16 @@ function pageLocationManagers(): void {
 <div class="form-card" id="lmImportCard" style="display:none;margin-bottom:16px;max-width:none">
     <h3 style="font-size:15px;margin-bottom:4px">Import mapping (CSV)</h3>
     <p class="text-muted" style="font-size:12px;margin:0 0 12px">
-        Takes the file <a href="?page=export_location_managers">Export CSV</a> produces — one row per person, columns
-        <code>Location Code, Location, Role, Employee, Employee Code, Mobile</code>.
-        Export it, edit it, import it back.
+        Needs three columns: <code>Location Code</code> (or <code>Location</code>), <code>Role</code>, <code>Employee Code</code> — one row per person.
+        The file <a href="?page=export_location_managers">Export CSV</a> produces already has them, so you can export it, edit it and import it back;
+        its <code>Employee</code> and <code>Mobile</code> columns are along for the ride and are ignored.
     </p>
     <ul class="text-muted" style="font-size:12px;margin:0 0 12px;padding-left:18px;line-height:1.7">
         <li><strong>Role</strong> must read <code>Store Manager</code>, <code>Operation Manager</code> or <code>Store Executive</code> (a trailing number orders the tree).</li>
+        <li>People are identified by <strong><code>Employee Code</code> only</strong> — names are not unique, so they are never used to decide who is who.</li>
+        <li>Phone numbers are not imported. They live on the employee record; change them on the Employees page.</li>
         <li>Each location in the file is <strong>replaced by its rows</strong> — delete a person's row to unassign them. A location listed with no people is cleared.</li>
         <li><strong>Locations missing from the file are left untouched</strong>, so you can import a few stores at a time.</li>
-        <li><code>Employee Code</code> identifies people; <code>Employee</code> name is used only when the code is blank, and must be unique. Same for <code>Location Code</code> / <code>Location</code>.</li>
-        <li>The <code>Mobile</code> column is <strong>ignored</strong> — phone numbers belong to the employee record, so change them on the Employees page.</li>
         <li>Nothing is written unless the whole file is valid; the first bad line is reported with its line number.</li>
     </ul>
     <form method="POST" enctype="multipart/form-data" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap">
