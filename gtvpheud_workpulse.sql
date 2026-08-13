@@ -374,6 +374,29 @@ CREATE TABLE `chk_sections` (
 -- --------------------------------------------------------
 
 --
+-- Table structure for table `chk_task_time`
+--
+
+CREATE TABLE `chk_task_time` (
+  `id` int(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `checklist_id` int(10) UNSIGNED NOT NULL,
+  `location_id` int(11) NOT NULL DEFAULT 0,
+  `item_id` int(10) UNSIGNED NOT NULL,
+  `employee_code` varchar(20) NOT NULL,
+  `log_date` date NOT NULL COMMENT 'cycle anchor the answer sits under',
+  `worked_on` date NOT NULL COMMENT 'calendar day the minutes were spent',
+  `minutes` int(10) UNSIGNED NOT NULL,
+  `created_at` datetime NOT NULL DEFAULT current_timestamp(),
+  `updated_at` datetime DEFAULT current_timestamp() ON UPDATE current_timestamp(),
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_chk_task_day` (`checklist_id`,`location_id`,`item_id`,`employee_code`,`worked_on`),
+  KEY `idx_chk_emp_day` (`checklist_id`,`employee_code`,`worked_on`),
+  KEY `idx_chk_item_cycle` (`checklist_id`,`item_id`,`log_date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- --------------------------------------------------------
+
+--
 -- Table structure for table `chk_validations`
 --
 
