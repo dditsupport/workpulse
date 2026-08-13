@@ -719,19 +719,33 @@ function doSaveChecklist(): void {
     // submit actually carries for it, and which log_date its cycle puts it
     // under. A column the submit did not carry is left alone; a column it
     // carried but left blank becomes NULL, which is how each is cleared.
-    $onTime  = chkHasWorkedOn() ? date('Y-m-d') : null;
-    $plan = [];  // itemId => ['log' => date, 'set' => [col => value|null]]
+    // The day the minutes are recorded against: the checklist day on screen,
+    // not date('Y-m-d'). They are the same unless a rollover is in force, and
+    // there the page says "12 Aug" while the clock says the 13th — the minutes
+    // belong to the day being filled, which is also the day the timesheet
+    // entry lands on.
+    $workDay = $day;
+    $onTime  = chkHasWorkedOn() ? $workDay : null;
+    $perDay  = chkHasTaskTimeDay();
+    $plan = [];  // itemId => ['log' => date, 'set' => [col => value|null], 'day_mins' => int|null]
     $skippedClosed = 0;
     foreach ($touched as $itemId) {
         if ($itemId <= 0 || empty($ownItems[$itemId])) continue;
         $sec = $secByItem[$itemId] ?? null;
         $set = [];
+        $dayMins = null;
         if ($tracksTime && array_key_exists($itemId, $times)) {
             // On a checklist that tracks time the minutes ARE the answer: any
             // time logged means the task was done, none means it was not. The
             // answer is still written so every done-count and report that
             // reads response_value keeps working untouched.
+            //
+            // What the box carries is *this day's* minutes. With per-day rows
+            // the values written to the response row are the cycle totals that
+            // follow from it, resolved inside the transaction below; without
+            // the table the day and the cycle are the same thing, as before.
             $mins = (int)$times[$itemId];
+            $dayMins = $mins;
             $set['response_value'] = $mins > 0 ? 'Yes' : null;
             $set['time_minutes']   = $mins > 0 ? $mins : null;
         } else {
@@ -747,25 +761,29 @@ function doSaveChecklist(): void {
         }
         if (!$set) continue;
         if (!checklistSectionEditable($sec, $day, $cl)) { $skippedClosed++; continue; }
-        $plan[$itemId] = ['log' => chkItemLogDate($sec, $cl, $day), 'set' => $set];
+        $plan[$itemId] = ['log' => chkItemLogDate($sec, $cl, $day), 'set' => $set, 'day_mins' => $dayMins];
     }
 
-    // Minutes move to whichever day they were entered on, so any day they move
-    // *off* needs its timesheet entry recomputed too. Collect those before the
-    // writes overwrite them.
+    // Which days' timesheet entries this submit can have changed. With per-day
+    // rows a submit only ever touches the day being filled, so that is the
+    // whole list. Without them the minutes live in one place and moving them
+    // leaves the day they moved off stale, so that day is collected too —
+    // before the writes overwrite the stamp that names it.
     $syncDays = [];
     if ($onTime !== null) {
         $syncDays[$onTime] = true;
-        foreach ($plan as $itemId => $p) {
-            if (!array_key_exists('time_minutes', $p['set'])) continue;
-            try {
-                $q = $db->prepare('SELECT worked_on FROM chk_daily_responses
-                                   WHERE checklist_id = ? AND location_id = ? AND item_id = ?
-                                     AND log_date = ? AND employee_code = ?');
-                $q->execute([$checklistId, $locationId, $itemId, $p['log'], $empCode]);
-                $prev = $q->fetchColumn();
-                if ($prev) $syncDays[(string)$prev] = true;
-            } catch (Exception $e) { /* column absent — nothing to resync */ }
+        if (!$perDay) {
+            foreach ($plan as $itemId => $p) {
+                if (!array_key_exists('time_minutes', $p['set'])) continue;
+                try {
+                    $q = $db->prepare('SELECT worked_on FROM chk_daily_responses
+                                       WHERE checklist_id = ? AND location_id = ? AND item_id = ?
+                                         AND log_date = ? AND employee_code = ?');
+                    $q->execute([$checklistId, $locationId, $itemId, $p['log'], $empCode]);
+                    $prev = $q->fetchColumn();
+                    if ($prev) $syncDays[(string)$prev] = true;
+                } catch (Exception $e) { /* column absent — nothing to resync */ }
+            }
         }
     }
 
@@ -795,10 +813,25 @@ function doSaveChecklist(): void {
         $db->beginTransaction();
         foreach ($plan as $itemId => $p) {
             $set = $p['set'];
+            // The box carried this day's minutes. Record them as their own row,
+            // then put the cycle total they add up to on the response — which
+            // is what time_minutes has always meant to the reports, and is the
+            // same number as the box on a daily task, where a cycle is a day.
+            if ($perDay && $p['day_mins'] !== null) {
+                $cycleMins = chkWriteTaskDayMinutes($checklistId, $locationId, $itemId, $empCode,
+                                                    $p['log'], $workDay, (int)$p['day_mins']);
+                $set['time_minutes']   = $cycleMins > 0 ? $cycleMins : null;
+                $set['response_value'] = $cycleMins > 0 ? 'Yes' : null;
+            }
             // Stamp the day the work was recorded whenever minutes are written,
             // so the timesheet dates it by when it happened rather than by the
-            // anchor of the cycle it belongs to.
-            if ($onTime !== null && array_key_exists('time_minutes', $set) && ($set['time_minutes'] ?? null) !== null) {
+            // anchor of the cycle it belongs to. With per-day rows only a day
+            // that actually carries minutes may claim the stamp — clearing this
+            // day must not re-date a cycle whose time sits on another one.
+            $stampable = $perDay && $p['day_mins'] !== null
+                ? ((int)$p['day_mins'] > 0)
+                : (array_key_exists('time_minutes', $set) && ($set['time_minutes'] ?? null) !== null);
+            if ($onTime !== null && $stampable) {
                 $set['worked_on'] = $onTime;
             }
             if (array_filter($set, fn($v) => $v !== null)) {
@@ -1065,6 +1098,17 @@ function chkWorkDayCol(): string { return chkHasWorkedOn() ? 'worked_on' : 'log_
 
 // Minutes this employee logged on one checklist on one day worked.
 function chkTaskTimeTotal(int $checklistId, string $empCode, string $day): int {
+    if (chkHasTaskTimeDay()) {
+        try {
+            $st = getDb()->prepare(
+                'SELECT COALESCE(SUM(minutes),0) FROM chk_task_time
+                 WHERE checklist_id = ? AND employee_code = ? AND worked_on = ?');
+            $st->execute([$checklistId, $empCode, $day]);
+            return (int)$st->fetchColumn();
+        } catch (Exception $e) {
+            return 0;
+        }
+    }
     if (!chkHasTaskTime()) return 0;
     $col = chkWorkDayCol();
     try {
@@ -1078,6 +1122,91 @@ function chkTaskTimeTotal(int $checklistId, string $empCode, string $day): int {
     }
 }
 
+// ── Per-day task minutes (chk_task_time) ─────────────────
+// A weekly or monthly task has one response row for the whole cycle, so the
+// single time_minutes on it could only ever describe one day: opening a later
+// day in the same cycle pre-filled it, saving moved it, and blanking it wiped
+// the day the work was really done. The minutes therefore live one row per
+// task per day worked, and time_minutes keeps the cycle total for the reports
+// that read it. See migrations/2026-08-15_chk_task_time.sql.
+function chkHasTaskTimeDay(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    try {
+        $r = getDb()->query('SELECT id FROM chk_task_time LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
+
+// What this employee logged against each task of one checklist on one day:
+// [item_id => minutes]. Empty when the table is not there yet.
+function chkTaskDayMinutes(int $checklistId, int $locationId, string $empCode, string $day): array {
+    if (!chkHasTaskTimeDay() || $empCode === '') return [];
+    try {
+        $st = getDb()->prepare(
+            'SELECT item_id, minutes FROM chk_task_time
+             WHERE checklist_id = ? AND location_id = ? AND employee_code = ? AND worked_on = ?');
+        $st->execute([$checklistId, $locationId, $empCode, $day]);
+        $out = [];
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) $out[(int)$r['item_id']] = (int)$r['minutes'];
+        return $out;
+    } catch (Exception $e) {
+        return [];
+    }
+}
+
+// Everything this employee logged against each task across one cycle:
+// [item_id => minutes]. This is what the response row's time_minutes holds,
+// read from the per-day rows so the fill page can show "of which today".
+function chkTaskCycleMinutes(int $checklistId, int $locationId, string $empCode, array $anchors): array {
+    if (!chkHasTaskTimeDay() || $empCode === '' || !$anchors) return [];
+    $anchors = array_values(array_unique($anchors));
+    $ph = implode(',', array_fill(0, count($anchors), '?'));
+    try {
+        $st = getDb()->prepare(
+            "SELECT item_id, COALESCE(SUM(minutes),0) AS mins FROM chk_task_time
+             WHERE checklist_id = ? AND location_id = ? AND employee_code = ? AND log_date IN ({$ph})
+             GROUP BY item_id");
+        $st->execute(array_merge([$checklistId, $locationId, $empCode], $anchors));
+        $out = [];
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) $out[(int)$r['item_id']] = (int)$r['mins'];
+        return $out;
+    } catch (Exception $e) {
+        return [];
+    }
+}
+
+// Write one task's minutes for one day: upsert, or delete the day's row when
+// the box was blanked. Returns the task's new cycle total, which is what goes
+// back onto chk_daily_responses.time_minutes.
+function chkWriteTaskDayMinutes(int $checklistId, int $locationId, int $itemId, string $empCode,
+                                string $logDate, string $day, int $minutes): int {
+    if (!chkHasTaskTimeDay()) return $minutes;
+    $db = getDb();
+    if ($minutes > 0) {
+        $db->prepare(
+            'INSERT INTO chk_task_time
+                (checklist_id, location_id, item_id, employee_code, log_date, worked_on, minutes)
+             VALUES (?,?,?,?,?,?,?)
+             ON DUPLICATE KEY UPDATE minutes = VALUES(minutes), log_date = VALUES(log_date)'
+        )->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $day, $minutes]);
+    } else {
+        // Blanking the box clears this day only. The other days of the cycle
+        // are other rows and are none of this submit's business.
+        $db->prepare(
+            'DELETE FROM chk_task_time
+             WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND employee_code = ? AND worked_on = ?'
+        )->execute([$checklistId, $locationId, $itemId, $empCode, $day]);
+    }
+    $st = $db->prepare(
+        'SELECT COALESCE(SUM(minutes),0) FROM chk_task_time
+         WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND employee_code = ? AND log_date = ?');
+    $st->execute([$checklistId, $locationId, $itemId, $empCode, $logDate]);
+    return (int)$st->fetchColumn();
+}
+
 // Recomputes an employee's timesheet entries for one checklist on one day:
 // delete what was there, then write one row per task that carried time, each
 // naming its task and carrying that task's own remark as its notes. Returns
@@ -1089,8 +1218,11 @@ function chkTaskTimeTotal(int $checklistId, string $empCode, string $day): int {
 //
 // The day here is the day the work was recorded, not the anchor of the cycle
 // the tasks belong to: a monthly task filled on the 11th logs its time on the
-// 11th, where the person actually spent it, instead of on the 1st. Since each
-// response carries exactly one such day, summing per day cannot double count.
+// 11th, where the person actually spent it, instead of on the 1st. The minutes
+// come from chk_task_time, which holds one row per task per day, so a monthly
+// task worked on two days contributes to both — where the single worked_on
+// stamp it replaces could only ever name one, and moved when the other was
+// filled. The remark is still the cycle's, joined from the response row.
 function chkSyncTimeEntry(int $checklistId, string $empCode, string $day): int {
     if ($empCode === '') return 0;
     $db  = getDb();
@@ -1110,7 +1242,20 @@ function chkSyncTimeEntry(int $checklistId, string $empCode, string $day): int {
         // which is how this worked before per-task entry existed.
         $remarkSel = chkHasRemarks() ? 'r.remarks' : 'NULL AS remarks';
         $rows = [];
-        if (chkHasTaskTime()) {
+        if (chkHasTaskTimeDay()) {
+            $st = $db->prepare(
+                "SELECT tt.item_id, tt.minutes AS mins, {$remarkSel}
+                 FROM chk_task_time tt
+                 LEFT JOIN chk_daily_responses r
+                        ON r.checklist_id = tt.checklist_id AND r.location_id = tt.location_id
+                       AND r.item_id = tt.item_id AND r.employee_code = tt.employee_code
+                       AND r.log_date = tt.log_date
+                 WHERE tt.checklist_id = ? AND tt.employee_code = ? AND tt.worked_on = ?
+                   AND tt.minutes > 0
+                 ORDER BY tt.item_id");
+            $st->execute([$checklistId, $empCode, $day]);
+            $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+        } elseif (chkHasTaskTime()) {
             $st = $db->prepare(
                 "SELECT r.item_id, r.time_minutes AS mins, {$remarkSel}
                  FROM chk_daily_responses r
@@ -1688,6 +1833,10 @@ function pageChecklistFill(int $checklistId): void {
     // containing it. The tile figures count daily work only — on the 1st of a
     // month the daily and monthly anchors are the same date, so counting by
     // log_date alone would fold monthly tasks into that day's tile.
+    // Are a task's minutes kept per day worked? Decides both what the duration
+    // box is pre-filled with and whether the cycle total is worth showing.
+    $perDayUi = chkHasTaskTimeDay();
+
     $dTs      = strtotime($displayDate);
     $navFirst = date('Y-m-01', $dTs);
     $navLast  = date('Y-m-t',  $dTs);
@@ -1777,12 +1926,21 @@ function pageChecklistFill(int $checklistId): void {
             $latest[$k] = $r;
             if ((string)$r['employee_code'] === $me) $mine[$k] = $r;
         }
+        // The duration box holds what this employee logged *on the day being
+        // filled*, not the cycle total: a monthly task's response row is shared
+        // by every day of the month, and pre-filling from it made the 13th show
+        // the 12th's hour — which the next submit then moved onto the 13th.
+        // The cycle total rides along beside it, so a task that has time on
+        // other days still says so.
+        $dayMine   = chkTaskDayMinutes($checklistId, $locationId, $me, $displayDate);
+        $cycleMine = chkTaskCycleMinutes($checklistId, $locationId, $me, array_values($anchors));
         foreach ($tasks as &$t) {
             $k = (int)$t['id'] . '|' . ($anchors[$t['item_freq']] ?? $displayDate);
             $t['log_date']       = $anchors[$t['item_freq']] ?? $displayDate;
             $t['response_value'] = $latest[$k]['response_value'] ?? null;
             $t['submitted_by']   = $latest[$k]['full_name'] ?? null;
-            $t['my_minutes']     = $mine[$k]['time_minutes'] ?? null;
+            $t['my_minutes']     = $perDayUi ? ($dayMine[(int)$t['id']] ?? null) : ($mine[$k]['time_minutes'] ?? null);
+            $t['cycle_minutes']  = $perDayUi ? (int)($cycleMine[(int)$t['id']] ?? 0) : (int)($mine[$k]['time_minutes'] ?? 0);
             $t['my_remarks']     = $mine[$k]['remarks'] ?? null;
         }
         unset($t);
@@ -2030,16 +2188,35 @@ $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunda
                         // nothing says it was not. So there is no separate
                         // Yes/No to keep in step with the minutes.
                         ?>
+                            <?php
+                            // The box is this day's minutes; $cycMin is everything
+                            // this employee has put against the task across its
+                            // cycle. On a daily task the two are the same number
+                            // and the extra label would just repeat itself.
+                            $cycMin  = (int)($t['cycle_minutes'] ?? 0);
+                            $cycNoun = function_exists('chkFreqNoun') ? chkFreqNoun($secInfo['freq']) : 'day';
+                            $showCyc = $perDayUi && $secInfo['freq'] !== 'daily' && $cycMin > 0;
+                            ?>
                             <?php if ($cellEditable): ?>
                             <span style="display:inline-flex;align-items:center;gap:5px">
-                                <span class="text-muted" style="display:inline-flex" title="How long this task took"><?= chkClockIcon(13) ?></span>
+                                <span class="text-muted" style="display:inline-flex" title="How long this task took today"><?= chkClockIcon(13) ?></span>
                                 <?= durationSelect('task_time[' . (int)$t['id'] . ']', $myMin, false, 'chk-task-time', 'width:110px;padding:3px 6px;font-size:12px') ?>
                             </span>
+                            <?php if ($showCyc): ?>
+                                <span class="text-muted" style="font-size:11px"
+                                      title="Everything you have logged against this task this <?= h($cycNoun) ?>. The box holds today's share of it."><?= h(fmtMinutes($cycMin)) ?> this <?= h($cycNoun) ?></span>
+                            <?php endif; ?>
                             <?php if (!empty($t['response_value'])): ?>
                                 <span class="text-muted" style="font-size:11px">By: <?= h($t['submitted_by'] ?? 'Unknown') ?></span>
                             <?php endif; ?>
-                            <?php elseif ($myMin > 0 || !empty($t['response_value'])): ?>
-                            <span class="badge badge-green">&#10003; <?= $myMin > 0 ? h(fmtMinutes($myMin)) : h($t['response_value']) ?></span>
+                            <?php elseif ($myMin > 0): ?>
+                            <span class="badge badge-green">&#10003; <?= h(fmtMinutes($myMin)) ?></span>
+                            <span class="text-muted" style="font-size:11px">By: <?= h($t['submitted_by'] ?? 'Unknown') ?></span>
+                            <?php elseif ($showCyc): ?>
+                            <?php // Time on this task, but spent on another day of the cycle — not this one's. ?>
+                            <span class="text-muted" style="font-size:12px">— none this day (<?= h(fmtMinutes($cycMin)) ?> this <?= h($cycNoun) ?>) —</span>
+                            <?php elseif (!empty($t['response_value'])): ?>
+                            <span class="badge badge-green">&#10003; <?= h($t['response_value']) ?></span>
                             <span class="text-muted" style="font-size:11px">By: <?= h($t['submitted_by'] ?? 'Unknown') ?></span>
                             <?php else: ?>
                             <span class="text-muted" style="font-size:12px">— <?= h($cellMsg) ?> —</span>
