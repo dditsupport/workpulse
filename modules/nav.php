@@ -175,15 +175,19 @@ function buildNav(): array {
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_categories', 'icon' => navIcon('categories'),   'label' => 'Audit Categories'];
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_parameters', 'icon' => navIcon('audit_param'),  'label' => 'Audit Parameters'];
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_templates',  'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'];
-    if (hasTxn('audit_operation')) $audit[] = ['page' => 'location_managers', 'icon' => navIcon('locations'),  'label' => 'Store Manager Mapping'];
 
     $store = [];
     if (hasTxn('outlet_directory')) $store[] = ['page' => 'outlet_directory', 'icon' => navIcon('outlet'), 'label' => 'Outlet Directory'];
     if (hasTxn('shelf_life'))       $store[] = ['page' => 'shelf_life',       'icon' => navIcon('shelf'),  'label' => 'Shelf Life'];
     if (hasTxn('store_hours'))      $store[] = ['page' => 'store_hours',      'icon' => navIcon('clock'),  'label' => 'Store Hours'];
     if (hasTxn('price_tags'))       $store[] = ['page' => 'price_tags',       'icon' => navIcon('tag'),    'label' => 'Price Tags'];
+    // Who manages which store — everyone reads it, only txn_audit_operation
+    // edits (the page hides the form and row actions for everyone else).
+    // Lives here rather than under Audits because it is store reference data
+    // that the whole company looks up, not an audit workflow step.
+    $store[] = ['page' => 'location_managers', 'icon' => navIcon('locations'), 'label' => 'Store Manager Mapping'];
     // Store Operations group focuses on Outlet Directory / Shelf Life /
-    // Store Hours / Price Tags / Banking.
+    // Store Hours / Price Tags / Store Manager Mapping / Banking.
 
     // Transactions: upload page is open to anyone with a self-claim location;
     // the report page is gated by txn_transactions_report.
@@ -356,8 +360,11 @@ function allowedPages(): array {
         $pages[] = 'audit_approve';
     }
     if (isSuperadmin() || hasTxn('audit_operation')) {
-        $pages = array_merge($pages, ['audit_operation_review', 'location_managers', 'export_location_managers']);
+        $pages[] = 'audit_operation_review';
     }
+    // Store manager mapping is read-only reference data for everyone
+    // (the nav entry already grants the page; the export mirrors it).
+    $pages[] = 'export_location_managers';
     if (isSuperadmin() || hasTxn('audit_management')) {
         $pages[] = 'audit_management_review';
     }
