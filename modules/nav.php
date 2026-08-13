@@ -66,6 +66,7 @@ function buildNav(): array {
             ['page' => 'shelf_life',           'icon' => navIcon('shelf'),   'label' => 'Shelf Life'],
             ['page' => 'store_hours',          'icon' => navIcon('clock'),   'label' => 'Store Hours'],
             ['page' => 'price_tags',           'icon' => navIcon('tag'),     'label' => 'Price Tags'],
+            ['page' => 'location_managers',    'icon' => navIcon('locations'), 'label' => 'Manager Mapping'],
             ['page' => 'transactions',         'icon' => navIcon('summary'), 'label' => 'Banking Cash Deposit'],
             ['page' => 'transactions_report',  'icon' => navIcon('report'),  'label' => 'Banking Cash Deposit Report'],
         ]],
