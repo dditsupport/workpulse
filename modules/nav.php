@@ -185,9 +185,9 @@ function buildNav(): array {
     // edits (the page hides the form and row actions for everyone else).
     // Lives here rather than under Audits because it is store reference data
     // that the whole company looks up, not an audit workflow step.
-    $store[] = ['page' => 'location_managers', 'icon' => navIcon('locations'), 'label' => 'Store Manager Mapping'];
+    $store[] = ['page' => 'location_managers', 'icon' => navIcon('locations'), 'label' => 'Manager Mapping'];
     // Store Operations group focuses on Outlet Directory / Shelf Life /
-    // Store Hours / Price Tags / Store Manager Mapping / Banking.
+    // Store Hours / Price Tags / Manager Mapping / Banking.
 
     // Transactions: upload page is open to anyone with a self-claim location;
     // the report page is gated by txn_transactions_report.
