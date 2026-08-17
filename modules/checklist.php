@@ -3,8 +3,9 @@
 // Checklist Module — daily / weekly / monthly checklists + manage tasks
 //
 // A checklist repeats on one of three cycles (chk_checklists.frequency):
-//   daily   → one cycle per calendar day, closing at midnight (or at
-//             rollover_min past it, e.g. Store = 02:00)
+//   daily   → one cycle per calendar day, closing at midnight (rollover_min
+//             then grants a grace window in which yesterday can still be
+//             finished, e.g. Store = until 02:00)
 //   weekly  → Sunday → Saturday, closing Saturday midnight
 //   monthly → 1st → last day, closing on the last day at midnight
 //
@@ -21,7 +22,8 @@
 //     before the start, "Closed at HH:MM" after the deadline).
 //   - On a WEEKLY / MONTHLY checklist the sections are grouping headers
 //     only: the whole period is fillable until it closes.
-//   - Past periods render read-only; future periods are blocked.
+//   - Past periods render read-only, except yesterday while it is still
+//     inside the grace window; future periods are blocked.
 //   - Superadmin bypasses all restrictions.
 // =========================================================
 
@@ -270,34 +272,63 @@ function chkPeriodLabel(string $freq, string $periodStart): string {
     return date('d M Y', $s);
 }
 
+// The clock time the grace window shuts, e.g. "12:00 PM". Meaningless without
+// a rollover, where the day simply ends at midnight.
+function chkGraceCloseLabel(array $cl): string {
+    $roll = (int)($cl['rollover_min'] ?? 0);
+    // A full 1440 keeps yesterday open all day; "12:00 AM" would read as this
+    // morning rather than tonight.
+    if ($roll <= 0 || $roll >= 1440) return 'midnight';
+    return date('h:i A', strtotime('00:00') + $roll * 60);
+}
+
 // When the open cycle stops accepting answers, in words.
 function chkPeriodCloseLabel(array $cl, string $periodStart): string {
     $freq = chkFrequency($cl);
     if ($freq === 'daily') {
+        // With a grace window today stays fillable past its own midnight,
+        // right up to the rollover minute the next morning.
         $roll = (int)($cl['rollover_min'] ?? 0);
         return $roll > 0
-            ? ('at ' . date('h:i A', strtotime('00:00') + $roll * 60) . ' tomorrow')
+            ? ('at ' . chkGraceCloseLabel($cl) . ' tomorrow')
             : 'at midnight';
     }
     return 'at midnight on ' . date('D, d M Y', strtotime(chkPeriodEnd($freq, $periodStart)));
 }
 
 // ── Time-window engine (per-checklist, DB-driven) ─────────
-// The one calendar day a checklist is fillable on. rollover_min shifts the
-// boundary: while now's minute-of-day is below rollover_min we still report
-// yesterday (Store rollover_min=120 → before 02:00 counts as the prior day).
+// The current checklist day — always the calendar day, from midnight.
 //
 // This is a *day*, not a cycle anchor: a checklist can hold daily, weekly and
 // monthly sections at once, so each task derives its own anchor from this day
 // via chkItemLogDate(). Filling the current day is what keeps every cycle's
 // open period writable.
-function checklistEffectiveDate(array $cl): string {
-    $now  = time();
+//
+// $now is a test seam. Production passes nothing; the tests pin the clock.
+function checklistEffectiveDate(array $cl, ?int $now = null): string {
+    return date('Y-m-d', $now ?? time());
+}
+
+// Yesterday, while it is still inside the grace window; null once the window
+// has passed. rollover_min is that window's width in minutes after midnight —
+// Store 120 → yesterday can be finished until 02:00.
+//
+// It grants extra time on the day just gone; it never delays today. An earlier
+// reading shifted the whole day instead, so a checklist set to 720 could not be
+// filled at all before noon.
+function checklistGraceDate(array $cl, ?int $now = null): ?string {
+    $now  = $now ?? time();
+    $roll = (int)($cl['rollover_min'] ?? 0);
+    if ($roll <= 0) return null;
     $minOfDay = (int)date('G', $now) * 60 + (int)date('i', $now);
-    if ($minOfDay < (int)($cl['rollover_min'] ?? 0)) {
-        return date('Y-m-d', strtotime('-1 day', $now));
-    }
-    return date('Y-m-d', $now);
+    return $minOfDay < $roll ? date('Y-m-d', strtotime('-1 day', $now)) : null;
+}
+
+// The days a non-superadmin may still write: the current day, plus the grace
+// day while its window is open.
+function checklistDayWritable(array $cl, string $day, ?int $now = null): bool {
+    return $day === checklistEffectiveDate($cl, $now)
+        || $day === checklistGraceDate($cl, $now);
 }
 
 // Does this section's band cover the whole day, i.e. gate nothing?
@@ -326,12 +357,18 @@ function checklistSectionDeadlineTs(array $section, string $logDate): int {
 // stays open for its whole cycle, which the day gate below already expresses,
 // since every day inside the open week or month is the effective day on the
 // day it is filled.
-function checklistSectionState(?array $section, string $day, array $cl): string {
+function checklistSectionState(?array $section, string $day, array $cl, ?int $now = null): string {
     if (isSuperadmin()) return 'open';
-    if ($day !== checklistEffectiveDate($cl)) return 'closed';
+    if (!checklistDayWritable($cl, $day, $now)) return 'closed';
+    // The grace day is open outright until its window shuts. A band describes
+    // one day, so yesterday's all-day section (end_min 1440) would read as long
+    // expired and the grace window would do nothing for exactly the checklists
+    // that need it — extra time to finish yesterday is what the window is.
+    // "not_yet_open" cannot apply to a day already past.
+    if ($day === checklistGraceDate($cl, $now)) return 'open';
     if ($section === null || empty($cl['time_gated'])) return 'open';
     if (chkItemFreq($section, $cl) !== 'daily') return 'open';
-    $now = time();
+    $now = $now ?? time();
     if ($now < checklistSectionStartTs($section, $day))    return 'not_yet_open';
     if ($now > checklistSectionDeadlineTs($section, $day)) return 'closed';
     return 'open';
@@ -339,8 +376,8 @@ function checklistSectionState(?array $section, string $day, array $cl): string 
 
 // True iff the current user may still write answers for the given section
 // on the given calendar day.
-function checklistSectionEditable(?array $section, string $day, array $cl): bool {
-    return checklistSectionState($section, $day, $cl) === 'open';
+function checklistSectionEditable(?array $section, string $day, array $cl, ?int $now = null): bool {
+    return checklistSectionState($section, $day, $cl, $now) === 'open';
 }
 
 // ── Attachment storage (per response) ─────────────────────
@@ -682,12 +719,16 @@ function doSaveChecklist(): void {
           . ($isLocMode ? "&location_id={$locationId}" : '')
           . "&date={$day}";
 
-    // Only the current day is writable for non-superadmin. Filling today is
-    // what keeps every cycle's open period writable, since today falls inside
-    // the open week and the open month by definition.
-    if (!isSuperadmin() && $day !== checklistEffectiveDate($cl)) {
+    // Only the current day — and yesterday while its grace window is open — is
+    // writable for non-superadmin. Filling today is what keeps every cycle's
+    // open period writable, since today falls inside the open week and the open
+    // month by definition.
+    if (!isSuperadmin() && !checklistDayWritable($cl, $day)) {
+        $grace = checklistGraceDate($cl);
         flash('error', 'You can only fill the current checklist day ('
-            . date('d M Y', strtotime(checklistEffectiveDate($cl))) . ').');
+            . date('d M Y', strtotime(checklistEffectiveDate($cl)))
+            . ($grace !== null ? ', or ' . date('d M Y', strtotime($grace))
+                . ' until ' . chkGraceCloseLabel($cl) : '') . ').');
         header("Location: {$back}"); exit;
     }
 
@@ -1647,12 +1688,17 @@ function pageChecklistFill(int $checklistId): void {
     $freq          = chkFrequency($cl);
     $timeTracked   = chkTracksTime($cl);
     $effectiveDate = checklistEffectiveDate($cl);
+    // Yesterday, while it can still be finished. The page always opens on the
+    // current day — the grace day is offered by a banner, never sprung on
+    // someone who came to fill today.
+    $graceDate     = checklistGraceDate($cl);
     // ?date= names a calendar day. Each section then resolves its own period
     // from it, so picking a day shows that day's daily work alongside the week
     // and the month containing it.
     $displayDate   = $_GET['date'] ?? $effectiveDate;
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $displayDate)) $displayDate = $effectiveDate;
-    $isPast        = ($displayDate < $effectiveDate);
+    $onGraceDay    = ($graceDate !== null && $displayDate === $graceDate);
+    $isPast        = ($displayDate < $effectiveDate) && !$onGraceDay;
     $isFutureDate  = ($displayDate > $effectiveDate);
     $periodLabel   = date('d M Y', strtotime($displayDate));
 
@@ -1674,8 +1720,11 @@ function pageChecklistFill(int $checklistId): void {
     }
     $haveScope = !$isLoc || $locationId > 0;
 
-    // When the open cycle stops accepting answers, in words.
-    $closeLabel = chkPeriodCloseLabel($cl, $effectiveDate);
+    // When the day on screen stops accepting answers, in words. The grace day
+    // has its own deadline — this morning's rollover, not tomorrow's.
+    $closeLabel = $onGraceDay
+        ? ('at ' . chkGraceCloseLabel($cl) . ' today')
+        : chkPeriodCloseLabel($cl, $effectiveDate);
 
     // ── Day picker ───────────────────────────────────────
     // One tile per day of the month. Picking a day drives every section: the
@@ -1698,6 +1747,11 @@ function pageChecklistFill(int $checklistId): void {
     }
     $tileMin  = $navFirst;
     $tileMax  = $navLast;
+    // The grace-day banner reads its figures out of the same count. On the 1st
+    // of a month yesterday sits in the month before, so reach back for it —
+    // the extra row has no tile and is simply not drawn.
+    $countMin = ($graceDate !== null && $graceDate < $tileMin) ? $graceDate : $tileMin;
+    $countMax = ($graceDate !== null && $graceDate > $tileMax) ? $graceDate : $tileMax;
     $tileWide = 72;
     $locQS    = $isLoc && $locationId > 0 ? "&location_id={$locationId}" : '';
 
@@ -1725,7 +1779,7 @@ function pageChecklistFill(int $checklistId): void {
                    AND r.response_value IS NOT NULL AND r.response_value <> ''
                    AND {$fSql} = 'daily'
                  GROUP BY r.log_date");
-            $st->execute([$checklistId, $locationId, $tileMin, $tileMax]);
+            $st->execute([$checklistId, $locationId, $countMin, $countMax]);
             $existingCounts = $st->fetchAll(PDO::FETCH_KEY_PAIR);
         } catch (Exception $e) {
             $existingCounts = [];
@@ -1924,7 +1978,32 @@ $loggedMins  = $timeUi ? chkTimeEntryMinutes($checklistId, $me, $displayDate) : 
 // when there are any, so the old string compare would always miss.
 $timeEntered = $loggedMins > 0 && chkTaskTimeTotal($checklistId, $me, $displayDate) > 0;
 $myTimeUrl   = '?page=my_time&week=' . urlencode(function_exists('weekStartSunday') ? weekStartSunday($displayDate) : $displayDate);
+
+// Yesterday can still be finished, and is not on screen — offer it, but only
+// while it has daily work left. A banner every morning saying a completed day
+// is open would be noise. Daily counts only: the weekly and monthly anchors
+// share dates with days, and the grace window is a property of the day.
+$graceDailyTotal = 0; $graceDailyDone = 0;
+$showGraceBanner = false;
+if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
+    $graceDailyTotal = (int)(chkItemTotalByFreq($checklistId)['daily'] ?? 0);
+    $graceDailyDone  = (int)($existingCounts[$graceDate] ?? 0);
+    $showGraceBanner = $graceDailyTotal > 0 && $graceDailyDone < $graceDailyTotal;
+}
 ?>
+<?php if ($showGraceBanner): ?>
+<div class="alert" style="margin-bottom:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:rgba(201,168,0,.10);color:var(--yellow);border:1px solid rgba(201,168,0,.30)">
+    <span><strong><?= h(date('d M', strtotime($graceDate))) ?></strong> is still open until
+        <?= h(chkGraceCloseLabel($cl)) ?> — <?= (int)$graceDailyDone ?> of <?= (int)$graceDailyTotal ?> done.</span>
+    <a class="btn btn-ghost btn-sm" href="?page=checklist&amp;id=<?= $checklistId ?><?= $locQS ?>&amp;date=<?= h($graceDate) ?>">Finish it</a>
+</div>
+<?php endif; ?>
+<?php if ($onGraceDay): ?>
+<div class="alert" style="margin-bottom:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:rgba(201,168,0,.10);color:var(--yellow);border:1px solid rgba(201,168,0,.30)">
+    <span>Finishing <strong><?= h(date('d M Y', strtotime($graceDate))) ?></strong> — open until <?= h(chkGraceCloseLabel($cl)) ?> today.</span>
+    <a class="btn btn-ghost btn-sm" href="?page=checklist&amp;id=<?= $checklistId ?><?= $locQS ?>&amp;date=<?= h($effectiveDate) ?>">Back to today</a>
+</div>
+<?php endif; ?>
 <?php if ($timeUi && $loggedMins > 0): ?>
 <div class="alert" style="margin-bottom:10px;background:rgba(99,102,241,.10);color:var(--text);border:1px solid rgba(99,102,241,.30)">
     <?= chkClockIcon(14) ?> <strong><?= h(fmtMinutes($loggedMins)) ?></strong> logged for this day in
@@ -2635,9 +2714,9 @@ function pageManageTasks(): void {
                 <?php if (!chkHasFrequency()): ?>
                 <span class="text-muted" style="font-size:11px">Add the <code>frequency</code> column to enable weekly / monthly cycles.</span>
                 <?php endif; ?></div>
-            <div class="form-group"><label>Day rollover (min after midnight)</label>
+            <div class="form-group"><label>Grace period after midnight (min)</label>
                 <input type="number" name="rollover_min" id="clRollover" class="form-control" min="0" max="1440" value="0">
-                <span class="text-muted" style="font-size:11px">Daily only — e.g. 120 = day rolls at 02:00</span></div>
+                <span class="text-muted" style="font-size:11px">Daily only — how long yesterday stays open, e.g. 120 = until 02:00. Today is always fillable from midnight.</span></div>
             <div class="form-group"><label>Sort order</label>
                 <input type="number" name="sort_order" id="clSort" class="form-control" value="0"></div>
             <div class="form-group"><label>&nbsp;</label>
