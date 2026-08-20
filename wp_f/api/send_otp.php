@@ -177,6 +177,21 @@ try {
     $expRow = $db->query("SELECT DATE_ADD(NOW(), INTERVAL {$otpExpiry} MINUTE) AS exp")->fetch();
     $expiresAt = $expRow['exp'];
 
+    // ── Release the DB before the network send ────────────
+    // Every query this request needs has run. The MSG91 call below can block
+    // for up to 10s and the SMTP handshake for up to 15s; holding a MySQL
+    // connection open across that wait is what piles connections up when a
+    // shift starts and every device asks for an OTP at once. So warm the
+    // settings the senders read, drop every handle that keeps the socket
+    // alive, and disconnect. api_getDb() would reconnect if anything below
+    // needed it — nothing does.
+    api_warmSettings($channel === 'sms'
+        ? ['Msg91OtpFlowId', 'Msg91V5Url', 'Msg91AuthKey']
+        : ['SmtpHost', 'SmtpPort', 'SmtpUser', 'SmtpPass', 'SmtpFromEmail', 'SmtpFromName']);
+    unset($st, $devSt, $rateSt, $locStmt, $expRow);
+    $db = null;
+    api_dbDisconnect();
+
     // ── Send ──────────────────────────────────────────────
     if ($channel === 'sms')
         sendSms($sendTo, $otp, $emp['full_name'], $employeeCode, $loc['location_name'], $punchType);

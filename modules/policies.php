@@ -599,9 +599,13 @@ function sendHeartbeat() {
     fetch('?page=policy_heartbeat&id=<?= $vid ?>&max_page=' + maxPageSeen + '&total=' + totalPages, { method: 'GET', cache: 'no-store' })
         .catch(() => {});
 }
-// updateProgress() already pushes a beat on each scroll event; this 5s
-// interval is a fallback in case no scrolling has happened recently.
-setInterval(sendHeartbeat, 5000);
+// updateProgress() already pushes a beat whenever the read position changes,
+// which is the only thing the server records. This interval is just a safety
+// net for a reader who is sitting still, so it stays slow on purpose: every
+// beat is a full index.php request (session + config + a database connection),
+// and a whole store reading a new policy at once used to turn that into a
+// steady flood of connections.
+setInterval(sendHeartbeat, 60000);
 </script>
 <?php
 }
