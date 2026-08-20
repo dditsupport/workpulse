@@ -46,17 +46,36 @@ if (!defined('DB_HOST') || !defined('DB_NAME') || !defined('DB_USER')
 // API HELPERS (api_* prefix — never collide with modules)
 // =========================================================
 
+// One lazily-created PDO per request. The handle lives on a class property
+// rather than a function static so api_dbDisconnect() can drop it: MySQL only
+// frees the connection slot once the last reference to the PDO is gone, and a
+// request that still has slow outbound work to do (an SMS or SMTP send) should
+// not be sitting on a slot while it waits on the network.
+final class ApiDbHandle {
+    public static ?PDO $pdo = null;
+}
+
 function api_getDb(): PDO {
-    static $pdo = null;
-    if ($pdo === null) {
+    if (ApiDbHandle::$pdo === null) {
         $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4';
-        $pdo = new PDO($dsn, DB_USER, DB_PASS, [
+        ApiDbHandle::$pdo = new PDO($dsn, DB_USER, DB_PASS, [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
             PDO::ATTR_EMULATE_PREPARES   => false,
+            // Never persistent: a pooled connection outlives the request and
+            // is the classic way a shared-hosting account runs out of slots.
+            PDO::ATTR_PERSISTENT         => false,
         ]);
     }
-    return $pdo;
+    return ApiDbHandle::$pdo;
+}
+
+// Release the MySQL connection early. Callers must drop their own $db and
+// PDOStatement references first — those keep the socket open too. Calling
+// api_getDb() afterwards simply reconnects, so this is always safe; it is
+// only worth doing before something slow that needs no database.
+function api_dbDisconnect(): void {
+    ApiDbHandle::$pdo = null;
 }
 
 function api_requireApiKey(): void {
@@ -105,15 +124,42 @@ function api_jsonBody(int $maxBytes = 65536): array {
     return is_array($data) ? $data : [];
 }
 
-function api_getSetting(string $key, string $default = ''): string {
+// system_settings rows already read this request. Values are the stored
+// string, or null for a key that has no row. Caching them keeps endpoints
+// that read a dozen settings down to one query, and lets a handler warm what
+// it needs before dropping the connection.
+final class ApiSettingsCache {
+    /** @var array<string,?string> */
+    public static array $values = [];
+}
+
+// Fetch several settings in one round trip and cache them. Keys already
+// cached are skipped. On a DB error nothing is cached and api_getSetting()
+// falls back to its default, matching the previous behaviour.
+function api_warmSettings(array $keys): void {
+    $keys = array_values(array_diff(array_unique($keys), array_keys(ApiSettingsCache::$values)));
+    if (!$keys) return;
     try {
-        $st = api_getDb()->prepare('SELECT setting_value FROM system_settings WHERE setting_key = ?');
-        $st->execute([$key]);
-        $row = $st->fetch();
-        return $row ? (string)$row['setting_value'] : $default;
-    } catch (Exception $e) {
-        return $default;
+        $in = implode(',', array_fill(0, count($keys), '?'));
+        $st = api_getDb()->prepare(
+            "SELECT setting_key, setting_value FROM system_settings WHERE setting_key IN ($in)"
+        );
+        $st->execute($keys);
+        foreach ($st->fetchAll() as $row) {
+            ApiSettingsCache::$values[$row['setting_key']] = (string)$row['setting_value'];
+        }
+    } catch (Throwable $e) {
+        return;
     }
+    // Remember the misses too, so a missing key isn't re-queried all request.
+    foreach ($keys as $k) {
+        if (!array_key_exists($k, ApiSettingsCache::$values)) ApiSettingsCache::$values[$k] = null;
+    }
+}
+
+function api_getSetting(string $key, string $default = ''): string {
+    if (!array_key_exists($key, ApiSettingsCache::$values)) api_warmSettings([$key]);
+    return ApiSettingsCache::$values[$key] ?? $default;
 }
 
 // ── Error logging — file-based, monthly rotation ──

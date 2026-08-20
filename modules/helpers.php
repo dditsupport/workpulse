@@ -371,9 +371,30 @@ class SmtpQueue {
     /** @var array<int,array{to:string,subject:string,body:string}> */
     private static array $queue = [];
     private static bool $registered = false;
+    /** @var array<string,string>|null SMTP config, read while the request still has a DB connection */
+    private static ?array $cfg = null;
+
+    // Hard stop for the drain, comfortably inside the 120s time limit
+    // flush() sets. One unreachable mail server must not keep the worker —
+    // and, on hosts without a disconnect hook, its MySQL connection — alive
+    // for the full limit.
+    private const DRAIN_BUDGET_SECONDS = 100;
 
     public static function enqueue(string $to, string $subject, string $body): void {
         self::$queue[] = ['to' => $to, 'subject' => $subject, 'body' => $body];
+        // Read the SMTP settings now, during the request, so flush() — which
+        // runs after the response has gone out — needs no database at all.
+        if (self::$cfg === null) {
+            $user = (string)getSetting('SmtpUser');
+            self::$cfg = [
+                'host'     => (string)getSetting('SmtpHost'),
+                'port'     => (string)getSetting('SmtpPort', '465'),
+                'user'     => $user,
+                'pass'     => (string)getSetting('SmtpPass'),
+                'from'     => (string)getSetting('SmtpFromEmail', $user),
+                'fromName' => (string)getSetting('SmtpFromName', 'Work Pulse'),
+            ];
+        }
         if (self::$registered) return;
         self::$registered = true;
         register_shutdown_function([self::class, 'flush']);
@@ -424,6 +445,16 @@ class SmtpQueue {
             @session_write_close();
         }
 
+        // Give the MySQL connection back before the drain. This handler runs
+        // after the response is finished but the worker — and its connection
+        // slot — is still alive, and the SMTP session below can take tens of
+        // seconds. Nothing here touches the database: the SMTP settings were
+        // captured in enqueue(). closeDb() lives in the out-of-web-root
+        // config.php alongside getDb(); see docs/DB_CONNECTIONS.md.
+        if (function_exists('closeDb')) {
+            try { closeDb(); } catch (Throwable $e) { /* never block the drain */ }
+        }
+
         $t1 = microtime(true);
         error_log(sprintf(
             'SmtpQueue: SAPI=%s release=%s queue=%d setupMs=%d',
@@ -435,12 +466,13 @@ class SmtpQueue {
         if (!$batch) return;
 
         try {
-            $host     = getSetting('SmtpHost');
-            $port     = (int)getSetting('SmtpPort', '465');
-            $user     = getSetting('SmtpUser');
-            $pass     = getSetting('SmtpPass');
-            $from     = getSetting('SmtpFromEmail', $user);
-            $fromName = getSetting('SmtpFromName', 'Work Pulse');
+            $cfg      = self::$cfg ?? [];
+            $host     = (string)($cfg['host'] ?? '');
+            $port     = (int)($cfg['port'] ?? 465);
+            $user     = (string)($cfg['user'] ?? '');
+            $pass     = (string)($cfg['pass'] ?? '');
+            $from     = (string)($cfg['from'] ?? '') ?: $user;
+            $fromName = (string)($cfg['fromName'] ?? '') ?: 'Work Pulse';
             if (!$host || !$user || !$pass) {
                 error_log('SmtpQueue: skipping ' . count($batch) . ' mails — SMTP not configured');
                 return;
@@ -463,7 +495,12 @@ class SmtpQueue {
             $mail->XMailer = 'WorkPulse/1.0';
 
             $sendStart = microtime(true);
+            $deadline  = $sendStart + self::DRAIN_BUDGET_SECONDS;
             foreach ($batch as $msg) {
+                if (microtime(true) > $deadline) {
+                    error_log('SmtpQueue: drain budget exhausted, dropping ' . $msg['to']);
+                    continue;
+                }
                 $one = microtime(true);
                 try {
                     $mail->clearAddresses();
