@@ -423,8 +423,8 @@ function allowedPages(): array {
     }
     $pages[] = 'profile';
     $pages[] = 'my_pending'; // dashboard sub-page; available to every logged-in user
-    // Policy pages — every logged-in user can read, view PDF, send heartbeat, see consent history
-    $pages = array_merge($pages, ['policies','policy_view','policy_pdf','policy_heartbeat','policy_consent_history']);
+    // Policy pages — every logged-in user can read, view PDF, see consent history
+    $pages = array_merge($pages, ['policies','policy_view','policy_pdf','policy_consent_history']);
     if (isSuperadmin() || hasTxn('policy_admin')) {
         $pages = array_merge($pages, ['policy_publish','policy_admin_list','policy_admin_versions']);
     }
@@ -901,7 +901,6 @@ function dispatchPage(string $page): void {
         case 'policies':                       if (function_exists('pagePolicies'))               pagePolicies();               break;
         case 'policy_view':                    if (function_exists('pagePolicyView'))             pagePolicyView();             break;
         case 'policy_pdf':                     if (function_exists('pagePolicyPdf'))              pagePolicyPdf();              break;
-        case 'policy_heartbeat':               if (function_exists('pagePolicyHeartbeat'))        pagePolicyHeartbeat();        break;
         case 'policy_publish':                 if (function_exists('pagePolicyPublish'))          pagePolicyPublish();          break;
         case 'policy_admin_list':              if (function_exists('pagePolicyAdminList'))        pagePolicyAdminList();        break;
         case 'policy_admin_versions':          if (function_exists('pagePolicyAdminVersions'))    pagePolicyAdminVersions();    break;

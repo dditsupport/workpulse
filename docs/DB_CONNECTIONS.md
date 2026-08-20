@@ -113,10 +113,14 @@ nothing in this repository uses it.
   `closeDb()` (once `config.php` provides it) before draining. The drain also
   has a 100s budget so one unreachable mail server cannot pin a worker for the
   full 120s limit.
-- `modules/policies.php` — the policy-reader heartbeat polled every 5s. Each
-  beat is a full `index.php` request. It only reports the read position, which
-  is already pushed the moment that position changes, so the idle fallback now
-  runs every 60s.
+- `modules/policies.php` — the policy-reader heartbeat is gone. It polled
+  every 5s, and every beat was a full `index.php` request — session, config,
+  a database connection — for a handler that only wrote two session keys. The
+  scroll-through and read-time gates it fed were already disabled, so nothing
+  read those keys: `policyViewGateOk()` returned `ok` unconditionally. The one
+  check that still matters, "did this user open this version", is stamped by
+  the page render itself. Endpoint, route, client poller and the dead
+  `POLICY_VIEW_*` constants all removed.
 
 ## Still holding a connection across slow I/O
 
