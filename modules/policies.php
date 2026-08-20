@@ -15,28 +15,19 @@ require_once __DIR__ . '/SmsService.php';
 define('POLICY_UPLOAD_DIR',     __DIR__ . '/../uploads/policies/');
 define('POLICY_MAX_BYTES',      15 * 1024 * 1024); // 15 MB cap per PDF
 define('POLICY_DEFAULT_GRACE',  7);                // days
-define('POLICY_VIEW_MIN_SECS',  0);                // no minimum reading-time delay
-define('POLICY_VIEW_PAGE_RATIO',0);                // (time gate disabled — scroll-through still required)
-define('POLICY_VIEW_MAX_SECS',  120);              // cap
 define('POLICY_OTP_TTL_SECS',     600);             // 10 minutes — matches SMS template wording
 define('POLICY_OTP_RESEND_SECS',  60);              // min seconds between sends
 define('POLICY_OTP_MAX_ATTEMPTS', 5);               // wrong-OTP cap before forcing a new send
 
-// ── Scroll/time gate (shared by OTP request + final consent) ──
-// Returns ['ok' => bool, 'error' => string, 'min_secs' => int].
-// Reads from the same $_SESSION['policy_view_*'] keys that the PDF
-// viewer JS heartbeat populates (pagePolicyHeartbeat).
+// ── View gate (shared by OTP request + final consent) ──
+// The scroll-through and read-time gates are gone: opening the policy is
+// enough. All that remains is proof the user actually opened THIS version,
+// which pagePolicyView() stamps into the session server-side.
 function policyViewGateOk(int $vid): array {
     if (($_SESSION['policy_view_start_id'] ?? 0) !== $vid) {
-        return ['ok' => false, 'error' => 'Open the policy first, then accept.', 'min_secs' => 0];
+        return ['ok' => false, 'error' => 'Open the policy first, then accept.'];
     }
-    $viewSecs = time() - (int)($_SESSION['policy_view_start'] ?? time());
-    $maxPage  = (int)($_SESSION['policy_view_max_page'] ?? 0);
-    $totalSes = (int)($_SESSION['policy_view_total']    ?? 0);
-    $totalPages = max(1, $totalSes);
-    $minSecs    = min(POLICY_VIEW_MAX_SECS, max(POLICY_VIEW_MIN_SECS, (int)ceil($totalPages * POLICY_VIEW_PAGE_RATIO)));
-    // Scroll-through / read-time gate removed — opening the policy is enough.
-    return ['ok' => true, 'error' => '', 'min_secs' => $minSecs];
+    return ['ok' => true, 'error' => ''];
 }
 
 // Mask a phone number for UI display: "98••••1234".
@@ -301,13 +292,11 @@ function pagePolicyView(): void {
     $pastGrace   = time() > $deadline;
     $catLabel    = ['hr'=>'HR','it'=>'IT','store_management'=>'Store Management'][$v['category']] ?? $v['category'];
 
-    // Initialise (or refresh) the consent-tracking session entry.
-    // We anchor view-time to the SERVER's clock — the client can't fake it.
+    // Stamp which version this user opened, on the SERVER's clock — that is
+    // what policyViewGateOk() checks when they come back to accept.
     if (!isset($_SESSION['policy_view_start']) || ($_SESSION['policy_view_start_id'] ?? 0) !== $vid) {
-        $_SESSION['policy_view_start']     = time();
-        $_SESSION['policy_view_start_id']  = $vid;
-        $_SESSION['policy_view_max_page']  = 0;
-        $_SESSION['policy_view_total']     = 0;
+        $_SESSION['policy_view_start']    = time();
+        $_SESSION['policy_view_start_id'] = $vid;
     }
 
     $pdfUrl = '?page=policy_pdf&id=' . $vid;
@@ -573,17 +562,11 @@ function showError(html) {
     }
 })();
 
-let lastReportedMax = -1, lastReportedTotal = -1;
+// Read position is a display for the reader only — nothing is reported to
+// the server, because nothing there gates on it any more.
 function updateProgress() {
     pageInfo.textContent = 'Read ' + maxPageSeen + ' / ' + totalPages;
     decideAcceptEnabled();
-    // Push to server immediately on any progress change so the server-side
-    // gate doesn't fall behind the client. The 5s polling beat is a fallback.
-    if (maxPageSeen !== lastReportedMax || totalPages !== lastReportedTotal) {
-        lastReportedMax   = maxPageSeen;
-        lastReportedTotal = totalPages;
-        sendHeartbeat();
-    }
 }
 function decideAcceptEnabled() {
     // Scroll-through / read-time gate removed — the button is always enabled.
@@ -591,39 +574,8 @@ function decideAcceptEnabled() {
     btnAccept.disabled = false;
 }
 setInterval(decideAcceptEnabled, 1000);
-
-// Heartbeat — server uses this for its own validation. Sent as GET so it
-// routes through index.php's special-page dispatcher (POST would land in
-// routePost() with no action and silently exit).
-function sendHeartbeat() {
-    fetch('?page=policy_heartbeat&id=<?= $vid ?>&max_page=' + maxPageSeen + '&total=' + totalPages, { method: 'GET', cache: 'no-store' })
-        .catch(() => {});
-}
-// updateProgress() already pushes a beat whenever the read position changes,
-// which is the only thing the server records. This interval is just a safety
-// net for a reader who is sitting still, so it stays slow on purpose: every
-// beat is a full index.php request (session + config + a database connection),
-// and a whole store reading a new policy at once used to turn that into a
-// steady flood of connections.
-setInterval(sendHeartbeat, 60000);
 </script>
 <?php
-}
-
-// Heartbeat endpoint — POST only, updates session state. Safe to call
-// repeatedly; never trusts the values blindly (they're capped + sanity-
-// checked in doConsentPolicy()).
-function pagePolicyHeartbeat(): void {
-    $vid = (int)($_GET['id'] ?? 0);
-    if ($vid < 1 || ($_SESSION['policy_view_start_id'] ?? 0) !== $vid) {
-        http_response_code(400); echo '{"ok":false}'; return;
-    }
-    $maxPage = max(0, min(10000, (int)($_GET['max_page'] ?? 0)));
-    $total   = max(0, min(10000, (int)($_GET['total']    ?? 0)));
-    $_SESSION['policy_view_max_page'] = max((int)($_SESSION['policy_view_max_page'] ?? 0), $maxPage);
-    $_SESSION['policy_view_total']    = $total;
-    header('Content-Type: application/json');
-    echo json_encode(['ok' => true, 'view_secs' => time() - (int)$_SESSION['policy_view_start']]);
 }
 
 // Stream the PDF file. Auth: must be in scope OR a policy admin OR superadmin.
@@ -1350,7 +1302,6 @@ function doConsentPolicy(): void {
             if ((int)$e->errorInfo[1] !== 1062) throw $e;
         }
         unset($_SESSION['policy_view_start'], $_SESSION['policy_view_start_id'],
-              $_SESSION['policy_view_max_page'], $_SESSION['policy_view_total'],
               $_SESSION['policy_otp'], $_SESSION['policy_otp_vid'], $_SESSION['policy_otp_phone'],
               $_SESSION['policy_otp_phone_mask'], $_SESSION['policy_otp_expires'],
               $_SESSION['policy_otp_last_sent'], $_SESSION['policy_otp_attempts']);
