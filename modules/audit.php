@@ -238,13 +238,20 @@ function auditRecalcTotalScore(int $auditId): float {
         $o = $r['obtain_score'] === null ? 0.0 : (float)$r['obtain_score'];
         $byCat[$cid] += $w * $o / 100.0; // weighted_pct within category (0..100 if sums=100)
     }
+    // sum is 0..100 within a category (its param weights add to 100), so the
+    // audit score is the categories' weighted average. Dividing by the total
+    // of the category weightages rather than assuming 100 lets a template
+    // score every section out of 100 — the Audit 2026 v10 templates do, six
+    // sections of 100 — without changing anything for the older templates
+    // whose weightages already add to 100, where the two are identical.
     $total = 0.0;
+    $wSum  = 0.0;
     foreach ($byCat as $cid => $sum) {
-        $catW = $cw[$cid] ?? 0.0;
-        // sum is 0..100 (since within-cat param weights sum to 100) → multiply by catW / 100
+        $catW  = $cw[$cid] ?? 0.0;
         $total += $catW * $sum / 100.0;
+        $wSum  += $catW;
     }
-    $total = round($total, 2);
+    $total = $wSum > 0 ? round($total * 100.0 / $wSum, 2) : 0.0;
     $db->prepare('UPDATE audits SET total_score = ? WHERE id = ?')->execute([$total, $auditId]);
     return $total;
 }
@@ -365,6 +372,39 @@ function auditGetParameters(int $categoryId = 0): array {
     return $st->fetchAll(PDO::FETCH_ASSOC);
 }
 
+// ── Pickable conditions for a set of questions ─────────
+// audit_parameter_options (2026-08-11) holds the "Option / Condition"
+// and "Action" columns of the audit sheet: the auditor picks one
+// condition and its points drive the score. Returns
+// [parameter_id => [option row, …]], empty for questions that don't use
+// conditions (the older rating / boolean / free-value ones) and for
+// databases that haven't run the migration yet.
+//
+// Inactive conditions are left out — an auditor must not be offered one —
+// so pass $includeInactive to see the full set, which the admin editor
+// needs or a retired condition becomes invisible and uneditable.
+function auditGetParameterOptions(array $paramIds, bool $includeInactive = false): array {
+    if (!$paramIds) return [];
+    $ph = implode(',', array_fill(0, count($paramIds), '?'));
+    $activeOnly = $includeInactive ? '' : ' AND is_active = 1';
+    try {
+        $st = getDb()->prepare(
+            "SELECT id, parameter_id, option_text, action_hint, points, sort_order, is_active
+             FROM audit_parameter_options
+             WHERE parameter_id IN ({$ph}){$activeOnly}
+             ORDER BY parameter_id, sort_order, id"
+        );
+        $st->execute($paramIds);
+    } catch (Exception $e) {
+        return []; // pre-migration DB — questions fall back to plain inputs
+    }
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $o) {
+        $out[(int)$o['parameter_id']][] = $o;
+    }
+    return $out;
+}
+
 // Full tree for audit edit/view: categories with their parameters + response row.
 //
 // Historical fidelity: every audit_response and audit_category_weight row
@@ -396,14 +436,19 @@ function auditGetTree(int $auditId, int $templateId): array {
     $params = [];
     if ($catIds) {
         $ph = implode(',', array_fill(0, count($catIds), '?'));
+        $modeCol = auditHasOptionModeCol() ? 'option_mode' : "'radio' AS option_mode";
         $st = $db->prepare(
-            "SELECT id, category_id, parameter_text, type, max_value, score_weightage, sort_order, is_active
+            "SELECT id, category_id, parameter_text, type, {$modeCol}, max_value, score_weightage, sort_order, is_active
              FROM audit_parameters WHERE category_id IN ({$ph}) ORDER BY category_id, sort_order, id"
         );
         $st->execute($catIds);
         foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $p) $params[] = $p;
     }
     $paramIds = array_column($params, 'id');
+
+    // conditions to pick from, per question (empty for the older
+    // rating/boolean/value questions that don't use them)
+    $opts = auditGetParameterOptions($paramIds);
 
     // responses (carry the snapshot fields used during render)
     $respCols = 'id, audit_id, parameter_id, category_id, category_name,
@@ -412,6 +457,12 @@ function auditGetTree(int $auditId, int $templateId): array {
                  auditor_remark, approver_remark, store_manager_remark';
     if (auditHasFiveStageCols()) {
         $respCols .= ', operation_remark, management_remark';
+    }
+    if (auditHasResponseOptionCols()) {
+        $respCols .= ', option_id, option_text';
+    }
+    if (auditHasResponseOptionIdsCol()) {
+        $respCols .= ', option_ids';
     }
     $resp = [];
     if ($paramIds) {
@@ -512,6 +563,7 @@ function auditGetTree(int $auditId, int $templateId): array {
                     $p['score_weightage'] = (float)$r['actual_weightage'];
                 }
             }
+            $p['options']     = $opts[(int)$p['id']] ?? [];
             $p['response']    = $r;
             $p['attachments'] = $r ? ($atts[(int)$r['id']] ?? []) : [];
             $c['parameters'][] = $p;
@@ -528,6 +580,8 @@ function auditGetTree(int $auditId, int $templateId): array {
                 'score_weightage' => (float)($r['actual_weightage'] ?? 0),
                 'sort_order'      => 9999,
                 'is_active'       => 0,
+                'option_mode'     => 'radio',
+                'options'         => [],
                 'response'        => $r,
                 'attachments'     => $atts[(int)$r['id']] ?? [],
                 'is_orphan'       => true,
@@ -720,6 +774,84 @@ function auditHasFiveStageCols(): bool {
     return $cached;
 }
 
+// Is every question in this tree answered by picking a condition? The
+// templates built from the Audit 2026 v10 sheet are, and for those the
+// audit table drops its Value and Obtain % columns — the answer is the
+// condition itself and its points, so a raw value box and a percentage
+// beside it are noise.
+function auditTreeUsesConditions(array $tree): bool {
+    $seen = false;
+    foreach ($tree as $c) {
+        foreach (($c['parameters'] ?? []) as $p) {
+            if (!empty($p['is_orphan'])) continue;
+            if (empty($p['options'])) return false;
+            $seen = true;
+        }
+    }
+    return $seen;
+}
+
+// What the category weightages on this audit are expected to add up to.
+// Not always 100: a template may score every section out of 100 (the Audit
+// 2026 v10 ones do), and the audit score is then the weighted average over
+// whatever the total is. Read off the snapshot so an audit keeps the scale
+// it was created with. Falls back to 100, which is what every template
+// used before this.
+function auditCategoryWeightTotal(int $auditId): float {
+    $col = auditHasCwSnapshotCols() ? 'actual_weightage' : 'modified_weightage';
+    try {
+        $st = getDb()->prepare("SELECT COALESCE(SUM({$col}), 0) FROM audit_category_weights WHERE audit_id = ?");
+        $st->execute([$auditId]);
+        $sum = (float)$st->fetchColumn();
+    } catch (Exception $e) {
+        $sum = 0.0;
+    }
+    return $sum > 0 ? round($sum, 2) : 100.0;
+}
+
+// Did the 2026-08-11 conditions migration run? Gates the option_id /
+// option_text snapshot on audit_responses. Without it the audit form
+// still renders the pickable conditions, it just can't record which
+// wording was picked, so the read-only view falls back to the points.
+function auditHasResponseOptionCols(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        getDb()->query('SELECT option_id FROM audit_responses LIMIT 0')->fetch();
+        $cached = true;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
+// Did the 2026-08-11 condition-input migration run? Gates
+// audit_parameters.option_mode (radio vs checkbox) and the
+// audit_responses.option_ids list behind it. Without it every question
+// with conditions behaves as 'radio', which is what the sheet describes.
+function auditHasOptionModeCol(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        getDb()->query('SELECT option_mode FROM audit_parameters LIMIT 0')->fetch();
+        $cached = true;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+function auditHasResponseOptionIdsCol(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        getDb()->query('SELECT option_ids FROM audit_responses LIMIT 0')->fetch();
+        $cached = true;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
 // ── Per-parameter response history (for the "history" icon next
 // to each question in the audit edit/view page). Returns saved
 // audit responses for the same parameter across past audits,
@@ -737,6 +869,8 @@ function auditGetParameterHistory(int $paramId, int $excludeAuditId = 0, int $lo
              r.parameter_type AS hist_parameter_type,
              r.category_name  AS hist_category_name'
         : '';
+    // The condition picked at the time, where the question uses conditions.
+    if (auditHasResponseOptionCols()) $snapCols .= ', r.option_text AS hist_option_text';
     $sql = 'SELECT a.id AS audit_id, a.audit_number, a.audit_date, a.status,
                    a.location_id,
                    l.location_name,

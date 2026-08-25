@@ -172,8 +172,13 @@ function auditValidateWeights(int $auditId): array {
     $catSt = $db->prepare('SELECT modified_weightage FROM audit_category_weights WHERE audit_id = ?');
     $catSt->execute([$auditId]);
     foreach ($catSt->fetchAll(PDO::FETCH_COLUMN) as $w) $catSum += (float)$w;
-    if (abs($catSum - 100) > AUDIT_WEIGHT_TOLERANCE) {
-        return [false, 'Category Modified Weightages must sum to 100 (currently ' . number_format($catSum, 2) . ').'];
+    // Expected total is the template's own — 100 for the older templates,
+    // 100 per section for the Audit 2026 v10 ones. Reviewers may still
+    // shift weight between sections, they just can't change the total.
+    $catExpect = auditCategoryWeightTotal($auditId);
+    if (abs($catSum - $catExpect) > AUDIT_WEIGHT_TOLERANCE) {
+        return [false, 'Category Modified Weightages must sum to ' . number_format($catExpect, 0)
+                       . ' (currently ' . number_format($catSum, 2) . ').'];
     }
     // per-cat param sums
     $st = $db->prepare(
@@ -260,6 +265,7 @@ function doSaveAuditWeights(): void {
         $paramVals   = $_POST['param_value']  ?? [];
         $paramMods   = $_POST['param_mod']    ?? [];
         $paramRemark = $_POST['param_remark'] ?? [];
+        $paramOpts   = $_POST['param_option'] ?? [];
 
         // Load each response's effective type + max. When the snapshot
         // columns exist (post-2026-04-27 migration) we prefer the
@@ -295,12 +301,57 @@ function doSaveAuditWeights(): void {
         $pSt->execute([$auditId]);
         foreach ($pSt->fetchAll(PDO::FETCH_ASSOC) as $p) $allParams[(int)$p['id']] = $p;
 
+        // Pickable conditions for these questions, keyed by option id. The
+        // posted param_value is only a mirror the browser keeps for the live
+        // score — the points and the wording are always re-read from the
+        // chosen option here, so a tampered or stale hidden field can't
+        // change a score.
+        $optsByParam = $allParams ? auditGetParameterOptions(array_keys($allParams)) : [];
+        $optById = [];
+        foreach ($optsByParam as $rowsOpt) {
+            foreach ($rowsOpt as $o) $optById[(int)$o['id']] = $o;
+        }
+        $hasOptCols = auditHasResponseOptionCols();
+        $hasOptIds  = auditHasResponseOptionIdsCol();
+
+        $setCols = 'value_entered = ?, obtain_score = ?, modified_weightage = ?, auditor_remark = ?';
+        if ($hasOptCols) $setCols .= ', option_id = ?, option_text = ?';
+        if ($hasOptIds)  $setCols .= ', option_ids = ?';
         $up = $db->prepare(
-            'UPDATE audit_responses SET value_entered = ?, obtain_score = ?, modified_weightage = ?, auditor_remark = ?
-             WHERE audit_id = ? AND parameter_id = ?');
+            "UPDATE audit_responses SET {$setCols} WHERE audit_id = ? AND parameter_id = ?");
         foreach ($allParams as $pid => $p) {
             $rawVal = array_key_exists($pid, $paramVals) ? trim((string)$paramVals[$pid]) : '';
             $val = $rawVal === '' ? null : (float)$rawVal;
+
+            // A question answered by ticking conditions scores the points of
+            // what was ticked — one for a radio question, the sum for a
+            // checkbox one — whatever the posted value field says. Gate on the
+            // question having conditions, not on the POST carrying a key:
+            // clearing every tick posts nothing at all and has to clear the
+            // saved answer.
+            $optId = 0; $optText = null; $optIds = null;
+            if (!empty($optsByParam[$pid])) {
+                $picked = $paramOpts[$pid] ?? [];
+                if (!is_array($picked)) $picked = ($picked === '' ? [] : [$picked]);
+                $ids = []; $texts = []; $sum = 0.0;
+                foreach ($picked as $oidRaw) {
+                    $oid = (int)$oidRaw;
+                    if ($oid > 0 && isset($optById[$oid]) && (int)$optById[$oid]['parameter_id'] === $pid
+                        && !in_array($oid, $ids, true)) {
+                        $ids[]   = $oid;
+                        $texts[] = (string)$optById[$oid]['option_text'];
+                        $sum    += (float)$optById[$oid]['points'];
+                    }
+                }
+                if ($ids) {
+                    $optIds  = implode(',', $ids);
+                    $optText = implode(' | ', $texts);
+                    $optId   = count($ids) === 1 ? $ids[0] : 0;
+                    $val     = $sum;
+                } else {
+                    $val = null; // nothing ticked (or only stale option ids)
+                }
+            }
             // Ratings are restricted to half-steps (0, 0.5, 1, 1.5 … 5) — match
             // the existing mobile app and the input's step="0.5". Snap server-side
             // so any value bypassing the input lands on a legal half-step.
@@ -318,7 +369,12 @@ function doSaveAuditWeights(): void {
                 $modW = (int)round((float)($p['existing_mod_w'] ?? 0));
             }
             $remark = array_key_exists($pid, $paramRemark) ? (string)$paramRemark[$pid] : '';
-            $up->execute([$val, $obtain, $modW, $remark !== '' ? $remark : null, $auditId, $pid]);
+            $upArgs = [$val, $obtain, $modW, $remark !== '' ? $remark : null];
+            if ($hasOptCols) { $upArgs[] = $optId ?: null; $upArgs[] = $optText; }
+            if ($hasOptIds)  { $upArgs[] = $optIds; }
+            $upArgs[] = $auditId;
+            $upArgs[] = $pid;
+            $up->execute($upArgs);
 
             // Attachments: response id was pre-fetched above
             if (!empty($_FILES['param_files']['name'][$pid][0] ?? null)) {
@@ -775,6 +831,8 @@ function exportAuditRegister(): void {
     $pTypeExpr   = $hasRsp ? "COALESCE(r.parameter_type, p.type)"                       : 'p.type';
     $pMaxExpr    = $hasRsp ? "COALESCE(r.parameter_max_value, p.max_value)"             : 'p.max_value';
     $catLinkExpr = $hasRsp ? "COALESCE(r.category_id, p.category_id)"                   : 'p.category_id';
+    // Condition the auditor picked, where the question uses one (2026-08-11).
+    $optTextExpr = auditHasResponseOptionCols() ? 'r.option_text' : 'NULL';
 
     $sql = 'SELECT a.audit_date, a.audit_number, a.status, a.submitted_at, a.approved_at,
                    a.location_id, l.location_name, t.name AS template_name,
@@ -788,6 +846,7 @@ function exportAuditRegister(): void {
                    ' . $pTypeExpr   . ' AS parameter_type,
                    ' . $pMaxExpr    . ' AS parameter_max_value,
                    p.score_weightage     AS param_current_weightage,
+                   ' . $optTextExpr . ' AS picked_option,
                    r.actual_weightage, r.modified_weightage, r.value_entered, r.obtain_score, r.auditor_remark,
                    (SELECT COUNT(*) FROM audit_response_attachments aa WHERE aa.response_id = r.id) AS doc_count,
                    a.total_score
@@ -829,7 +888,7 @@ function exportAuditRegister(): void {
         'Audit Category','Category Actual Weightage','Category Modified Weightage',
         'Audit Parameter','Parameter Type','Parameter Max Value',
         'Parameter Actual Weightage','Parameter Modified Weightage',
-        'Value','Obtain Score','Weighted Obtain (Modified Wt × Obtain%)',
+        'Condition Picked','Value','Obtain Score','Weighted Obtain (Modified Wt × Obtain%)',
         'Total Audit Score','Remarks','Documents'
     ], escape: '');
     foreach ($rows as $r) {
@@ -850,6 +909,7 @@ function exportAuditRegister(): void {
             $r['parameter_max_value'] ?? '',
             $r['actual_weightage'] ?? '',
             $r['modified_weightage'] ?? '',
+            $r['picked_option'] ?? '',
             $r['value_entered'] ?? '', $r['obtain_score'] ?? '', $obtPct,
             $r['total_score'] ?? '', $r['auditor_remark'] ?? '', $r['doc_count'] ?? 0
         ], escape: '');

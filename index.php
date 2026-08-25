@@ -193,6 +193,8 @@ function routePost(string $a): void {
         case 'del_audit_category':        if (function_exists('doDelAuditCategory'))       doDelAuditCategory();       break;
         case 'save_audit_parameter':      if (function_exists('doSaveAuditParameter'))     doSaveAuditParameter();     break;
         case 'del_audit_parameter':       if (function_exists('doDelAuditParameter'))      doDelAuditParameter();      break;
+        case 'save_audit_condition':      if (function_exists('doSaveAuditCondition'))     doSaveAuditCondition();     break;
+        case 'del_audit_condition':       if (function_exists('doDelAuditCondition'))      doDelAuditCondition();      break;
         // Violations
         case 'create_violation':          if (function_exists('doCreateViolation'))         doCreateViolation();         break;
         case 'add_violation_remark':      if (function_exists('doAddViolationRemark'))      doAddViolationRemark();      break;

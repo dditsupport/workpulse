@@ -35,6 +35,9 @@ function pageAuditTemplates(): void {
     }
     $paramsByCat = [];
     foreach ($params as $p) { $paramsByCat[(int)$p['category_id']][] = $p; }
+    // Pickable conditions per question — shown read-only under the question
+    // so an admin can see what the auditor will be choosing from.
+    $prmOpts = auditGetParameterOptions(array_column($params, 'id'));
     ?>
     <div class="page-header">
         <h2>Audit Template</h2>
@@ -158,9 +161,24 @@ function pageAuditTemplates(): void {
                                     <?php if ($p['type'] !== 'rating'): ?>
                                         <span class="prm-pill type"><?= h($p['type']) ?><?= $p['type'] === 'value' && $p['max_value'] !== null ? ' · max ' . h($p['max_value']) : '' ?></span>
                                     <?php endif; ?>
+                                    <?php $pOpts = $prmOpts[(int)$p['id']] ?? []; if ($pOpts): ?>
+                                        <span class="prm-pill type"><?= ($p['option_mode'] ?? 'radio') === 'checkbox' ? 'checkbox · tick many' : 'radio · pick one' ?></span>
+                                        <ul class="prm-conds">
+                                            <?php foreach ($pOpts as $o): ?>
+                                                <li>
+                                                    <?= h($o['option_text']) ?>
+                                                    <span class="pts"><?= h((string)(float)$o['points']) ?></span>
+                                                    <?php if (!empty($o['action_hint'])): ?>
+                                                        <em>&rarr; <?= h($o['action_hint']) ?></em>
+                                                    <?php endif; ?>
+                                                </li>
+                                            <?php endforeach; ?>
+                                        </ul>
+                                    <?php endif; ?>
                                 </div>
                                 <div class="num"><?= number_format((float)$p['score_weightage'], 0) ?></div>
                                 <div class="actions-col">
+                                    <a class="btn btn-sm btn-secondary" href="?page=audit_conditions&parameter_id=<?= (int)$p['id'] ?>">Conditions<?= $pOpts ? ' (' . count($pOpts) . ')' : '' ?></a>
                                     <button type="button" class="btn btn-sm btn-secondary" onclick='auditPrmOpen("edit", <?= (int)$p['id'] ?>)'>Edit</button>
                                     <form method="POST" class="inline-form" onsubmit="return confirm('Delete this parameter?')">
                                         <input type="hidden" name="action" value="del_audit_parameter">
@@ -224,6 +242,13 @@ function auditTplPageStyles(): void {
     .audit-tree-row .caret{appearance:none;border:none;background:transparent;cursor:pointer;font-size:12px;color:var(--muted);width:18px;padding:0;line-height:1}
     .audit-tree-row .caret[aria-expanded="false"]{transform:rotate(-90deg)}
     .audit-tree-row .folder{font-size:14px}
+    /* Read-only list of the conditions a question offers, with the action
+       each one calls for. Wraps onto its own line under the question. */
+    .audit-tree-row.prm-row .name{flex-wrap:wrap}
+    .prm-conds{flex-basis:100%;list-style:none;margin:4px 0 2px;padding:0 0 0 22px;font-size:11.5px;line-height:1.45;color:var(--muted)}
+    .prm-conds li{padding:1px 0}
+    .prm-conds .pts{margin-left:6px;font-weight:600;color:var(--text);opacity:.75;font-variant-numeric:tabular-nums}
+    .prm-conds em{opacity:.85}
     .audit-tree-row .diamond{font-size:11px;color:var(--yellow)}
     .cat-row{background:rgba(255,255,255,.03);font-weight:600}
     .cat-row .name .lbl{color:var(--text)}
@@ -344,6 +369,14 @@ function auditTplPageModals(array $templates, array $cats): void {
                         <input type="number" step="0.01" class="form-control" name="max_value" id="prm-modal-max">
                     </div>
                 </div>
+                <div>
+                    <label>Conditions answered by</label>
+                    <select class="form-control" name="option_mode" id="prm-modal-mode">
+                        <option value="radio">Radio — pick one condition</option>
+                        <option value="checkbox">Checkbox — tick any number, points add up</option>
+                    </select>
+                    <div class="hint">Only applies to questions that have conditions configured.</div>
+                </div>
                 <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
                     <div>
                         <label>Score Weightage</label>
@@ -398,6 +431,7 @@ function auditTplPageJs(array $templates, array $cats): void {
                 'category_id'     => (int)$p['category_id'],
                 'parameter_text'  => $p['parameter_text'],
                 'type'            => $p['type'],
+                'option_mode'     => $p['option_mode'] ?? 'radio',
                 'max_value'       => $p['max_value'] !== null ? (float)$p['max_value'] : null,
                 'score_weightage' => (float)$p['score_weightage'],
                 'sort_order'      => (int)$p['sort_order'],
@@ -480,6 +514,7 @@ function auditTplPageJs(array $templates, array $cats): void {
             document.getElementById('prm-modal-cat').value = '';
             document.getElementById('prm-modal-text').value = '';
             document.getElementById('prm-modal-type').value = 'rating';
+            document.getElementById('prm-modal-mode').value = 'radio';
             document.getElementById('prm-modal-max').value = '';
             document.getElementById('prm-modal-wt').value = '';
             document.getElementById('prm-modal-sort').value = '0';
@@ -490,6 +525,7 @@ function auditTplPageJs(array $templates, array $cats): void {
                 document.getElementById('prm-modal-cat').value = prmMap[id].category_id;
                 document.getElementById('prm-modal-text').value = prmMap[id].parameter_text || '';
                 document.getElementById('prm-modal-type').value = prmMap[id].type || 'rating';
+                document.getElementById('prm-modal-mode').value = prmMap[id].option_mode || 'radio';
                 document.getElementById('prm-modal-max').value = prmMap[id].max_value === null ? '' : prmMap[id].max_value;
                 document.getElementById('prm-modal-wt').value = prmMap[id].score_weightage;
                 document.getElementById('prm-modal-sort').value = prmMap[id].sort_order;
@@ -639,6 +675,7 @@ function pageAuditParameters(): void {
     $templates = auditGetTemplates(false);
     $cats = auditGetCategories($templateFilter);
     $params = auditGetParameters($categoryFilter);
+    $prmOpts = auditGetParameterOptions(array_column($params, 'id'));
     ?>
     <div class="page-header"><h2>Audit Parameters</h2></div>
     <form method="POST" class="form-card" style="margin-bottom:18px">
@@ -672,6 +709,13 @@ function pageAuditParameters(): void {
             <div class="form-group" id="prm-max-wrap" style="display:none">
                 <label>Max Value (for Value type)</label>
                 <input type="number" step="0.01" class="form-control" name="max_value" id="prm-max">
+            </div>
+            <div class="form-group">
+                <label>Conditions answered by</label>
+                <select class="form-control" name="option_mode" id="prm-mode">
+                    <option value="radio">Radio — pick one condition</option>
+                    <option value="checkbox">Checkbox — tick any number, points add up</option>
+                </select>
             </div>
             <div class="form-group">
                 <label>Score Weightage <span class="required">*</span></label>
@@ -711,14 +755,26 @@ function pageAuditParameters(): void {
                 <tr>
                     <td data-label="ID"><?= (int)$p['id'] ?></td>
                     <td data-label="Category"><?= h($p['template_name']) ?> / <?= h($p['category_name']) ?></td>
-                    <td data-label="Parameter"><?= h($p['parameter_text']) ?></td>
+                    <td data-label="Parameter"><?= h($p['parameter_text']) ?>
+                        <?php $pOpts = $prmOpts[(int)$p['id']] ?? []; if ($pOpts): ?>
+                            <ul class="prm-conds" style="list-style:none;margin:4px 0 0;padding:0;font-size:11.5px;line-height:1.45;color:var(--muted)">
+                                <?php foreach ($pOpts as $o): ?>
+                                    <li><?= h($o['option_text']) ?>
+                                        <span style="font-weight:600;color:var(--text);opacity:.75"><?= h((string)(float)$o['points']) ?></span>
+                                        <?php if (!empty($o['action_hint'])): ?><em>&rarr; <?= h($o['action_hint']) ?></em><?php endif; ?>
+                                    </li>
+                                <?php endforeach; ?>
+                            </ul>
+                        <?php endif; ?>
+                    </td>
                     <td data-label="Type"><?= h($p['type']) ?></td>
                     <td data-label="Max"><?= $p['max_value'] !== null ? h($p['max_value']) : '—' ?></td>
                     <td data-label="Score Wt."><?= number_format((float)$p['score_weightage'], 2) ?></td>
                     <td data-label="Sort"><?= (int)$p['sort_order'] ?></td>
                     <td data-label="Active"><?= $p['is_active'] ? '<span class="badge badge-green">Yes</span>' : '<span class="badge badge-grey">No</span>' ?></td>
                     <td data-label="Actions" class="actions">
-                        <button class="btn btn-sm btn-primary" type="button" onclick='editPrm(<?= (int)$p['id'] ?>, <?= (int)$p['category_id'] ?>, <?= json_encode($p['parameter_text']) ?>, <?= json_encode($p['type']) ?>, <?= $p['max_value'] === null ? 'null' : (float)$p['max_value'] ?>, <?= (float)$p['score_weightage'] ?>, <?= (int)$p['sort_order'] ?>, <?= (int)$p['is_active'] ?>)'>Edit</button>
+                        <a class="btn btn-sm btn-secondary" href="?page=audit_conditions&parameter_id=<?= (int)$p['id'] ?>">Conditions</a>
+                        <button class="btn btn-sm btn-primary" type="button" onclick='editPrm(<?= (int)$p['id'] ?>, <?= (int)$p['category_id'] ?>, <?= htmlspecialchars(json_encode($p['parameter_text']), ENT_QUOTES) ?>, <?= json_encode($p['type']) ?>, <?= $p['max_value'] === null ? 'null' : (float)$p['max_value'] ?>, <?= (float)$p['score_weightage'] ?>, <?= (int)$p['sort_order'] ?>, <?= (int)$p['is_active'] ?>, <?= json_encode($p['option_mode'] ?? 'radio') ?>)'>Edit</button>
                         <form method="POST" class="inline-form" onsubmit="return confirm('Delete parameter?')">
                             <input type="hidden" name="action" value="del_audit_parameter">
                             <input type="hidden" name="id" value="<?= (int)$p['id'] ?>">
@@ -735,11 +791,12 @@ function pageAuditParameters(): void {
         var t = document.getElementById('prm-type').value;
         document.getElementById('prm-max-wrap').style.display = (t === 'value') ? '' : 'none';
     }
-    function editPrm(id,cat,txt,type,max,wt,sort,active){
+    function editPrm(id,cat,txt,type,max,wt,sort,active,mode){
         document.getElementById('prm-id').value=id;
         document.getElementById('prm-cat').value=cat;
         document.getElementById('prm-text').value=txt;
         document.getElementById('prm-type').value=type;
+        document.getElementById('prm-mode').value = mode || 'radio';
         document.getElementById('prm-max').value = (max === null ? '' : max);
         document.getElementById('prm-wt').value=wt;
         document.getElementById('prm-sort').value=sort;
@@ -747,8 +804,154 @@ function pageAuditParameters(): void {
         toggleMax();
         window.scrollTo({top:0, behavior:'smooth'});
     }
-    function resetPrm(){['prm-id','prm-text','prm-max','prm-wt'].forEach(function(x){document.getElementById(x).value='';});document.getElementById('prm-type').value='rating';document.getElementById('prm-sort').value='0';document.getElementById('prm-active').checked=true;toggleMax();}
+    function resetPrm(){['prm-id','prm-text','prm-max','prm-wt'].forEach(function(x){document.getElementById(x).value='';});document.getElementById('prm-type').value='rating';document.getElementById('prm-mode').value='radio';document.getElementById('prm-sort').value='0';document.getElementById('prm-active').checked=true;toggleMax();}
     toggleMax();
+    </script>
+    <?php
+}
+
+// ===========================================================
+// PAGE: Conditions for one question (admin)
+// ===========================================================
+// The conditions an auditor picks from, with the action each one calls
+// for and the marks it carries. Reached from the Conditions button beside
+// a question on the Audit Templates screen.
+function pageAuditConditions(): void {
+    if (!auditCanAdmin()) { echo '<p>Access denied.</p>'; return; }
+    $paramId = (int)($_GET['parameter_id'] ?? 0);
+    if ($paramId < 1) { echo '<p>No question selected.</p>'; return; }
+
+    $st = getDb()->prepare(
+        'SELECT p.*, c.name AS category_name, c.template_id, t.name AS template_name
+         FROM audit_parameters p
+         JOIN audit_categories c ON c.id = p.category_id
+         JOIN audit_templates  t ON t.id = c.template_id
+         WHERE p.id = ?');
+    $st->execute([$paramId]);
+    $p = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$p) { echo '<p>Question not found.</p>'; return; }
+
+    $full = $p['max_value'] !== null ? (float)$p['max_value'] : 0.0;
+    // Inactive ones included: this is where they get switched back on.
+    $opts = auditGetParameterOptions([$paramId], true)[$paramId] ?? [];
+    $backTpl = '?page=audit_templates&template_id=' . (int)$p['template_id'];
+    ?>
+    <div class="page-header">
+        <h2>Conditions</h2>
+        <a class="btn btn-ghost" href="<?= h($backTpl) ?>">Back to template</a>
+    </div>
+    <div class="form-card" style="margin-bottom:14px">
+        <div style="color:var(--muted);font-size:12px"><?= h($p['template_name']) ?> / <?= h($p['category_name']) ?></div>
+        <div style="font-size:15px;font-weight:600;margin-top:2px"><?= h($p['parameter_text']) ?></div>
+        <div class="hint" style="margin-top:6px">
+            Full marks for this question: <strong><?= h((string)$full) ?></strong>.
+            A positive condition scores that, a negative one scores 0.
+            <?php if (($p['option_mode'] ?? 'radio') === 'checkbox'): ?>
+                The auditor may tick several and the marks add up.
+            <?php else: ?>
+                The auditor picks exactly one.
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <form method="POST" class="form-card" style="margin-bottom:18px">
+        <input type="hidden" name="action" value="save_audit_condition">
+        <input type="hidden" name="parameter_id" value="<?= $paramId ?>">
+        <input type="hidden" name="id" id="cond-id">
+        <div class="form-grid">
+            <div class="form-group" style="grid-column:1 / -1">
+                <label>Condition <span class="required">*</span></label>
+                <textarea class="form-control" name="option_text" id="cond-text" rows="2" required
+                          placeholder="e.g. Heavy dust and cooling issue found, and a ticket is already raised"></textarea>
+            </div>
+            <div class="form-group" style="grid-column:1 / -1">
+                <label>Action</label>
+                <input class="form-control" name="action_hint" id="cond-action"
+                       placeholder="What the auditor has to do for this condition — e.g. No action">
+            </div>
+            <div class="form-group">
+                <label>Marks <span class="required">*</span></label>
+                <select class="form-control" name="marks_mode" id="cond-marks" onchange="condToggleMarks()">
+                    <option value="full">Positive — full marks (<?= h((string)$full) ?>)</option>
+                    <option value="zero">Negative — 0</option>
+                    <option value="custom">Custom</option>
+                </select>
+            </div>
+            <div class="form-group" id="cond-points-wrap" style="display:none">
+                <label>Points</label>
+                <input type="number" step="0.01" min="0" class="form-control" name="points" id="cond-points">
+            </div>
+            <div class="form-group">
+                <label>Sort Order</label>
+                <input type="number" class="form-control" name="sort_order" id="cond-sort" value="<?= count($opts) + 1 ?>">
+            </div>
+            <div class="form-group">
+                <label class="checkbox-label"><input type="checkbox" name="is_active" id="cond-active" checked value="1"> Active</label>
+            </div>
+        </div>
+        <div class="form-actions">
+            <button class="btn btn-primary" id="cond-submit">Add Condition</button>
+            <button type="button" class="btn btn-ghost" onclick="condReset()">Reset</button>
+        </div>
+    </form>
+
+    <div class="table-wrap" data-stack>
+        <table class="table">
+            <thead><tr><th>Condition</th><th>Action</th><th style="width:90px">Points</th><th style="width:70px">Sort</th><th style="width:80px">Active</th><th style="width:160px">Actions</th></tr></thead>
+            <tbody>
+            <?php if (!$opts): ?>
+                <tr><td colspan="6" class="empty-row">No conditions yet. The question falls back to a plain value box until it has some.</td></tr>
+            <?php else: foreach ($opts as $o): ?>
+                <tr>
+                    <td data-label="Condition"><?= h($o['option_text']) ?></td>
+                    <td data-label="Action"><?= $o['action_hint'] !== null && $o['action_hint'] !== '' ? h($o['action_hint']) : '—' ?></td>
+                    <td data-label="Points"><?= h((string)(float)$o['points']) ?></td>
+                    <td data-label="Sort"><?= (int)$o['sort_order'] ?></td>
+                    <td data-label="Active"><?= $o['is_active'] ? '<span class="badge badge-green">Yes</span>' : '<span class="badge badge-grey">No</span>' ?></td>
+                    <td data-label="Actions" class="actions">
+                        <button class="btn btn-sm btn-primary" type="button"
+                                onclick='condEdit(<?= (int)$o['id'] ?>, <?= htmlspecialchars(json_encode($o['option_text']), ENT_QUOTES) ?>, <?= htmlspecialchars(json_encode((string)($o['action_hint'] ?? '')), ENT_QUOTES) ?>, <?= (float)$o['points'] ?>, <?= (int)$o['sort_order'] ?>, <?= (int)$o['is_active'] ?>)'>Edit</button>
+                        <form method="POST" class="inline-form" onsubmit="return confirm('Delete this condition?')">
+                            <input type="hidden" name="action" value="del_audit_condition">
+                            <input type="hidden" name="id" value="<?= (int)$o['id'] ?>">
+                            <button class="btn btn-sm btn-danger">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+            <?php endforeach; endif; ?>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+    var condFull = <?= json_encode($full) ?>;
+    function condToggleMarks(){
+        var m = document.getElementById('cond-marks').value;
+        document.getElementById('cond-points-wrap').style.display = (m === 'custom') ? '' : 'none';
+    }
+    function condEdit(id, text, action, points, sort, active){
+        document.getElementById('cond-id').value = id;
+        document.getElementById('cond-text').value = text;
+        document.getElementById('cond-action').value = action;
+        document.getElementById('cond-sort').value = sort;
+        document.getElementById('cond-active').checked = !!active;
+        // Match the stored points back to the simple choices where we can,
+        // so editing a plain positive/negative condition stays a one-click job.
+        var mode = (points === condFull && condFull > 0) ? 'full' : (points === 0 ? 'zero' : 'custom');
+        document.getElementById('cond-marks').value = mode;
+        document.getElementById('cond-points').value = points;
+        condToggleMarks();
+        document.getElementById('cond-submit').textContent = 'Save Condition';
+        window.scrollTo({top:0, behavior:'smooth'});
+    }
+    function condReset(){
+        ['cond-id','cond-text','cond-action','cond-points'].forEach(function(x){ document.getElementById(x).value=''; });
+        document.getElementById('cond-marks').value='full';
+        document.getElementById('cond-active').checked=true;
+        condToggleMarks();
+        document.getElementById('cond-submit').textContent = 'Add Condition';
+    }
+    condToggleMarks();
     </script>
     <?php
 }
@@ -837,16 +1040,27 @@ function doSaveAuditParameter(): void {
     $wt    = (float)($_POST['score_weightage'] ?? 0);
     $sort  = (int)($_POST['sort_order'] ?? 0);
     $active = !empty($_POST['is_active']) ? 1 : 0;
+    // How the question's conditions are answered — one (radio) or many
+    // (checkbox). Ignored on a database that hasn't run the 2026-08-11
+    // condition-input migration.
+    $mode  = ($_POST['option_mode'] ?? 'radio') === 'checkbox' ? 'checkbox' : 'radio';
+    $hasMode = auditHasOptionModeCol();
     if (!$cat || $text === '') { flash('error', 'Category and text required.'); header('Location: ' . auditAdminBackTo('?page=audit_parameters')); return; }
     if ($type === 'value' && ($max === null || $max <= 0)) { flash('error', 'Max Value required for Value type.'); header('Location: ' . auditAdminBackTo('?page=audit_parameters')); return; }
     $db = getDb();
     try {
         if ($id > 0) {
-            $db->prepare('UPDATE audit_parameters SET category_id=?, parameter_text=?, type=?, max_value=?, score_weightage=?, sort_order=?, is_active=? WHERE id=?')
-               ->execute([$cat,$text,$type,$max,$wt,$sort,$active,$id]);
+            $db->prepare('UPDATE audit_parameters SET category_id=?, parameter_text=?, type=?, max_value=?, score_weightage=?, sort_order=?, is_active=?'
+                         . ($hasMode ? ', option_mode=?' : '') . ' WHERE id=?')
+               ->execute($hasMode
+                   ? [$cat,$text,$type,$max,$wt,$sort,$active,$mode,$id]
+                   : [$cat,$text,$type,$max,$wt,$sort,$active,$id]);
         } else {
-            $db->prepare('INSERT INTO audit_parameters (category_id, parameter_text, type, max_value, score_weightage, sort_order, is_active) VALUES (?,?,?,?,?,?,?)')
-               ->execute([$cat,$text,$type,$max,$wt,$sort,$active]);
+            $db->prepare('INSERT INTO audit_parameters (category_id, parameter_text, type, max_value, score_weightage, sort_order, is_active'
+                         . ($hasMode ? ', option_mode' : '') . ') VALUES (?,?,?,?,?,?,?' . ($hasMode ? ',?' : '') . ')')
+               ->execute($hasMode
+                   ? [$cat,$text,$type,$max,$wt,$sort,$active,$mode]
+                   : [$cat,$text,$type,$max,$wt,$sort,$active]);
         }
         flash('success', 'Parameter saved.');
     } catch (Exception $e) { flash('error', 'Save failed: ' . $e->getMessage()); }
@@ -883,6 +1097,98 @@ function doDelAuditParameter(): void {
         }
     }
     header('Location: ' . auditAdminBackTo($tpl > 0 ? '?page=audit_templates&template_id=' . $tpl : '?page=audit_parameters'));
+}
+
+// ===========================================================
+// POST HANDLERS — Conditions on a question
+// ===========================================================
+function doSaveAuditCondition(): void {
+    if (!auditCanAdmin()) { header('Location: ?page=audit_templates'); return; }
+    $id      = (int)($_POST['id'] ?? 0);
+    $paramId = (int)($_POST['parameter_id'] ?? 0);
+    $text    = trim((string)($_POST['option_text'] ?? ''));
+    $action  = trim((string)($_POST['action_hint'] ?? ''));
+    $sort    = (int)($_POST['sort_order'] ?? 0);
+    $active  = !empty($_POST['is_active']) ? 1 : 0;
+    $back    = '?page=audit_conditions&parameter_id=' . $paramId;
+
+    // Editing an existing condition: its parameter is whatever it already
+    // belongs to, never whatever the form claims.
+    $db = getDb();
+    if ($id > 0) {
+        $st = $db->prepare('SELECT parameter_id FROM audit_parameter_options WHERE id = ?');
+        $st->execute([$id]);
+        $owner = (int)$st->fetchColumn();
+        if ($owner < 1) { flash('error', 'Condition not found.'); header('Location: ?page=audit_templates'); return; }
+        $paramId = $owner;
+        $back    = '?page=audit_conditions&parameter_id=' . $paramId;
+    }
+    if ($paramId < 1 || $text === '') {
+        flash('error', 'Question and condition text required.');
+        header('Location: ' . $back); return;
+    }
+
+    $st = $db->prepare('SELECT max_value FROM audit_parameters WHERE id = ?');
+    $st->execute([$paramId]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$row) { flash('error', 'Question not found.'); header('Location: ?page=audit_templates'); return; }
+    $full = $row['max_value'] !== null ? (float)$row['max_value'] : 0.0;
+
+    // Marks: full for a positive condition, 0 for a negative one, or a
+    // number the admin types. Points above the question's Max Value would
+    // score over 100% for that question, so they're refused — raise the
+    // Max Value on the question first if that's really the intent.
+    switch ($_POST['marks_mode'] ?? 'full') {
+        case 'zero':   $points = 0.0; break;
+        case 'custom': $points = (float)($_POST['points'] ?? 0); break;
+        default:       $points = $full; break;
+    }
+    if ($points < 0) $points = 0.0;
+    if ($full > 0 && $points > $full) {
+        flash('error', 'Points cannot exceed the question\'s Max Value (' . number_format($full, 2)
+                     . '). Raise Max Value on the question first.');
+        header('Location: ' . $back); return;
+    }
+
+    try {
+        if ($id > 0) {
+            $db->prepare('UPDATE audit_parameter_options
+                             SET option_text = ?, action_hint = ?, points = ?, sort_order = ?, is_active = ?
+                           WHERE id = ?')
+               ->execute([$text, $action !== '' ? $action : null, $points, $sort, $active, $id]);
+        } else {
+            $db->prepare('INSERT INTO audit_parameter_options
+                            (parameter_id, option_text, action_hint, points, sort_order, is_active)
+                          VALUES (?,?,?,?,?,?)')
+               ->execute([$paramId, $text, $action !== '' ? $action : null, $points, $sort, $active]);
+        }
+        flash('success', 'Condition saved.');
+    } catch (Exception $e) {
+        flash('error', 'Save failed: ' . $e->getMessage());
+    }
+    header('Location: ' . $back);
+}
+
+function doDelAuditCondition(): void {
+    if (!auditCanAdmin()) { header('Location: ?page=audit_templates'); return; }
+    $id = (int)($_POST['id'] ?? 0);
+    $paramId = 0;
+    if ($id > 0) {
+        $db = getDb();
+        $st = $db->prepare('SELECT parameter_id FROM audit_parameter_options WHERE id = ?');
+        $st->execute([$id]);
+        $paramId = (int)$st->fetchColumn();
+        // Audits that already picked this condition keep their own snapshot
+        // of its wording and marks on the response, so deleting the master
+        // row can't rewrite an audit that has been filed.
+        try {
+            $db->prepare('DELETE FROM audit_parameter_options WHERE id = ?')->execute([$id]);
+            flash('success', 'Condition deleted.');
+        } catch (Exception $e) {
+            flash('error', 'Delete failed: ' . $e->getMessage());
+        }
+    }
+    header('Location: ' . ($paramId > 0 ? '?page=audit_conditions&parameter_id=' . $paramId : '?page=audit_templates'));
 }
 
 // ===========================================================
@@ -943,6 +1249,9 @@ function exportAuditTemplates(): void {
     foreach ($cats   as $c) $catsByTpl[(int)$c['template_id']][] = $c;
     $paramsByCat = [];
     foreach ($params as $p) $paramsByCat[(int)$p['category_id']][] = $p;
+    // One row per condition, so the export has the same shape as the sheet
+    // it was built from. A question without conditions still gets its row.
+    $prmOpts = auditGetParameterOptions(array_column($params, 'id'));
 
     // Filename: include the template name when filtered to a single
     // template, otherwise mark as ALL.
@@ -971,6 +1280,7 @@ function exportAuditTemplates(): void {
         'Category ID', 'Category Name', 'Category Weightage', 'Category Sort',
         'Parameter ID', 'Parameter Text', 'Parameter Type', 'Max Value',
         'Score Weightage', 'Parameter Sort', 'Parameter Active',
+        'Condition', 'Action', 'Points',
     ], escape: '');
 
     foreach ($templates as $t) {
@@ -982,6 +1292,7 @@ function exportAuditTemplates(): void {
                 $tplId, $t['name'], $t['is_active'] ? 'Yes' : 'No',
                 '', '(no categories)', '', '',
                 '', '', '', '', '', '', '',
+                '', '', '',
             ], escape: '');
             continue;
         }
@@ -995,12 +1306,13 @@ function exportAuditTemplates(): void {
                     $tplId, $t['name'], $t['is_active'] ? 'Yes' : 'No',
                     $catId, $c['name'], number_format((float)$c['weightage'], 2, '.', ''), (int)$c['sort_order'],
                     '', '(no parameters)', '', '', '', '', '',
+                    '', '', '',
                 ], escape: '');
                 continue;
             }
 
             foreach ($list as $p) {
-                fputcsv($out, [
+                $base = [
                     $tplId, $t['name'], $t['is_active'] ? 'Yes' : 'No',
                     $catId, $c['name'], number_format((float)$c['weightage'], 2, '.', ''), (int)$c['sort_order'],
                     (int)$p['id'], $p['parameter_text'], $p['type'],
@@ -1008,7 +1320,19 @@ function exportAuditTemplates(): void {
                     number_format((float)$p['score_weightage'], 2, '.', ''),
                     (int)$p['sort_order'],
                     $p['is_active'] ? 'Yes' : 'No',
-                ], escape: '');
+                ];
+                $pOpts = $prmOpts[(int)$p['id']] ?? [];
+                if (!$pOpts) {
+                    fputcsv($out, array_merge($base, ['', '', '']), escape: '');
+                    continue;
+                }
+                foreach ($pOpts as $o) {
+                    fputcsv($out, array_merge($base, [
+                        $o['option_text'],
+                        $o['action_hint'] ?? '',
+                        number_format((float)$o['points'], 2, '.', ''),
+                    ]), escape: '');
+                }
             }
         }
     }
