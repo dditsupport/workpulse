@@ -780,7 +780,27 @@ function pageAuditEdit(): void {
         header('Location: ?page=audit_list'); exit;
     }
 
+    // One section at a time: figure out how far the auditor has actually
+    // gotten (every question in a category answered) so far-off sections
+    // stay locked, then clamp the requested section into what's reachable.
+    // $section is 1-based to match the "Section N of M" framing on screen.
+    $total = count($tree);
+    $furthest = $total;
+    foreach ($tree as $i => $c) {
+        $complete = true;
+        foreach ($c['parameters'] as $p) {
+            $r = $p['response'] ?? null;
+            if (!$r || $r['value_entered'] === null) { $complete = false; break; }
+        }
+        if (!$complete) { $furthest = $i + 1; break; }
+    }
+    $section = (int)($_GET['section'] ?? 1);
+    if ($section < 1) $section = 1;
+    if ($total > 0) $section = min($section, $total, $furthest);
+    $currentCat = $total > 0 ? $tree[$section - 1] : null;
+
     renderAuditHeader($a);
+    if ($total > 0) renderAuditSectionStepper($tree, $section, $furthest, $id, $draftToken);
     ?>
     <form method="POST" enctype="multipart/form-data" id="auditForm">
         <input type="hidden" name="action" value="save_audit_weights">
@@ -788,11 +808,20 @@ function pageAuditEdit(): void {
         <?php if ($id === 0 && $draftToken !== ''): ?>
             <input type="hidden" name="draft_token" value="<?= h($draftToken) ?>">
         <?php endif; ?>
-        <?php renderAuditEditTable($tree, $id, false, (int)($a['location_id'] ?? 0)); ?>
-        <div class="form-actions" style="position:sticky;bottom:0;z-index:50;margin-top:20px;padding:12px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 -4px 12px rgba(0,0,0,.25)">
+        <input type="hidden" name="section" value="<?= (int)$section ?>">
+        <input type="hidden" name="current_category_id" value="<?= (int)($currentCat['id'] ?? 0) ?>">
+        <?php renderAuditEditTable($currentCat ? [$currentCat] : [], $id, false, (int)($a['location_id'] ?? 0)); ?>
+        <div class="form-actions" style="position:sticky;bottom:0;z-index:50;margin-top:20px;padding:12px 14px;background:var(--surface);border:1px solid var(--border);border-radius:8px;box-shadow:0 -4px 12px rgba(0,0,0,.25);display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+            <?php if ($section > 1): ?>
+                <button class="btn btn-secondary" type="submit" name="nav" value="prev">← Previous</button>
+            <?php endif; ?>
             <button class="btn btn-primary" type="submit">Save</button>
-            <button class="btn btn-success" type="submit" name="submit_after_save" value="1">Save & Submit</button>
-            <a class="btn btn-ghost" href="?page=audit_list">Back</a>
+            <?php if ($section < $total): ?>
+                <button class="btn btn-success" type="submit" name="nav" value="next">Next →</button>
+            <?php else: ?>
+                <button class="btn btn-success" type="submit" name="submit_after_save" value="1">Save & Submit</button>
+            <?php endif; ?>
+            <a class="btn btn-ghost" href="?page=audit_list" style="margin-left:auto">Back</a>
         </div>
     </form>
     <form method="POST" id="auditAttDelForm">
@@ -801,6 +830,47 @@ function pageAuditEdit(): void {
         <input type="hidden" name="att_id" id="auditAttDelAttId" value="">
     </form>
     <?php renderAuditEditJs(); ?>
+    <?php
+}
+
+// ── Section stepper — one pill per category, shown above the form ──
+// A section is clickable once it's been reached ($idx <= $furthest);
+// anything beyond that is locked (greyed, no link) until the auditor
+// completes what comes before it. The current section is highlighted;
+// anything strictly before $furthest is a finished section (checkmark).
+function renderAuditSectionStepper(array $tree, int $current, int $furthest, int $auditId, string $draftToken): void {
+    $base = $auditId > 0 ? ('?page=audit_edit&id=' . $auditId) : ('?page=audit_edit&draft=' . h($draftToken));
+    ?>
+    <style>
+    .audit-stepper{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+    .audit-step{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:999px;font-size:12.5px;font-weight:600;border:1px solid var(--border);color:var(--muted);background:rgba(255,255,255,.03);text-decoration:none;white-space:nowrap}
+    .audit-step .n{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:rgba(255,255,255,.08);font-size:10.5px;flex-shrink:0}
+    a.audit-step:hover{border-color:var(--accent);color:var(--text)}
+    .audit-step.is-current{border-color:var(--accent);background:rgba(26,143,227,.12);color:var(--text)}
+    .audit-step.is-current .n{background:var(--accent);color:#fff}
+    .audit-step.is-done{color:var(--green)}
+    .audit-step.is-done .n{background:rgba(39,174,96,.22);color:var(--green)}
+    .audit-step.is-locked{opacity:.5;cursor:default}
+    </style>
+    <div class="audit-stepper">
+        <?php foreach ($tree as $i => $c):
+            $idx = $i + 1;
+            $reachable = $idx <= $furthest;
+            $done      = $idx < $furthest;
+            $isCurrent = $idx === $current;
+            $cls = 'audit-step' . ($isCurrent ? ' is-current' : ($done ? ' is-done' : '')) . (!$reachable ? ' is-locked' : '');
+        ?>
+            <?php if ($reachable && !$isCurrent): ?>
+                <a class="<?= $cls ?>" href="<?= $base . '&section=' . $idx ?>">
+                    <span class="n"><?= $done ? '✓' : $idx ?></span><?= h($c['name']) ?>
+                </a>
+            <?php else: ?>
+                <span class="<?= $cls ?>">
+                    <span class="n"><?= $done ? '✓' : $idx ?></span><?= h($c['name']) ?>
+                </span>
+            <?php endif; ?>
+        <?php endforeach; ?>
+    </div>
     <?php
 }
 
