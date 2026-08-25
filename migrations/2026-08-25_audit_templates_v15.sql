@@ -46,10 +46,16 @@
 -- was already either a question's full points or zero, never a value in
 -- between, so max_value and every positive option's points are set equal
 -- to score_weightage below (a negative option stays 0) — a mechanical
--- rescale, not a change to which answer scores what. Every install that
+-- rescale, not a change to which answer scores what. A fresh install
+-- running this file gets the corrected numbers directly. A database that
 -- already ran an earlier copy of this file (with the mismatched numbers)
--- needs 2026-08-25_audit_v15_points_match_weightage.sql on top; a fresh
--- install just runs this corrected version and doesn't need that file.
+-- needs the equivalent UPDATE applied on top:
+--   UPDATE audit_parameters p JOIN audit_categories c ON c.id = p.category_id
+--     JOIN audit_templates t ON t.id = c.template_id
+--     SET p.max_value = p.score_weightage WHERE t.name IN ('Store Hygiene','Audit');
+--   UPDATE audit_parameter_options o JOIN audit_parameters p ON p.id = o.parameter_id
+--     JOIN audit_categories c ON c.id = p.category_id JOIN audit_templates t ON t.id = c.template_id
+--     SET o.points = p.score_weightage WHERE t.name IN ('Store Hygiene','Audit') AND o.points > 0;
 --
 -- This is a one-time seed, not idempotent — it always INSERTs two new
 -- templates. Re-running this file will create duplicates. Before running,
