@@ -857,12 +857,16 @@ function auditDraftTree(int $templateId): array {
         $st->execute($catIds);
         $params = $st->fetchAll(PDO::FETCH_ASSOC);
     }
+    // Same conditions auditGetTree() attaches — without them a draft would
+    // render its questions as bare value boxes until the first Save.
+    $opts = auditGetParameterOptions(array_column($params, 'id'));
     $tree = [];
     foreach ($cats as $c) {
         $c['modified_weightage'] = (float)$c['weightage'];
         $c['parameters'] = [];
         foreach ($params as $p) {
             if ((int)$p['category_id'] === (int)$c['id']) {
+                $p['options']     = $opts[(int)$p['id']] ?? [];
                 $p['response']    = null;
                 $p['attachments'] = [];
                 $c['parameters'][] = $p;
@@ -2039,14 +2043,43 @@ function renderAuditHeader(array $a): void {
     <?php
 }
 
+// Read-only rendering of one answer. A question with pickable conditions
+// shows the condition the auditor chose (snapshotted on the response) with
+// its points beside it — the bare number means nothing to a reviewer. Every
+// other question keeps the old "value / out-of" form: rating out of 5,
+// boolean as Yes/No out of 1, value out of its max.
+function auditAnswerHtml(array $p, $valEnt, string $optTxt = ''): string {
+    if ($optTxt !== '') {
+        $pts = $valEnt !== null
+            ? ' <span style="color:var(--muted)">(' . h((string)(float)$valEnt) . ')</span>'
+            : '';
+        return '<span class="opt-answer">' . h($optTxt) . '</span>' . $pts;
+    }
+    if ($valEnt === null) return '—';
+    if (($p['type'] ?? '') === 'rating') {
+        return h((string)(float)$valEnt) . ' <span style="color:var(--muted)">/ 5</span>';
+    }
+    if (($p['type'] ?? '') === 'boolean') {
+        return ((float)$valEnt > 0 ? 'Yes' : 'No') . ' <span style="color:var(--muted)">/ 1</span>';
+    }
+    $rawV = h((string)(float)$valEnt);
+    if (isset($p['max_value']) && $p['max_value'] !== null && (float)$p['max_value'] > 0) {
+        return $rawV . ' <span style="color:var(--muted)">/ ' . h((string)(float)$p['max_value']) . '</span>';
+    }
+    return $rawV;
+}
+
 // ── Main category/parameter accordion for edit OR view ──
 // $locationId scopes the per-question history popup to the same store as
 // this audit (auditors compare a single location across time, not the
 // same question across stores).
 function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $locationId = 0): void {
+    // Condition-based templates answer with the condition itself, so the
+    // Value box and the Obtain % beside it carry nothing and are dropped.
+    $condOnly = auditTreeUsesConditions($tree);
     ?>
     <div class="table-wrap" data-stack>
-        <table class="table audit-table">
+        <table class="table audit-table<?= $condOnly ? ' cond-only' : '' ?>">
             <thead>
                 <tr>
                     <th style="width:46px">#</th>
@@ -2055,9 +2088,9 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                     <?php if ($readonly): ?>
                         <th style="width:110px">Modified Wt.</th>
                     <?php endif; ?>
-                    <th style="width:130px">Value</th>
+                    <th class="col-value" style="width:130px">Value</th>
                     <th style="width:90px">Obtain Score</th>
-                    <th style="width:110px">Obtain %</th>
+                    <th class="col-obt-pct" style="width:110px">Obtain %</th>
                     <th style="min-width:150px">Auditor Remarks</th>
                     <th style="min-width:140px">Documents</th>
                 </tr>
@@ -2091,27 +2124,43 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                     }
                 }
             ?>
-                <tr class="audit-cat-row<?= $catBarCls ? ' ' . h($catBarCls) : '' ?>" data-cat-id="<?= (int)$c['id'] ?>">
+                <tr class="audit-cat-row<?= $catBarCls ? ' ' . h($catBarCls) : '' ?>" data-cat-id="<?= (int)$c['id'] ?>"
+                    data-weight="<?= h((string)(float)$c['modified_weightage']) ?>">
                     <td class="srno" data-label="#"><?= $idx ?></td>
                     <td class="cat-name" data-label="Category"><strong><?= $idx ?>. <?= h($c['name']) ?></strong></td>
                     <td class="num" data-label="Weightage"><?= number_format((float)$c['weightage'], 0) ?></td>
                     <?php if ($readonly): ?>
                         <td data-label="Modified Wt."><?= number_format((float)$c['modified_weightage'], 0) ?></td>
                     <?php endif; ?>
-                    <td></td>
+                    <td class="col-value"></td>
                     <td class="num cat-obtain <?= h($catCls) ?>" data-label="Obtain Score"><?= $catSumObt !== null ? number_format($catSumObt, 2) : '—' ?></td>
-                    <td class="num cat-obtain-pct <?= h($catCls) ?>" data-label="Obtain %"><?= $catObtPct !== null ? number_format($catObtPct, 2) : '—' ?></td>
+                    <td class="num cat-obtain-pct col-obt-pct <?= h($catCls) ?>" data-label="Obtain %"><?= $catObtPct !== null ? number_format($catObtPct, 2) : '—' ?></td>
                     <td colspan="2"></td>
                 </tr>
                 <?php foreach ($c['parameters'] as $pIdx => $p):
                     $r = $p['response'] ?? null;
                     $respId = $r ? (int)$r['id'] : 0;
                     $valEnt = $r ? $r['value_entered'] : null;
+                    $optTxt = $r && isset($r['option_text']) ? (string)$r['option_text'] : '';
                     $obt    = $r ? $r['obtain_score']  : null;
                     $modW   = $r ? (float)$r['modified_weightage'] : (float)$p['score_weightage'];
                     // Display weightage: use the response snapshot when available (historical
                     // value at audit-creation time), otherwise the current master value.
                     $actW   = $r && isset($r['actual_weightage']) ? (float)$r['actual_weightage'] : (float)$p['score_weightage'];
+                    // Pickable conditions for this question (empty on the older
+                    // rating / boolean / free-value questions). $optOn is every
+                    // condition ticked: the option_ids list when the question
+                    // takes several, the single option_id otherwise.
+                    $opts   = $p['options'] ?? [];
+                    $optOn  = [];
+                    if ($r && !empty($r['option_ids'])) {
+                        foreach (explode(',', (string)$r['option_ids']) as $oidRaw) {
+                            $oidRaw = (int)trim($oidRaw);
+                            if ($oidRaw > 0) $optOn[] = $oidRaw;
+                        }
+                    } elseif ($r && !empty($r['option_id'])) {
+                        $optOn[] = (int)$r['option_id'];
+                    }
                     $auRmk  = $r ? ($r['auditor_remark'] ?? '') : '';
                     $apRmk  = $r ? ($r['approver_remark'] ?? '') : '';
                     $smRmk  = $r ? ($r['store_manager_remark'] ?? '') : '';
@@ -2121,7 +2170,8 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                     $scoreCls = auditScoreColor($obt !== null ? (float)$obt : null);
                 ?>
                 <tr class="audit-param-row<?= !empty($p['is_orphan']) ? ' is-orphan' : '' ?>" data-cat-id="<?= (int)$c['id'] ?>" data-param-id="<?= (int)$p['id'] ?>"
-                    data-type="<?= h($p['type']) ?>" data-max="<?= $p['max_value'] !== null ? h($p['max_value']) : '' ?>">
+                    data-type="<?= h($p['type']) ?>" data-max="<?= $p['max_value'] !== null ? h($p['max_value']) : '' ?>"
+                    data-weight="<?= h((string)(float)$modW) ?>">
                     <td class="srno"></td>
                     <td class="param-text" data-label="Parameter">
                         <div class="param-text-wrap">
@@ -2139,7 +2189,35 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                                 </svg>
                             </button>
                         </div>
-                        <?php if ($p['type'] !== 'rating'): ?>
+                        <?php if ($opts): ?>
+                            <?php
+                            // The answer itself: one condition (radio) or any
+                            // number of them (checkbox), each with the action it
+                            // calls for and the points it carries.
+                            $optMulti = ($p['option_mode'] ?? 'radio') === 'checkbox';
+                            $optName  = 'param_option[' . (int)$p['id'] . ']' . ($optMulti ? '[]' : '');
+                            ?>
+                            <ul class="opt-guide<?= $optMulti ? ' is-multi' : '' ?>" role="group"
+                                aria-label="<?= h($p['parameter_text']) ?>">
+                                <?php foreach ($opts as $o): $oid = (int)$o['id']; $isOn = in_array($oid, $optOn, true); ?>
+                                    <li<?= $isOn ? ' class="is-picked"' : '' ?>>
+                                        <label>
+                                            <input type="<?= $optMulti ? 'checkbox' : 'radio' ?>" class="opt-input"
+                                                   name="<?= h($optName) ?>" value="<?= $oid ?>"
+                                                   data-points="<?= h((string)(float)$o['points']) ?>"
+                                                   <?= $isOn ? 'checked' : '' ?> <?= $readonly ? 'disabled' : '' ?>>
+                                            <span class="opt-body">
+                                                <span class="opt-cond"><?= h($o['option_text']) ?></span>
+                                                <span class="opt-pts"><?= h((string)(float)$o['points']) ?></span>
+                                                <?php if (!empty($o['action_hint'])): ?>
+                                                    <span class="opt-action">Action: <?= h($o['action_hint']) ?></span>
+                                                <?php endif; ?>
+                                            </span>
+                                        </label>
+                                    </li>
+                                <?php endforeach; ?>
+                            </ul>
+                        <?php elseif ($p['type'] !== 'rating'): ?>
                             <span class="hint">[<?= h($p['type']) ?><?= $p['type'] === 'value' && $p['max_value'] !== null ? ' max ' . h($p['max_value']) : '' ?>]</span>
                         <?php endif; ?>
                         <?php if (!empty($smRmk)): ?>
@@ -2159,31 +2237,27 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                     <?php if ($readonly): ?>
                         <td data-label="Modified Wt."><?= number_format((float)$modW, 0) ?></td>
                     <?php endif; ?>
-                    <td data-label="Value">
+                    <td class="col-value" data-label="Value">
                         <?php if ($readonly): ?>
                             <?php
-                            // Show "value / out-of" so the reader can read the
-                            // raw answer against its scale at a glance. Scale
-                            // depends on the parameter type:
+                            // Show the picked condition, or "value / out-of" so the
+                            // reader can read the raw answer against its scale at a
+                            // glance. Scale depends on the parameter type:
                             //   rating  → out of 5
                             //   value   → out of max_value (omitted if unset)
                             //   boolean → out of 1, labelled Yes/No for clarity
-                            if ($valEnt === null) {
-                                echo '—';
-                            } elseif ($p['type'] === 'rating') {
-                                echo h((string)(float)$valEnt) . ' <span style="color:var(--muted)">/ 5</span>';
-                            } elseif ($p['type'] === 'boolean') {
-                                $isYes = (float)$valEnt > 0;
-                                echo ($isYes ? 'Yes' : 'No') . ' <span style="color:var(--muted)">/ 1</span>';
-                            } else { // value
-                                $rawV = h((string)(float)$valEnt);
-                                if ($p['max_value'] !== null && (float)$p['max_value'] > 0) {
-                                    echo $rawV . ' <span style="color:var(--muted)">/ ' . h((string)(float)$p['max_value']) . '</span>';
-                                } else {
-                                    echo $rawV;
-                                }
-                            }
+                            echo auditAnswerHtml($p, $valEnt, $optTxt);
                             ?>
+                        <?php elseif ($opts): ?>
+                            <?php
+                            // No input here — the answer is the condition ticked
+                            // beside the question. The hidden field only mirrors
+                            // the points of what's ticked so the live score can
+                            // read it; the server re-reads the points from the
+                            // conditions themselves and never trusts it.
+                            ?>
+                            <input type="hidden" class="param-value" name="param_value[<?= (int)$p['id'] ?>]"
+                                   value="<?= $valEnt !== null ? h((string)(float)$valEnt) : '' ?>">
                         <?php elseif ($p['type'] === 'boolean'): ?>
                             <select class="form-control param-value" name="param_value[<?= (int)$p['id'] ?>]">
                                 <option value="">—</option>
@@ -2203,7 +2277,7 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                         <?php endif; ?>
                     </td>
                     <td class="num param-obtain <?= h($scoreCls) ?>" data-label="Obtain Score"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
-                    <td class="num param-obtain-pct <?= h($scoreCls) ?>" data-label="Obtain %"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
+                    <td class="num param-obtain-pct col-obt-pct <?= h($scoreCls) ?>" data-label="Obtain %"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
                     <td class="wide-cell" data-label="Auditor Remarks">
                         <?php if ($readonly): ?>
                             <?= nl2br(h($auRmk)) ?: '—' ?>
@@ -2273,6 +2347,28 @@ function renderAuditHistoryModal(): void {
     .param-text-wrap{display:flex;align-items:flex-start;gap:8px;flex-wrap:wrap}
     .param-text-label{flex:1;min-width:0}
     .orphan-tag{display:inline-block;background:rgba(201,168,0,.18);color:var(--yellow);font-size:10.5px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;padding:1px 6px;border-radius:999px;margin-left:6px;vertical-align:middle}
+    /* The conditions a question is answered with: tick one (radio) or any
+       number (checkbox), each with the action it calls for and its points.
+       This list IS the answer control, so it sits under the question where
+       there is room for the full wording. */
+    .opt-guide{list-style:none;margin:6px 0 0;padding:0;font-size:12px;line-height:1.45}
+    .opt-guide li{border-left:2px solid var(--border);margin-bottom:3px;color:var(--muted)}
+    .opt-guide li.is-picked{border-left-color:var(--accent);background:rgba(255,255,255,.045);color:var(--text)}
+    .opt-guide label{display:flex;align-items:flex-start;gap:8px;padding:5px 8px;cursor:pointer}
+    .opt-guide input[type=radio],.opt-guide input[type=checkbox]{margin:2px 0 0;flex:0 0 auto;accent-color:var(--accent);width:15px;height:15px;cursor:pointer}
+    .opt-guide input:disabled{cursor:default}
+    .opt-guide input:disabled + .opt-body{opacity:.75}
+    .opt-guide .opt-body{min-width:0}
+    .opt-guide .opt-cond{color:inherit}
+    .opt-guide .opt-pts{display:inline-block;margin-left:6px;padding:0 6px;border-radius:999px;background:rgba(255,255,255,.07);font-variant-numeric:tabular-nums;font-weight:600;color:var(--text);opacity:.85}
+    .opt-guide .opt-action{display:block;font-style:italic;opacity:.8;font-size:11.5px;margin-top:1px}
+    .opt-guide li.is-picked .opt-pts{background:var(--accent);color:#fff;opacity:1}
+    /* Condition-only templates: the answer is the condition, so the Value
+       box and the Obtain % beside it have nothing left to say. */
+    .audit-table.cond-only .col-value,
+    .audit-table.cond-only .col-obt-pct{display:none}
+    /* Chosen condition in a read-only value cell — text, so not right-aligned. */
+    td.num > .opt-answer{display:inline-block;text-align:left;white-space:normal;min-width:120px}
     tr.is-orphan{opacity:.85}
     .btn-icon-history{appearance:none;border:1px solid var(--border);background:transparent;color:var(--muted);width:26px;height:26px;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;cursor:pointer;flex-shrink:0;transition:background .12s,color .12s,border-color .12s}
     .btn-icon-history:hover{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -2413,7 +2509,12 @@ function renderAuditHistoryModal(): void {
                               + '<td data-label="Store Manager">' + esc(r.store_manager_name || '—') + '</td>'
                               + '<td data-label="Weightage" class="num">' + fmtInt(r.actual_weightage) + '</td>'
                               + '<td data-label="Modified Wt." class="num">' + fmtInt(r.modified_weightage) + '</td>'
-                              + '<td data-label="Value" class="num">' + (r.value_entered === null ? '—' : esc(r.value_entered)) + '</td>'
+                              + '<td data-label="Value" class="num">'
+                              + (r.hist_option_text
+                                   ? '<span class="opt-answer">' + esc(r.hist_option_text) + '</span>'
+                                     + (r.value_entered === null ? '' : ' <span style="color:var(--muted)">(' + esc(r.value_entered) + ')</span>')
+                                   : (r.value_entered === null ? '—' : esc(r.value_entered)))
+                              + '</td>'
                               + '<td data-label="Obtain" class="num">' + fmt(r.obtain_score) + '</td>'
                               + '<td data-label="Auditor Remarks">' + remarkCell + '</td>'
                               + '</tr>';
@@ -2446,6 +2547,9 @@ function renderAuditHistoryModal(): void {
 
 // ── Approver table — lock inputs, show approver_remark textareas ──
 function renderAuditApproveTable(array $tree, int $auditId, int $locationId = 0): void {
+    // What the category weightages have to add back up to after the
+    // approver shifts weight around — see auditCategoryWeightTotal().
+    $catExpect = auditCategoryWeightTotal($auditId);
     ?>
     <div class="table-wrap" data-stack>
         <table class="table audit-table">
@@ -2481,6 +2585,7 @@ function renderAuditApproveTable(array $tree, int $auditId, int $locationId = 0)
                 <?php foreach ($c['parameters'] as $p):
                     $r = $p['response'] ?? null;
                     $valEnt = $r ? $r['value_entered'] : null;
+                    $optTxt = $r && isset($r['option_text']) ? (string)$r['option_text'] : '';
                     $obt    = $r ? $r['obtain_score']  : null;
                     $modW   = $r ? (float)$r['modified_weightage'] : (float)$p['score_weightage'];
                     $actW   = $r && isset($r['actual_weightage']) ? (float)$r['actual_weightage'] : (float)$p['score_weightage'];
@@ -2515,7 +2620,7 @@ function renderAuditApproveTable(array $tree, int $auditId, int $locationId = 0)
                                value="<?= (int)round($modW) ?>"
                                data-cat-id="<?= (int)$c['id'] ?>">
                     </td>
-                    <td class="num"><?= $valEnt !== null ? h((string)(float)$valEnt) : '—' ?></td>
+                    <td class="num"><?= auditAnswerHtml($p, $valEnt, $optTxt) ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
                     <td><?= nl2br(h($r['auditor_remark'] ?? '')) ?: '—' ?></td>
@@ -2533,7 +2638,7 @@ function renderAuditApproveTable(array $tree, int $auditId, int $locationId = 0)
                 <tr class="audit-total-sum">
                     <td></td>
                     <td colspan="2" style="text-align:right;font-weight:600">Category Modified Weightage sum:</td>
-                    <td colspan="8" id="catTotalSum" style="font-weight:600">0 / 100</td>
+                    <td colspan="8" id="catTotalSum" data-expect="<?= h((string)$catExpect) ?>" style="font-weight:600">0 / <?= h((string)$catExpect) ?></td>
                 </tr>
             </tbody>
         </table>
@@ -2563,8 +2668,11 @@ function renderAuditApproveTable(array $tree, int $auditId, int $locationId = 0)
             document.querySelectorAll('.cat-mod-wt').forEach(function (el) { total += num(el.value); });
             var totEl = document.getElementById('catTotalSum');
             if (totEl) {
-                totEl.textContent = total + ' / 100';
-                totEl.style.color = (total === 100) ? 'var(--green)' : 'var(--red)';
+                // Expected total is the template's own — 100, or 100 per
+                // section on the templates that score sections out of 100.
+                var expect = num(totEl.dataset.expect) || 100;
+                totEl.textContent = total + ' / ' + expect;
+                totEl.style.color = (total === expect) ? 'var(--green)' : 'var(--red)';
             }
         }
         document.addEventListener('input',  function (e) { if (e.target.matches('.param-mod-wt, .cat-mod-wt')) recalc(); });
@@ -2609,6 +2717,7 @@ function renderAuditOperationReviewTable(array $tree, int $auditId, int $locatio
                 <?php foreach ($c['parameters'] as $p):
                     $r = $p['response'] ?? null;
                     $valEnt = $r ? $r['value_entered'] : null;
+                    $optTxt = $r && isset($r['option_text']) ? (string)$r['option_text'] : '';
                     $obt    = $r ? $r['obtain_score']  : null;
                     $modW   = $r ? (float)$r['modified_weightage'] : (float)$p['score_weightage'];
                     $actW   = $r && isset($r['actual_weightage']) ? (float)$r['actual_weightage'] : (float)$p['score_weightage'];
@@ -2637,7 +2746,7 @@ function renderAuditOperationReviewTable(array $tree, int $auditId, int $locatio
                     </td>
                     <td class="num"><?= number_format($actW, 0) ?></td>
                     <td class="num"><?= number_format($modW, 0) ?></td>
-                    <td class="num"><?= $valEnt !== null ? h((string)(float)$valEnt) : '—' ?></td>
+                    <td class="num"><?= auditAnswerHtml($p, $valEnt, $optTxt) ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
                     <td><?= nl2br(h($r['auditor_remark'] ?? '')) ?: '—' ?></td>
@@ -2789,6 +2898,7 @@ function renderAuditManagerReviewTable(array $tree, int $auditId, int $locationI
                 <?php foreach ($c['parameters'] as $p):
                     $r = $p['response'] ?? null;
                     $valEnt = $r ? $r['value_entered'] : null;
+                    $optTxt = $r && isset($r['option_text']) ? (string)$r['option_text'] : '';
                     $obt    = $r ? $r['obtain_score']  : null;
                     $modW   = $r ? (float)$r['modified_weightage'] : (float)$p['score_weightage'];
                     $actW   = $r && isset($r['actual_weightage']) ? (float)$r['actual_weightage'] : (float)$p['score_weightage'];
@@ -2817,7 +2927,7 @@ function renderAuditManagerReviewTable(array $tree, int $auditId, int $locationI
                     </td>
                     <td class="num"><?= number_format($actW, 0) ?></td>
                     <td class="num"><?= number_format($modW, 0) ?></td>
-                    <td class="num"><?= $valEnt !== null ? h((string)(float)$valEnt) : '—' ?></td>
+                    <td class="num"><?= auditAnswerHtml($p, $valEnt, $optTxt) ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
                     <td><?= nl2br(h($r['auditor_remark'] ?? '')) ?: '—' ?></td>
@@ -2867,8 +2977,12 @@ function renderAuditEditJs(): void {
                 var valEl = row.querySelector('.param-value'); if (!valEl) return;
                 var v = valEl.value;
                 var obt = compObtain(type, max, v);
+                // Modified Wt. is only an input on the reviewer screens. On the
+                // auditor's own form the column isn't there, so fall back to the
+                // weightage the row carries — without it every category summed
+                // to zero and the category Obtain Score never moved.
                 var modWEl = row.querySelector('.param-mod-wt');
-                var modW = modWEl ? num(modWEl.value) : 0;
+                var modW = modWEl ? num(modWEl.value) : num(row.dataset.weight);
                 var obtCell = row.querySelector('.param-obtain');
                 var pctCell = row.querySelector('.param-obtain-pct');
                 var cls = scoreClass(obt);
@@ -2892,7 +3006,7 @@ function renderAuditEditJs(): void {
             document.querySelectorAll('tr.audit-cat-row').forEach(function(row){
                 var cid = row.dataset.catId;
                 var catModEl = row.querySelector('.cat-mod-wt');
-                var catMod = catModEl ? num(catModEl.value) : 0;
+                var catMod = catModEl ? num(catModEl.value) : num(row.dataset.weight);
                 var obtCell = row.querySelector('.cat-obtain');
                 var pctCell = row.querySelector('.cat-obtain-pct');
                 var sumObt = catObtain[cid] || 0;
@@ -2927,10 +3041,31 @@ function renderAuditEditJs(): void {
                 t.style.color = ti !== 100 ? 'var(--red)' : 'var(--green)';
             }
         }
+        // A question answered by ticking conditions scores the points of what
+        // is ticked — one for a radio question, the sum for a checkbox one.
+        // Mirror that onto the row's hidden .param-value so the live score
+        // reads the same number the server will store, and mark the chosen
+        // lines. Nothing ticked leaves the value blank, which reads as
+        // unanswered everywhere (including the "answer everything" gate on
+        // Submit).
+        function syncOptions(row){
+            if (!row) return;
+            var inputs = row.querySelectorAll('.opt-input');
+            if (!inputs.length) return;
+            var total = 0, any = false;
+            inputs.forEach(function(inp){
+                var li = inp.closest('li');
+                if (li) li.classList.toggle('is-picked', inp.checked);
+                if (inp.checked) { any = true; total += num(inp.dataset.points); }
+            });
+            var hid = row.querySelector('input.param-value');
+            if (hid) hid.value = any ? total : '';
+        }
         document.addEventListener('input', function(e){
             if (e.target.matches('.param-value, .param-mod-wt, .cat-mod-wt')) recalc();
         });
         document.addEventListener('change', function(e){
+            if (e.target.matches('.opt-input')) { syncOptions(e.target.closest('tr')); recalc(); return; }
             if (e.target.matches('.param-value, .param-mod-wt, .cat-mod-wt')) recalc();
         });
         recalc();

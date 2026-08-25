@@ -373,7 +373,7 @@ function allowedPages(): array {
         $pages = array_merge($pages, ['audit_summary', 'export_audit_summary']);
     }
     if (isSuperadmin() || hasTxn('audit_admin')) {
-        $pages = array_merge($pages, ['audit_templates', 'audit_categories', 'audit_parameters', 'export_audit_templates']);
+        $pages = array_merge($pages, ['audit_templates', 'audit_categories', 'audit_parameters', 'audit_conditions', 'export_audit_templates']);
     }
     // Violations sub-pages — server-side scope filter restricts data inside each page.
     $pages = array_merge($pages, ['violations', 'violation_view', 'download_violation_attachment']);
@@ -890,6 +890,7 @@ function dispatchPage(string $page): void {
         case 'audit_annotation_serve':  if (function_exists('pageAuditAnnotationServe'))  pageAuditAnnotationServe();  break;
         case 'audit_annotation_thread': if (function_exists('pageAuditAnnotationThread')) pageAuditAnnotationThread(); break;
         case 'audit_templates':   if (function_exists('pageAuditTemplates'))  pageAuditTemplates();  break;
+        case 'audit_conditions':  if (function_exists('pageAuditConditions')) pageAuditConditions(); break;
         case 'location_managers': if (function_exists('pageLocationManagers')) pageLocationManagers(); break;
         case 'export_location_managers': if (function_exists('exportLocationManagersCsv')) exportLocationManagersCsv(); break;
         case 'audit_categories':  if (function_exists('pageAuditCategories')) pageAuditCategories(); break;
