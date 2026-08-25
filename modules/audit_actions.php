@@ -319,8 +319,16 @@ function doSaveAuditWeights(): void {
         if ($hasOptIds)  $setCols .= ', option_ids = ?';
         $up = $db->prepare(
             "UPDATE audit_responses SET {$setCols} WHERE audit_id = ? AND parameter_id = ?");
-        foreach ($allParams as $pid => $p) {
-            $rawVal = array_key_exists($pid, $paramVals) ? trim((string)$paramVals[$pid]) : '';
+        // Scoped to whatever was actually posted, not every parameter on the
+        // audit — the audit form shows one section at a time, so a save here
+        // only ever carries that section's parameter ids. Iterating $allParams
+        // instead would treat every other section's absent field as "cleared"
+        // and null out answers already saved earlier.
+        foreach ($paramVals as $pidRaw => $rawValPosted) {
+            $pid = (int)$pidRaw;
+            if (!isset($allParams[$pid])) continue;
+            $p = $allParams[$pid];
+            $rawVal = trim((string)$rawValPosted);
             $val = $rawVal === '' ? null : (float)$rawVal;
 
             // A question answered by ticking conditions scores the points of
@@ -405,6 +413,39 @@ function doSaveAuditWeights(): void {
         flash('success', $assignedNumber
             ? ('Saved. Audit number assigned: ' . $assignedNumber)
             : 'Saved.');
+
+        // Section-stepper navigation. Previous and a plain Save never
+        // block; Next additionally requires every question in the section
+        // just saved to be answered before the auditor can move on.
+        $section = max(1, (int)($_POST['section'] ?? 1));
+        $nav     = $_POST['nav'] ?? '';
+        if ($nav === 'next') {
+            $catId   = (int)($_POST['current_category_id'] ?? 0);
+            $missing = 0;
+            if ($catId > 0) {
+                // LEFT JOIN + snapshot category_id so an orphaned response
+                // (parameter deleted from the master since this audit was
+                // created) is still counted against its section instead of
+                // silently passing through — matches how auditGetTree()/
+                // exportAuditRegister() already resolve a response's category.
+                $catExpr = auditHasResponseSnapshotCols() ? 'COALESCE(r.category_id, p.category_id)' : 'p.category_id';
+                $mst = $db->prepare(
+                    "SELECT COUNT(*) FROM audit_responses r
+                     LEFT JOIN audit_parameters p ON p.id = r.parameter_id
+                     WHERE r.audit_id = ? AND {$catExpr} = ? AND r.value_entered IS NULL");
+                $mst->execute([$auditId, $catId]);
+                $missing = (int)$mst->fetchColumn();
+            }
+            if ($missing > 0) {
+                flash('error', $missing . ' question(s) in this section still need an answer.');
+            } else {
+                $section++;
+            }
+        } elseif ($nav === 'prev') {
+            $section = max(1, $section - 1);
+        }
+        header('Location: ?page=audit_edit&id=' . $auditId . '&section=' . $section);
+        return;
     } catch (Exception $e) {
         if ($db->inTransaction()) $db->rollBack();
         flash('error', 'Save failed: ' . $e->getMessage());
