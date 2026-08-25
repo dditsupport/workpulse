@@ -414,33 +414,17 @@ function doSaveAuditWeights(): void {
             ? ('Saved. Audit number assigned: ' . $assignedNumber)
             : 'Saved.');
 
-        // Section-stepper navigation. Previous and a plain Save never
-        // block; Next additionally requires every question in the section
-        // just saved to be answered before the auditor can move on.
+        // Section-stepper navigation. Any section is reachable at any
+        // time — Next/Previous just move the pointer by one; they never
+        // block on this section being incomplete. The stepper marks
+        // finished sections green so the auditor can see what's left
+        // without being forced through them in order, and the final
+        // Submit gate (doSubmitAudit) is still what actually requires
+        // every question on the whole audit to be answered.
         $section = max(1, (int)($_POST['section'] ?? 1));
         $nav     = $_POST['nav'] ?? '';
         if ($nav === 'next') {
-            $catId   = (int)($_POST['current_category_id'] ?? 0);
-            $missing = 0;
-            if ($catId > 0) {
-                // LEFT JOIN + snapshot category_id so an orphaned response
-                // (parameter deleted from the master since this audit was
-                // created) is still counted against its section instead of
-                // silently passing through — matches how auditGetTree()/
-                // exportAuditRegister() already resolve a response's category.
-                $catExpr = auditHasResponseSnapshotCols() ? 'COALESCE(r.category_id, p.category_id)' : 'p.category_id';
-                $mst = $db->prepare(
-                    "SELECT COUNT(*) FROM audit_responses r
-                     LEFT JOIN audit_parameters p ON p.id = r.parameter_id
-                     WHERE r.audit_id = ? AND {$catExpr} = ? AND r.value_entered IS NULL");
-                $mst->execute([$auditId, $catId]);
-                $missing = (int)$mst->fetchColumn();
-            }
-            if ($missing > 0) {
-                flash('error', $missing . ' question(s) in this section still need an answer.');
-            } else {
-                $section++;
-            }
+            $section++;
         } elseif ($nav === 'prev') {
             $section = max(1, $section - 1);
         }
