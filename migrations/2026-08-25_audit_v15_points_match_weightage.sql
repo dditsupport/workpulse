@@ -14,6 +14,11 @@
 -- scanning all 218 options in migrations/2026-08-25_audit_templates_v15.sql
 -- before writing this file.
 --
+-- 2026-08-25_audit_templates_v15.sql has since been corrected in place to
+-- seed the right numbers from the start — this file is only still needed
+-- to fix a database that already ran that seed before the correction. A
+-- fresh install seeded from the corrected file doesn't need this one.
+--
 -- What this does, for every parameter (and its options) under the
 -- "Store Hygiene" and "Audit" templates only:
 --   1. audit_parameters.max_value  := score_weightage
