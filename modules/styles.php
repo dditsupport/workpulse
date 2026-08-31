@@ -184,7 +184,7 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 
 .btn-ghost-x{background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:12px;padding:0 4px}
 .btn-ghost-x:hover{color:var(--red)}
-/* Checklist: the clarification half of a task description ("Task name –
+/* Checklist: the clarification half of a task description ("Task name |
    what it means"). Smaller, muted and italic under the name, so the row still
    reads as one task while the explanation stays available at a glance — the
    same treatment an audit option's action hint gets. */
