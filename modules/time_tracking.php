@@ -126,7 +126,10 @@ function timeEntryLabel(array $e, bool $withSource = false): string {
         $name = timeChecklistName($e);
         // Entries written before chk_item_id existed name no task, so the
         // checklist is all they have to go on and it stays in the label.
+        // Only the task name goes in a timesheet label — the clarification
+        // half of the description would run the row off the grid.
         $task = trim((string)($e['chk_task_name'] ?? ''));
+        if ($task !== '' && function_exists('chkTaskName')) $task = chkTaskName($task);
         if ($task === '')  return 'Checklist — ' . $name;
         return $withSource ? ($task . ' — ' . $name) : $task;
     }
