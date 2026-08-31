@@ -337,18 +337,21 @@ function chkSectionAllDay(array $section): bool {
 }
 
 // ── Task text: name + clarification ───────────────────────
-// A task is written as "Task name – what it actually means", the same shape an
-// audit option carries with its action hint. Split on the first dash that has
-// whitespace on both sides so the two halves can be shown apart: the name at
-// full size, the explanation on its own smaller, muted line underneath. The
-// whitespace requirement keeps hyphenated words intact — "Purchase Follow-Up"
-// and "SF-2" are names, not separators. A description without such a dash is
-// all name and renders exactly as before.
+// A task is written as "Task name | what it actually means", the same shape an
+// audit option carries with its action hint. Split on the first pipe so the two
+// halves can be shown apart: the name at full size, the explanation on its own
+// smaller, muted line underneath. The pipe is the only separator: it never
+// appears inside prose, so it cannot be mistaken for punctuation the way a dash
+// can — "Purchase Follow-Up" and "SF-2" carry dashes of their own.
+//
+// A description with no pipe is all name and renders exactly as before, so
+// tasks written before this convention keep working; converting them is what
+// migrations/2026-08-31_chk_task_pipe_separator.sql is for.
 function chkSplitTaskText(?string $desc): array {
     $desc = trim((string)$desc);
     if ($desc === '') return ['', ''];
-    $parts = preg_split('/\s+[–—-]\s+/u', $desc, 2);
-    if (!is_array($parts) || count($parts) < 2) return [$desc, ''];
+    $parts = explode('|', $desc, 2);
+    if (count($parts) < 2) return [$desc, ''];
     $name = trim($parts[0]);
     $hint = trim($parts[1]);
     if ($name === '' || $hint === '') return [$desc, ''];
@@ -3073,9 +3076,9 @@ function pageManageTasks(): void {
             <div class="form-group" style="grid-column:1/-1">
                 <label>Task Description <span class="required">*</span></label>
                 <input type="text" name="description" id="taskDesc" class="form-control" required
-                       placeholder="e.g. Check Fridge Temperature &ndash; Record the reading of every chiller and freezer.">
+                       placeholder="e.g. Check Fridge Temperature | Record the reading of every chiller and freezer.">
                 <div class="text-muted" style="margin-top:4px;font-size:11.5px">
-                    Write it as <strong>Task name &ndash; what it means</strong>. Everything after the dash is
+                    Write it as <strong>Task name | what it means</strong>. Everything after the pipe is
                     shown to the filler as a smaller clarification line under the task name.
                 </div>
             </div>
