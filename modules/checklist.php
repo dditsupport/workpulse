@@ -336,6 +336,44 @@ function chkSectionAllDay(array $section): bool {
     return (int)($section['start_min'] ?? 0) <= 0 && (int)($section['end_min'] ?? 1440) >= 1440;
 }
 
+// ── Task text: name + clarification ───────────────────────
+// A task is written as "Task name – what it actually means", the same shape an
+// audit option carries with its action hint. Split on the first dash that has
+// whitespace on both sides so the two halves can be shown apart: the name at
+// full size, the explanation on its own smaller, muted line underneath. The
+// whitespace requirement keeps hyphenated words intact — "Purchase Follow-Up"
+// and "SF-2" are names, not separators. A description without such a dash is
+// all name and renders exactly as before.
+function chkSplitTaskText(?string $desc): array {
+    $desc = trim((string)$desc);
+    if ($desc === '') return ['', ''];
+    $parts = preg_split('/\s+[–—-]\s+/u', $desc, 2);
+    if (!is_array($parts) || count($parts) < 2) return [$desc, ''];
+    $name = trim($parts[0]);
+    $hint = trim($parts[1]);
+    if ($name === '' || $hint === '') return [$desc, ''];
+    return [$name, $hint];
+}
+
+// The task name alone — for places that must stay on one line (CSV columns,
+// tooltips, page titles).
+function chkTaskName(?string $desc): string { return chkSplitTaskText($desc)[0]; }
+
+// Escaped HTML for a task: the name, then the clarification beneath it when
+// there is one. $extra is appended inline after the name — that is where the
+// file badge and the "(Retired)" tag belong, beside the name rather than after
+// the explanation. $nameClass wraps the name in a span for layouts that style
+// it (the report tree's .lbl, say).
+function chkTaskHtml(?string $desc, string $extra = '', string $nameClass = ''): string {
+    [$name, $hint] = chkSplitTaskText($desc);
+    $out = $nameClass !== ''
+        ? '<span class="' . h($nameClass) . '">' . h($name) . '</span>'
+        : h($name);
+    $out .= $extra;
+    if ($hint !== '') $out .= '<div class="chk-task-hint">' . h($hint) . '</div>';
+    return $out;
+}
+
 // Per-section start / deadline (Unix ts) on the given checklist date, from
 // the section's minutes-from-midnight window (end_min may exceed 1440 for
 // cross-midnight bands, e.g. Store Evening → 02:00 next day).
@@ -2229,21 +2267,25 @@ if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
                 <tr>
                     <td class="chk-num" style="text-align:center;color:var(--muted);font-size:12px"><?= $sr++ ?></td>
                     <td class="chk-particular">
-                        <?= h($t['task_description']) ?>
                         <?php
                         // Paperclip badge — all-time file count for this task
                         // in the current scope. Always a link, so "no files"
                         // is an answer you can click through to and confirm.
+                        // Built before the text so it can sit inline beside the
+                        // task name, above the clarification line.
                         $fc      = $itemFileCounts[(int)$t['id']] ?? null;
                         $fcN     = (int)($fc['n'] ?? 0);
                         $fcLast  = (string)($fc['last_date'] ?? '');
                         $fcTitle = $fcN > 0
                             ? ($fcN . ' file(s) — last on ' . date('d M Y', strtotime($fcLast)))
                             : 'No files attached to this task yet';
+                        $fcHtml  = '<a class="chk-file-badge' . ($fcN > 0 ? ' has-files' : '') . '"'
+                                 . ' href="?page=checklist_files&amp;id=' . $checklistId
+                                 . '&amp;item_id=' . (int)$t['id'] . '&amp;date=' . h($displayDate) . '"'
+                                 . ' title="' . h($fcTitle) . '">' . chkClipIcon(11)
+                                 . ($fcN > 0 ? (int)$fcN : 'none') . '</a>';
                         ?>
-                        <a class="chk-file-badge<?= $fcN > 0 ? ' has-files' : '' ?>"
-                           href="?page=checklist_files&amp;id=<?= $checklistId ?>&amp;item_id=<?= (int)$t['id'] ?>&amp;date=<?= h($displayDate) ?>"
-                           title="<?= h($fcTitle) ?>"><?= chkClipIcon(11) ?><?= $fcN > 0 ? (int)$fcN : 'none' ?></a>
+                        <?= chkTaskHtml($t['task_description'], $fcHtml) ?>
                     </td>
                     <td class="chk-answer">
                         <?php
@@ -2761,7 +2803,7 @@ function pageChecklistItemFiles(): void {
 </div>
 
 <div class="table-wrap" style="padding:14px;margin-bottom:14px">
-    <div style="font-size:15px;font-weight:600;margin-bottom:6px"><?= h($item['task_description']) ?></div>
+    <div style="font-size:15px;font-weight:600;margin-bottom:6px"><?= chkTaskHtml($item['task_description']) ?></div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px" class="text-muted">
         <span class="badge badge-grey" style="font-weight:600"><?= h($cl['name']) ?></span>
         <?php if (!empty($item['section_name'])): ?>
@@ -3030,7 +3072,12 @@ function pageManageTasks(): void {
         <div class="form-grid">
             <div class="form-group" style="grid-column:1/-1">
                 <label>Task Description <span class="required">*</span></label>
-                <input type="text" name="description" id="taskDesc" class="form-control" required placeholder="e.g. Check Fridge Temperature">
+                <input type="text" name="description" id="taskDesc" class="form-control" required
+                       placeholder="e.g. Check Fridge Temperature &ndash; Record the reading of every chiller and freezer.">
+                <div class="text-muted" style="margin-top:4px;font-size:11.5px">
+                    Write it as <strong>Task name &ndash; what it means</strong>. Everything after the dash is
+                    shown to the filler as a smaller clarification line under the task name.
+                </div>
             </div>
             <div class="form-group">
                 <label>Section</label>
@@ -3141,7 +3188,7 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
             <tr class="<?= $t['is_active'] ? '' : 'row-inactive' ?>">
                 <td><?= $t['id'] ?></td>
                 <td><?= h($t['section_name'] ?: 'General') ?></td>
-                <td><?= h($t['task_description']) ?></td>
+                <td><?= chkTaskHtml($t['task_description']) ?></td>
                 <td><span class="badge badge-blue"><?= h($t['input_type']) ?></span></td>
                 <td><?= (int)$t['est_minutes'] ?></td>
                 <td><?= $t['is_active'] ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-grey">Inactive</span>' ?></td>

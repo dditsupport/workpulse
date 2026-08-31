@@ -184,6 +184,11 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 
 .btn-ghost-x{background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:12px;padding:0 4px}
 .btn-ghost-x:hover{color:var(--red)}
+/* Checklist: the clarification half of a task description ("Task name –
+   what it means"). Smaller, muted and italic under the name, so the row still
+   reads as one task while the explanation stays available at a glance — the
+   same treatment an audit option's action hint gets. */
+.chk-task-hint{display:block;margin-top:2px;font-size:11.5px;font-weight:400;font-style:italic;line-height:1.45;color:var(--muted);opacity:.9;white-space:normal;word-break:break-word}
 /* Checklist: per-task all-time file badge + the files page gallery */
 .chk-file-badge{display:inline-flex;align-items:center;gap:3px;flex:0 0 auto;margin-left:6px;padding:1px 7px;border:1px solid var(--border);border-radius:999px;font-size:10px;font-weight:600;color:var(--muted);text-decoration:none;white-space:nowrap;vertical-align:middle}
 .chk-file-badge:hover{border-color:var(--accent);color:var(--accent)}

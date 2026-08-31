@@ -379,19 +379,21 @@ function pageChecklistReport(): void {
             <tr class="<?= !$q['is_active'] ? 'row-inactive' : '' ?>">
                 <td class="rpt-sr"><?= $sr++ ?></td>
                 <td style="text-align:left;white-space:normal;word-break:break-word">
-                    <?= h($q['task_description']) ?>
-                    <?= !$q['is_active'] ? '<span class="text-muted"> (Retired)</span>' : '' ?>
                     <?php
                     // Month total for this task, so the row itself says whether
-                    // anything was ever attached against this question.
+                    // anything was ever attached against this question. Built
+                    // first: it belongs inline beside the task name, above the
+                    // clarification line.
                     $rowAtt = $attByItemDay[(int)$q['id']] ?? [];
                     $rowN = 0; $rowImg = 0;
                     foreach ($rowAtt as $c) { $rowN += (int)$c['n']; $rowImg += (int)$c['img']; }
-                    if (function_exists('chkFileBadge')):
-                        echo chkFileBadge($checklistId, (int)$q['id'], $rowN, $rowImg, null,
-                                          $empMode ? null : $locationId,
-                                          sprintf('%04d-%02d-01', $selectedYear, $selectedMonth));
-                    endif; ?>
+                    $rowExtra = !$q['is_active'] ? '<span class="text-muted"> (Retired)</span>' : '';
+                    if (function_exists('chkFileBadge')) {
+                        $rowExtra .= chkFileBadge($checklistId, (int)$q['id'], $rowN, $rowImg, null,
+                                                  $empMode ? null : $locationId,
+                                                  sprintf('%04d-%02d-01', $selectedYear, $selectedMonth));
+                    }
+                    echo chkTaskHtml($q['task_description'], $rowExtra); ?>
                 </td>
                 <?php for ($d = 1; $d <= $daysInMonth; $d++):
                     $val = $responses[$q['id']][$d] ?? '';
@@ -815,8 +817,11 @@ function pageChecklistAudit(): void {
 .chk-tree.with-time .chk-tree-row{grid-template-columns:1fr 120px 84px 220px}
 .chk-tree-row .mins{display:inline-flex;align-items:center;gap:4px;justify-content:flex-end;white-space:nowrap}
 .chk-tree-row .mins.none{color:var(--muted)}
-.chk-tree-row .name{display:flex;align-items:center;gap:8px;min-width:0;color:var(--text)}
+.chk-tree-row .name{display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-width:0;color:var(--text)}
 .chk-tree-row .name .lbl{overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+/* The name is a flex line, so a task's clarification has to claim a full basis
+   of its own or it would sit beside the name instead of under it. */
+.chk-tree-row .name>.chk-task-hint{flex:0 0 100%}
 .chk-tree-row .num{text-align:right;font-variant-numeric:tabular-nums;font-size:13px;color:var(--text)}
 .chk-tree-row .caret{appearance:none;border:none;background:transparent;cursor:pointer;font-size:12px;color:var(--muted);width:18px;padding:0;line-height:1}
 .chk-tree-row .caret[aria-expanded="false"]{transform:rotate(-90deg)}
@@ -949,10 +954,12 @@ function pageChecklistAudit(): void {
         ?>
         <tr>
             <td style="text-align:center;color:var(--muted)"><?= $sr++ ?></td>
-            <td style="white-space:normal;word-break:break-word"><?= h($it['task_description']) ?>
+            <td style="white-space:normal;word-break:break-word">
                 <?php $at = $attByLoc[0][$iid] ?? null;
-                      if (function_exists('chkFileBadge'))
-                          echo chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, null, $filterDate); ?>
+                      $itExtra = function_exists('chkFileBadge')
+                          ? chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, null, $filterDate)
+                          : '';
+                      echo chkTaskHtml($it['task_description'], $itExtra); ?>
                 <?php $rmk = trim((string)($r['remarks'] ?? '')); if ($rmk !== ''): ?>
                 <div class="text-muted" style="margin-top:3px;font-size:11px">&ldquo;<?= h($rmk) ?>&rdquo;</div>
                 <?php endif; ?>
@@ -1044,10 +1051,11 @@ $minsCell = function (int $m) use ($timeUi): string {
                 <div class="chk-tree-row item-row<?= $r ? '' : ' missing' ?>">
                     <div class="name" style="padding-left:74px">
                         <span class="diamond" aria-hidden="true">◆</span>
-                        <span class="lbl"><?= h($it['task_description']) ?></span>
                         <?php $at = $attByLoc[$locId][(int)$it['id']] ?? null;
-                              if (function_exists('chkFileBadge'))
-                                  echo chkFileBadge($checklistId, (int)$it['id'], (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, $locId, $filterDate); ?>
+                              $itExtra = function_exists('chkFileBadge')
+                                  ? chkFileBadge($checklistId, (int)$it['id'], (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, $locId, $filterDate)
+                                  : '';
+                              echo chkTaskHtml($it['task_description'], $itExtra, 'lbl'); ?>
                         <?php $rmk = trim((string)($r['remarks'] ?? '')); if ($rmk !== ''): ?>
                         <div style="font-size:11px;margin-top:3px;color:var(--muted);white-space:normal;word-break:break-word">&ldquo;<?= h($rmk) ?>&rdquo;</div>
                         <?php endif; ?>
@@ -1802,10 +1810,12 @@ function pageChecklistValidate(): void {
             ?>
                 <tr>
                     <td style="text-align:center;color:var(--muted);font-size:12px"><?= $sr++ ?></td>
-                    <td style="white-space:normal;word-break:break-word"><?= h($it['task_description']) ?>
+                    <td style="white-space:normal;word-break:break-word">
                         <?php $at = $atts[$iid] ?? null;
-                              if (function_exists('chkFileBadge'))
-                                  echo chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $logDate, $empMode ? null : $locationId, $logDate); ?>
+                              $itExtra = function_exists('chkFileBadge')
+                                  ? chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $logDate, $empMode ? null : $locationId, $logDate)
+                                  : '';
+                              echo chkTaskHtml($it['task_description'], $itExtra); ?>
                     </td>
                     <td>
                         <?php if ($resp !== ''): ?>
