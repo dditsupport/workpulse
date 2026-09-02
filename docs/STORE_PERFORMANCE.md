@@ -108,6 +108,14 @@ or 36 months of history. Each figure carries a ▲/▼ against the month before
 it, coloured by whether that movement is good for *that* parameter — wastage
 falling is green, wastage rising is red.
 
+**Achievement is also coloured against that month's Target**: green once it
+matches or beats it, red while it is short. That is separate from the arrow
+beside it, so a month can read green and still carry a red ▼ — ahead of
+target, down on last month. A month with no target, or a target of zero, is
+left uncoloured, because every figure clears zero and saying so would be
+noise. The pairing lives in `perfBenchmarks()` in `modules/store_performance.php`;
+one line there gives another parameter the same treatment.
+
 The Store Manager gets a remark box per parameter in the review month's
 column. **Save** keeps the month open; **Submit for review** tells Operations
 the remarks are done, and they stay editable until the month is concluded.
