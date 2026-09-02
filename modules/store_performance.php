@@ -191,21 +191,47 @@ function perfMonthInput(string $ymd): string {   // for <input type="month">
 // parenthesised negatives) before deciding. Anything left that is not a
 // number is kept verbatim as a note — "No Audit" against Audit Score is
 // a real statement about the month, not a parse failure.
-// Returns [float|null $number, string|null $text].
+//
+// Returns [float|null $number, string|null $text, bool $hadPercentSign].
+// The third element matters for percentage parameters: "3%" states its
+// own scale and is 3, while a bare "0.03" is a fraction the upload has
+// to multiply. See perfScalePercent().
 function perfParseValue(string $raw): array {
     $s = trim($raw);
-    if ($s === '') return [null, null];
+    if ($s === '') return [null, null, false];
 
-    $clean = str_replace(["\xE2\x82\xB9", 'Rs.', 'Rs', ',', ' ', '%'], '', $s);
-    $neg   = false;
+    $hadPct = str_contains($s, '%');
+    $clean  = str_replace(["\xE2\x82\xB9", 'Rs.', 'Rs', ',', ' ', '%'], '', $s);
+    $neg    = false;
     if (preg_match('/^\((.*)\)$/', $clean, $m)) { $neg = true; $clean = $m[1]; }
     if (is_numeric($clean)) {
         $n = (float)$clean;
-        return [$neg ? -$n : $n, null];
+        return [$neg ? -$n : $n, null, $hadPct];
     }
     // Excel error cells are a failed formula, not a measurement.
-    if ($s[0] === '#') return [null, null];
-    return [null, mb_substr($s, 0, 60)];
+    if ($s[0] === '#') return [null, null, false];
+    return [null, mb_substr($s, 0, 60), false];
+}
+
+// Percentages are stored the way the source workbook holds them and the
+// way everyone reads them: 3% is 3, not 0.03. Spreadsheets export a
+// percent-formatted cell either way, so the upload settles the scale:
+//
+//   · a cell that carries its own "%" is already a percentage — as-is;
+//   · otherwise the file's declared scale decides. 'fraction' (the
+//     default, and what Operations exports today) multiplies by 100, so
+//     0.03 becomes 3; 'whole' takes the number as written, which is what
+//     the historical Target vs Achievement sheet holds.
+//
+// Only parameters typed 'percent' are touched; a count or an amount is
+// never rescaled.
+function perfScalePercent(?float $num, string $valueType, bool $hadPercentSign, string $scale): ?float {
+    if ($num === null || $valueType !== 'percent') return $num;
+    if ($hadPercentSign || $scale !== 'fraction') return $num;
+    // Rounded to the column's own scale: 1.4727 * 100 is 147.26999999999998
+    // in binary float, and storing that would make the grid disagree with
+    // the number the manager typed.
+    return round($num * 100, 4);
 }
 
 // Indian digit grouping — 2,20,000 rather than 220,000, matching the
@@ -237,11 +263,14 @@ function perfDisplayValue(?array $cell, array $param): string {
     };
 }
 
-// Plain number for the CSV export — no grouping, no unit.
-function perfRawValue(?array $cell): string {
+// Plain number for the CSV export — no grouping. A percentage keeps its
+// "%" so re-importing the export cannot be read as a fraction and
+// multiplied a second time.
+function perfRawValue(?array $cell, ?array $param = null): string {
     if ($cell === null) return '';
     if ($cell['value_num'] === null) return (string)($cell['value_text'] ?? '');
-    return rtrim(rtrim(number_format((float)$cell['value_num'], 4, '.', ''), '0'), '.');
+    $n = rtrim(rtrim(number_format((float)$cell['value_num'], 4, '.', ''), '0'), '.');
+    return ($param !== null && $param['value_type'] === 'percent') ? $n . '%' : $n;
 }
 
 // ── Data access ─────────────────────────────────────────
@@ -431,6 +460,13 @@ function doPerfUpload(): void {
     // the fallback for a long file whose Month column is blank on a row.
     $formMonth = perfNormalizeMonth((string)($_POST['period_month'] ?? ''));
 
+    // How this file writes percentages. Defaults to 'fraction' — 0.03 for
+    // 3% — which is what a spreadsheet's own percent formatting produces
+    // and what Operations uploads. 'whole' is for a file that already
+    // carries 3, such as an export of the old Target vs Achievement sheet.
+    $pctScale = (string)($_POST['percent_scale'] ?? 'fraction');
+    if (!in_array($pctScale, ['fraction', 'whole'], true)) $pctScale = 'fraction';
+
     $fh = @fopen($file['tmp_name'], 'r');
     if (!$fh) { flash('error', 'Could not read the uploaded file.'); header('Location: ' . $back); exit; }
 
@@ -486,7 +522,10 @@ function doPerfUpload(): void {
     // ── Parse everything before touching the database, so a file with a
     // typo in it is rejected whole rather than half-applied.
     $locMap  = perfLocationsByName();
+    $types   = [];                       // param_code => value_type
+    foreach (perfParameters() as $p) $types[(string)$p['param_code']] = (string)$p['value_type'];
     $parsed  = [];                       // [locId][month][code] => [num, text]
+    $rescaled = 0;                       // percentages converted from a fraction
     $unknownOutlets = [];                // normalised name => original spelling
     $unknownParams  = [];
     $badMonths      = 0;
@@ -521,14 +560,18 @@ function doPerfUpload(): void {
                 if ($paramRaw !== '') $unknownParams[perfNormalizeKey($paramRaw)] = $paramRaw;
                 continue;
             }
-            [$num, $txt] = perfParseValue((string)($r[$colValue] ?? ''));
+            [$num, $txt, $hadPct] = perfParseValue((string)($r[$colValue] ?? ''));
             if ($num === null && $txt === null) { $blankCells++; continue; }
-            $parsed[$locId][$month][$code] = [$num, $txt];
+            $scaled = perfScalePercent($num, $types[$code] ?? 'number', $hadPct, $pctScale);
+            if ($scaled !== $num) $rescaled++;
+            $parsed[$locId][$month][$code] = [$scaled, $txt];
         } else {
             foreach ($paramCols as $i => $code) {
-                [$num, $txt] = perfParseValue((string)($r[$i] ?? ''));
+                [$num, $txt, $hadPct] = perfParseValue((string)($r[$i] ?? ''));
                 if ($num === null && $txt === null) { $blankCells++; continue; }
-                $parsed[$locId][$month][$code] = [$num, $txt];
+                $scaled = perfScalePercent($num, $types[$code] ?? 'number', $hadPct, $pctScale);
+                if ($scaled !== $num) $rescaled++;
+                $parsed[$locId][$month][$code] = [$scaled, $txt];
             }
         }
     }
@@ -586,6 +629,7 @@ function doPerfUpload(): void {
          . ' for ' . $outlets . ' outlet' . ($outlets === 1 ? '' : 's')
          . ' across ' . count($months) . ' month' . (count($months) === 1 ? '' : 's')
          . ' (' . implode(', ', array_map('perfMonthLabel', array_keys($months))) . ').';
+    if ($rescaled)       $msg .= ' ' . number_format($rescaled) . ' percentage(s) read as fractions and multiplied by 100 (0.03 → 3%).';
     if ($blankCells)     $msg .= ' ' . number_format($blankCells) . ' blank cell(s) skipped.';
     if ($badMonths)      $msg .= ' ' . number_format($badMonths) . ' row(s) skipped for an unreadable month.';
     if ($unknownParams)  $msg .= ' Unknown parameter(s) ignored: ' . implode(', ', array_slice($unknownParams, 0, 6)) . '.';
@@ -799,7 +843,17 @@ function pagePerfUpload(): void {
             <label>CSV file <span class="required">*</span></label>
             <input type="file" name="csv" class="form-control" accept=".csv,text/csv" required>
             <small class="text-muted">Max <?= (int)(PERF_CSV_MAX_BYTES / 1024 / 1024) ?> MB.
-                <a href="index.php?page=perf_sample_csv">Download the template</a>.</small>
+                <a href="index.php?page=perf_sample_csv" style="color:var(--accent)">Download the template</a>.</small>
+        </div>
+        <div class="form-group" style="grid-column:1 / -1">
+            <label>Percentages in this file are written as</label>
+            <select name="percent_scale" class="form-control" style="max-width:400px">
+                <option value="fraction" selected>Fractions — 0.03 means 3%</option>
+                <option value="whole">Whole numbers — 3 means 3%</option>
+            </select>
+            <small class="text-muted">Applies only to the eight % parameters. A cell that already
+                carries a "%" (like <code>3%</code>) is taken as written whichever option is picked.
+                The old Target vs Achievement sheet holds whole numbers.</small>
         </div>
     </div>
     <div class="form-actions"><button type="submit" class="btn btn-primary">Import</button></div>
@@ -812,9 +866,11 @@ function pagePerfUpload(): void {
     <b>Wide</b> — <code>Outlet</code> plus one column per parameter (<code>01Target</code>,
     <code>02Achivement</code>, …), one row per outlet, month taken from the form above.<br>
     Column order never matters. Outlet names are matched to
-    <a href="index.php?page=locations">Locations</a> ignoring case, spacing and punctuation; any that
+    <a href="index.php?page=locations" style="color:var(--accent)">Locations</a> ignoring case, spacing and punctuation; any that
     don't match are listed back to you and nothing else in the file is held up. Re-uploading a month
-    overwrites that month's numbers and leaves remarks and conclusions untouched.
+    overwrites that month's numbers and leaves remarks and conclusions untouched.<br>
+    Percentages are stored the way you read them — 3% is 3 — so a file written as fractions is
+    multiplied by 100 on the way in, and the import result tells you how many cells that touched.
 </div>
 
 <div class="table-wrap">
@@ -862,9 +918,18 @@ function perfSampleCsv(): void {
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="performance_upload_template.csv"');
     $out = fopen('php://output', 'w');
-    fputcsv($out, ['Month', 'Outlet', 'Parameter', 'Value'], escape: '');
+    // The trailing note column is documentation, not data: the importer
+    // only reads columns it recognises, so it can be left in place or
+    // deleted. Value is left blank so nothing here can be uploaded by
+    // accident.
+    fputcsv($out, ['Month', 'Outlet', 'Parameter', 'Value', 'How to write it'], escape: '');
     foreach (perfParameters() as $p) {
-        fputcsv($out, [$month, $sample, perfParamLabel($p), ''], escape: '');
+        $hint = match ($p['value_type']) {
+            'percent' => 'fraction — 0.03 for 3% (or write 3%)',
+            'amount'  => 'rupees — 445000',
+            default   => 'count — 1036',
+        };
+        fputcsv($out, [$month, $sample, perfParamLabel($p), '', $hint], escape: '');
     }
     fclose($out);
     exit;
@@ -893,7 +958,7 @@ function pagePerfReviews(): void {
     if (!$months) {
         echo '<div class="page-header"><h2>Performance Reviews</h2></div>';
         echo '<div class="rpt-prompt">No performance data has been uploaded yet.'
-           . (perfCanAdmin() ? ' <a href="index.php?page=perf_upload">Upload a month</a>.' : '')
+           . (perfCanAdmin() ? ' <a href="index.php?page=perf_upload" style="color:var(--accent)">Upload a month</a>.' : '')
            . '</div>';
         return;
     }
@@ -1055,7 +1120,7 @@ function pagePerfReview(): void {
             echo '<div class="rpt-prompt">That outlet is not yours to view.</div>';
         } else {
             echo '<div class="rpt-prompt">No performance data has been uploaded yet.'
-               . (perfCanAdmin() ? ' <a href="index.php?page=perf_upload">Upload a month</a>.' : '')
+               . (perfCanAdmin() ? ' <a href="index.php?page=perf_upload" style="color:var(--accent)">Upload a month</a>.' : '')
                . '</div>';
         }
         return;
@@ -1206,7 +1271,7 @@ function pagePerfReview(): void {
 
 <?php if (!$grid): ?>
     <div class="alert alert-error">No data has been uploaded for this outlet yet, so there is nothing to
-        review. <?= perfCanAdmin() ? '<a href="index.php?page=perf_upload">Upload a month</a>.' : '' ?></div>
+        review. <?= perfCanAdmin() ? '<a href="index.php?page=perf_upload" style="color:var(--accent)">Upload a month</a>.' : '' ?></div>
 <?php endif; ?>
 
 <?php if ($isConcluded && perfCanRemark($locId) && !isSuperadmin()): ?>
@@ -1392,7 +1457,7 @@ function exportPerfReview(): void {
     fputcsv($out, $head, escape: '');
     foreach ($params as $p) {
         $row = [perfParamLabel($p)];
-        foreach ($months as $m) $row[] = perfRawValue($grid[(string)$p['param_code']][$m] ?? null);
+        foreach ($months as $m) $row[] = perfRawValue($grid[(string)$p['param_code']][$m] ?? null, $p);
         fputcsv($out, $row, escape: '');
     }
 

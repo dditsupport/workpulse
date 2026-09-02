@@ -71,11 +71,35 @@ Details that matter in practice:
 - `2,20,000`, `₹220000`, `93.5%` and `(500)` all parse. Blank cells are
   skipped rather than stored as zero, and Excel error cells (`#VALUE!`) are
   dropped. Text like `No Audit` is kept as written and shown in the grid.
+- **Percentages go in as fractions** — `0.03` for 3% — which is what a
+  spreadsheet's own percent formatting exports. See below.
 - **Re-uploading a month overwrites that month's numbers and leaves remarks
   and conclusions untouched** — correcting a figure never costs a review.
 
 `Download the template` on the upload page gives the long layout pre-filled
-with the 18 parameter labels.
+with the 18 parameter labels and a note column saying how each one is written.
+
+### Percentages
+
+Stored the way everyone reads them: **3% is 3**, not 0.03. That is the scale
+the historical import loaded and the scale the review grid and the export use.
+
+Uploads name their own scale, on the form:
+
+| Setting | `0.03` means | `3` means |
+|---|---|---|
+| **Fractions** (default) | 3% | 300% |
+| Whole numbers | 0.03% | 3% |
+
+Leave it on *Fractions* — that is what Operations exports. Pick *Whole
+numbers* only for a file that already carries `3` for 3%, such as an export
+of the old Target vs Achievement sheet.
+
+Either way, a cell that carries its own `%` sign (`3%`) is taken as written
+and never multiplied, so the CSV export — which writes percentages with the
+sign — re-imports unchanged. Only the eight `%` parameters are affected;
+counts and amounts are never rescaled. The import result tells you how many
+cells were multiplied, so a wrong choice shows up immediately.
 
 ## The review
 
