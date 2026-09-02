@@ -1029,7 +1029,9 @@ function pagePerfReviews(): void {
 <div class="page-header">
     <h2>📈 Performance Reviews · <?= h(perfMonthLabel($month)) ?></h2>
     <?php if (perfCanAdmin()): ?>
-        <a class="btn btn-ghost" href="index.php?page=perf_upload">Upload data</a>
+        <!-- The only route to the upload page: it is deliberately not a
+             sidebar entry, so this button has to read as an action. -->
+        <a class="btn btn-primary" href="index.php?page=perf_upload">Upload month's data</a>
     <?php endif; ?>
 </div>
 

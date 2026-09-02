@@ -6,7 +6,11 @@ Operations closes the month with a conclusion. The review screen shows the
 history side by side — months across, parameters down — with each month's
 remarks sitting under the number they explain.
 
-Lives under **Audits** in the sidebar.
+Lives under **Audits** in the sidebar, as a single entry — *Performance
+Review*. The upload page is reached from the button on it rather than from the
+sidebar, the way *Create Audit* is reached from the Audit List: Operations has
+one place to start. It is still gated on `txn_perf_admin` server-side, so
+being off the sidebar is presentation, not permission.
 
 ## Setup, in order
 

@@ -60,7 +60,6 @@ function buildNav(): array {
             ['page' => 'audit_categories',  'icon' => navIcon('categories'),   'label' => 'Audit Categories'],
             ['page' => 'audit_parameters',  'icon' => navIcon('audit_param'),  'label' => 'Audit Parameters'],
             ['page' => 'audit_templates',   'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'],
-            ['page' => 'perf_upload',       'icon' => navIcon('report'),       'label' => 'Performance Upload'],
             ['page' => 'perf_reviews',      'icon' => navIcon('summary'),      'label' => 'Performance Review'],
         ]],
         ['group' => 'Store Operations', 'items' => [
@@ -178,12 +177,13 @@ function buildNav(): array {
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_categories', 'icon' => navIcon('categories'),   'label' => 'Audit Categories'];
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_parameters', 'icon' => navIcon('audit_param'),  'label' => 'Audit Parameters'];
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_templates',  'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'];
-    // Store Performance — the monthly MIS review. Operations uploads and
-    // concludes; everyone else with a claimed outlet (a Store Manager)
-    // gets one entry that opens their own outlet and nothing else.
-    if (hasTxn('perf_admin')) {
-        $audit[] = ['page' => 'perf_upload', 'icon' => navIcon('report'), 'label' => 'Performance Upload'];
-    }
+    // Store Performance — the monthly MIS review. One sidebar entry: the
+    // review. "Performance Upload" is reached from a button on it, the way
+    // "Create Audit" is reached from the Audit List, so Operations has one
+    // place to start rather than two. The page stays gated server-side on
+    // txn_perf_admin.
+    // A Store Manager (a claimed outlet, no txn flag) gets the same entry,
+    // pointing at their own outlet and nothing else.
     if (hasTxn('perf_admin') || hasTxn('perf_view')) {
         $audit[] = ['page' => 'perf_reviews', 'icon' => navIcon('summary'), 'label' => 'Performance Review'];
     } elseif ($locOwner) {
