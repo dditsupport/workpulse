@@ -34,7 +34,11 @@ $txnGroups = [
                            'txn_audit_management' => 'Management Approve',
                            'txn_audit_annotation_resolve' => 'Audit Annotation · Resolve',
                            'txn_audit_admin' => 'Audit Admin', 'txn_audit_view' => 'View All Audits',
-                           'txn_audit_summary' => 'Audit Summary'],
+                           'txn_audit_summary' => 'Audit Summary',
+                           // Store Performance (monthly MIS). A Store Manager needs
+                           // neither flag — owning an outlet is their access.
+                           'txn_perf_admin' => 'Performance Upload & Conclusion',
+                           'txn_perf_view'  => 'Performance · View All Outlets'],
     'Store Operations' => ['txn_outlet_directory' => 'Outlet Directory', 'txn_shelf_life' => 'Shelf Life',
                            'txn_shelf_life_upload' => 'Shelf Life Upload', 'txn_store_hours' => 'Store Hours',
                            'txn_price_tags' => 'Price Tags',

@@ -25,7 +25,7 @@ require_once __DIR__ . '/modules/attendance.php';
 require_once __DIR__ . '/modules/settings.php';
 
 // Conditionally load modules (graceful if not yet created)
-foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos'] as $mod) {
+foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos','store_performance'] as $mod) {
     $f = __DIR__ . '/modules/' . $mod . '.php';
     if (file_exists($f)) require_once $f;
 }
@@ -48,7 +48,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
@@ -195,6 +195,13 @@ function routePost(string $a): void {
         case 'del_audit_parameter':       if (function_exists('doDelAuditParameter'))      doDelAuditParameter();      break;
         case 'save_audit_condition':      if (function_exists('doSaveAuditCondition'))     doSaveAuditCondition();     break;
         case 'del_audit_condition':       if (function_exists('doDelAuditCondition'))      doDelAuditCondition();      break;
+        // Store performance (monthly MIS). Upload + conclusion are gated on
+        // txn_perf_admin inside the handlers; the per-parameter remarks are
+        // gated on the writer owning the outlet (employees.location_id).
+        case 'perf_upload':           if (function_exists('doPerfUpload'))         doPerfUpload();         break;
+        case 'perf_save_remarks':     if (function_exists('doPerfSaveRemarks'))    doPerfSaveRemarks();    break;
+        case 'perf_save_conclusion':  if (function_exists('doPerfSaveConclusion')) doPerfSaveConclusion(); break;
+        case 'perf_reopen_review':    if (function_exists('doPerfReopenReview'))   doPerfReopenReview();   break;
         // Violations
         case 'create_violation':          if (function_exists('doCreateViolation'))         doCreateViolation();         break;
         case 'add_violation_remark':      if (function_exists('doAddViolationRemark'))      doAddViolationRemark();      break;

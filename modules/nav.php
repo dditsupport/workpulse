@@ -60,6 +60,8 @@ function buildNav(): array {
             ['page' => 'audit_categories',  'icon' => navIcon('categories'),   'label' => 'Audit Categories'],
             ['page' => 'audit_parameters',  'icon' => navIcon('audit_param'),  'label' => 'Audit Parameters'],
             ['page' => 'audit_templates',   'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'],
+            ['page' => 'perf_upload',       'icon' => navIcon('report'),       'label' => 'Performance Upload'],
+            ['page' => 'perf_reviews',      'icon' => navIcon('summary'),      'label' => 'Performance Review'],
         ]],
         ['group' => 'Store Operations', 'items' => [
             ['page' => 'outlet_directory',     'icon' => navIcon('outlet'),  'label' => 'Outlet Directory'],
@@ -176,6 +178,17 @@ function buildNav(): array {
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_categories', 'icon' => navIcon('categories'),   'label' => 'Audit Categories'];
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_parameters', 'icon' => navIcon('audit_param'),  'label' => 'Audit Parameters'];
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_templates',  'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'];
+    // Store Performance — the monthly MIS review. Operations uploads and
+    // concludes; everyone else with a claimed outlet (a Store Manager)
+    // gets one entry that opens their own outlet and nothing else.
+    if (hasTxn('perf_admin')) {
+        $audit[] = ['page' => 'perf_upload', 'icon' => navIcon('report'), 'label' => 'Performance Upload'];
+    }
+    if (hasTxn('perf_admin') || hasTxn('perf_view')) {
+        $audit[] = ['page' => 'perf_reviews', 'icon' => navIcon('summary'), 'label' => 'Performance Review'];
+    } elseif ($locOwner) {
+        $audit[] = ['page' => 'perf_review', 'icon' => navIcon('summary'), 'label' => 'Performance Review'];
+    }
 
     $store = [];
     if (hasTxn('outlet_directory')) $store[] = ['page' => 'outlet_directory', 'icon' => navIcon('outlet'), 'label' => 'Outlet Directory'];
@@ -371,6 +384,15 @@ function allowedPages(): array {
     }
     if (isSuperadmin() || hasTxn('audit_summary')) {
         $pages = array_merge($pages, ['audit_summary', 'export_audit_summary']);
+    }
+    // Store performance — the review screen and its export are reachable by
+    // any employee with a claimed outlet; perfReviewContext() pins them to
+    // that outlet, so the page name being allowed grants nothing extra.
+    if (isSuperadmin() || hasTxn('perf_admin') || hasTxn('perf_view') || myLocationId() > 0) {
+        $pages = array_merge($pages, ['perf_review', 'perf_reviews', 'export_perf_review']);
+    }
+    if (isSuperadmin() || hasTxn('perf_admin')) {
+        $pages = array_merge($pages, ['perf_upload', 'perf_sample_csv']);
     }
     if (isSuperadmin() || hasTxn('audit_admin')) {
         $pages = array_merge($pages, ['audit_templates', 'audit_categories', 'audit_parameters', 'audit_conditions', 'export_audit_templates']);
@@ -898,6 +920,12 @@ function dispatchPage(string $page): void {
         case 'audit_param_history': if (function_exists('pageAuditParamHistory')) pageAuditParamHistory(); break;
         case 'download_audit_attachment': if (function_exists('downloadAuditAttachment')) downloadAuditAttachment(); break;
         case 'export_audit_register':     if (function_exists('exportAuditRegister'))     exportAuditRegister();     break;
+        // Store performance (monthly MIS)
+        case 'perf_upload':      if (function_exists('pagePerfUpload'))   pagePerfUpload();   break;
+        case 'perf_reviews':     if (function_exists('pagePerfReviews'))  pagePerfReviews();  break;
+        case 'perf_review':      if (function_exists('pagePerfReview'))   pagePerfReview();   break;
+        case 'perf_sample_csv':  if (function_exists('perfSampleCsv'))    perfSampleCsv();    break;
+        case 'export_perf_review': if (function_exists('exportPerfReview')) exportPerfReview(); break;
         // Policies (Phase 5)
         case 'policies':                       if (function_exists('pagePolicies'))               pagePolicies();               break;
         case 'policy_view':                    if (function_exists('pagePolicyView'))             pagePolicyView();             break;
