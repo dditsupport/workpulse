@@ -156,6 +156,15 @@ function perfParamCode(string $raw): ?string {
     return $key === '' ? null : ($map[$key] ?? null);
 }
 
+// Parameters judged against another parameter in the same month, rather
+// than only against the month before: [param_code => benchmark_code].
+// Achievement is the one that matters today — it reads green once it
+// reaches that month's Target and red while it is short. Add a pair here
+// to give another parameter the same treatment.
+function perfBenchmarks(): array {
+    return ['02' => '01'];      // Achievement vs Target
+}
+
 // ── Month handling ──────────────────────────────────────
 // Everything is stored on the 1st. Accepts what the workbook and Excel
 // actually emit: 2026/07, 2026-07, 07/2026, 2026-07-01, Jul 2026.
@@ -1135,6 +1144,9 @@ function pagePerfReview(): void {
     $params    = perfParameters();
 
     $showRemarks = !isset($_GET['remarks']) || $_GET['remarks'] !== '0';
+    $paramByCode = [];
+    foreach ($params as $p) $paramByCode[(string)$p['param_code']] = $p;
+    $benchmarks  = perfBenchmarks();
 
     $grid     = perfValueGrid($locId, $months);
     $reviews  = perfReviewHeaders($locId, $months);
@@ -1189,6 +1201,11 @@ function pagePerfReview(): void {
 .perf-grid th.perf-col-review{width:250px}
 .perf-delta{font-size:10px;margin-left:5px;font-family:inherit}
 .perf-up{color:var(--green)}.perf-down{color:var(--red)}
+/* Met / missed the month's own benchmark — Achievement against Target.
+   Independent of the delta arrow beside it, which is month-on-month: a
+   figure can be down on last month and still ahead of target. */
+.perf-hit{color:var(--green);font-weight:700}
+.perf-miss{color:var(--red);font-weight:700}
 .perf-note{color:var(--yellow);font-family:inherit;font-style:italic;font-size:11.5px}
 .perf-cell-remark{margin-top:5px;padding-top:5px;border-top:1px dashed rgba(255,255,255,.12);
     font-family:inherit;font-size:11px;font-style:italic;color:var(--muted);
@@ -1324,18 +1341,36 @@ function pagePerfReview(): void {
                                    . ($d > 0 ? '&#9650;' : '&#9660;') . '</span>';
                         }
                     }
+                    // Did this month's figure reach the month's own
+                    // benchmark? Achievement is green once it matches or
+                    // beats Target, red while it is short. A zero or
+                    // missing target is no benchmark at all — everything
+                    // clears zero, so colouring it would say nothing.
+                    $hitClass = ''; $hitTitle = '';
+                    $benchCode = $benchmarks[$code] ?? null;
+                    if ($benchCode !== null && $cell && $cell['value_num'] !== null) {
+                        $bench = $grid[$benchCode][$m] ?? null;
+                        if ($bench && $bench['value_num'] !== null && (float)$bench['value_num'] > 0) {
+                            $met       = (float)$cell['value_num'] >= (float)$bench['value_num'];
+                            $hitClass  = $met ? 'perf-hit' : 'perf-miss';
+                            $benchName = $paramByCode[$benchCode]['param_name'] ?? $benchCode;
+                            $hitTitle  = ($met ? 'Met ' : 'Below ') . strtolower((string)$benchName)
+                                       . ' (' . perfDisplayValue($bench, $paramByCode[$benchCode] ?? $p) . ')';
+                        }
+                    }
+
                     $shown = perfDisplayValue($cell, $p);
                     $isNote = $cell && $cell['value_num'] === null && $cell['value_text'] !== null;
                     $pastRemark = $remarks[$m][$code]['remark'] ?? '';
                 ?>
                     <td class="perf-cell <?= $isReview ? 'perf-col-review' : '' ?>">
-                        <div class="perf-num" title="<?= h($shown) ?>">
+                        <div class="perf-num" title="<?= h($hitTitle !== '' ? $hitTitle : $shown) ?>">
                         <?php if ($shown === ''): ?>
                             <span class="text-muted">—</span>
                         <?php elseif ($isNote): ?>
                             <span class="perf-note"><?= h($shown) ?></span>
                         <?php else: ?>
-                            <?= h($shown) ?><?= $delta ?>
+                            <span class="<?= $hitClass ?>"><?= h($shown) ?></span><?= $delta ?>
                         <?php endif; ?>
                         </div>
 
