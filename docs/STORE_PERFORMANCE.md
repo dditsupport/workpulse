@@ -33,10 +33,25 @@ need them (see below). Nobody has them until you do.
 
 | | Upload | See every outlet | Parameter remarks | Conclusion |
 |---|---|---|---|---|
-| Operations Manager — `txn_perf_admin` | yes | yes | no | yes |
+| Operations Manager — `txn_perf_admin` | yes | yes | yes, via **Justify** | yes |
 | Management / HO — `txn_perf_view` | no | yes | no | no |
 | Store Manager — `employees.location_id` set | no | own outlet only | own outlet only | no |
-| Superadmin | yes | yes | yes | yes |
+| Superadmin | yes | yes | yes, via **Justify** | yes |
+
+### Remarks on a manager's behalf
+
+Reviews often happen with Operations and the Store Manager at one screen, or
+with a manager who has not logged in, so Operations can write the
+per-parameter remarks for any outlet. It is a deliberate mode rather than
+boxes that are always live: **Justify**, on each row of the review list and in
+the header of the review itself, opens them. An ordinary read-through cannot
+be typed into by accident.
+
+Whoever types is what gets recorded — `perf_remarks.updated_by`, shown under
+each remark in the grid — so an entry made on a manager's behalf never reads
+as the manager's own. A banner says whose behalf it is and under whose name it
+will be saved. The Store Manager needs none of this on their own outlet: their
+boxes are always live.
 
 A Store Manager needs **no permission flag at all**: access is owning an
 outlet. The outlet on their employee record is the only one they can open, and

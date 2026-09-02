@@ -9,6 +9,8 @@
 //     · uploads one CSV per month for every outlet
 //     · reads any outlet's history
 //     · writes the closing conclusion for a month
+//     · may also write the per-parameter remarks on any outlet, for a
+//       review done side by side with the manager
 //
 //   Store Manager (employees.location_id — no txn flag at all)
 //     · sees ONLY their own outlet
@@ -86,13 +88,32 @@ function perfCanViewLocation(int $locationId): bool {
     return $locationId === perfMyLocation();
 }
 
-// Who may write the per-parameter remarks: the Store Manager who owns
-// the outlet. Superadmin is included so support can correct an entry —
-// every other role, Operations included, reads them.
+// Who may write the per-parameter remarks: the Store Manager who owns the
+// outlet, and Operations on any outlet — a review often happens with the
+// two of them at one screen, and the manager's words should not have to
+// wait for the manager's login. Whoever types is recorded on the remark
+// (perf_remarks.updated_by) and shown beside it, so an entry made on a
+// manager's behalf never reads as the manager's own.
 function perfCanRemark(int $locationId): bool {
     if ($locationId <= 0) return false;
-    if (isSuperadmin()) return true;
+    if (isSuperadmin() || perfCanAdmin()) return true;
     return $locationId === perfMyLocation();
+}
+
+// The outlet's Store Manager, for the "on behalf of" banner. Read from
+// the same mapping the audit workflow uses (Store Operations > Manager
+// Mapping). Empty when the outlet has no mapping yet — the banner then
+// just says "the Store Manager", which is still true.
+function perfStoreManagerName(int $locationId): string {
+    try {
+        $st = getDb()->prepare(
+            'SELECT e.full_name
+             FROM location_managers lm
+             JOIN employees e ON e.employee_code = lm.store_manager_code
+             WHERE lm.location_id = ?');
+        $st->execute([$locationId]);
+        return (string)($st->fetchColumn() ?: '');
+    } catch (Exception $e) { return ''; }
 }
 
 // Who may write the closing conclusion: Operations only.
@@ -652,11 +673,16 @@ function doPerfUpload(): void {
 function doPerfSaveRemarks(): void {
     $locId = (int)($_POST['location_id'] ?? 0);
     $month = perfNormalizeMonth((string)($_POST['period_month'] ?? '')) ?? '';
-    $back  = 'index.php?page=perf_review&loc=' . $locId . '&month=' . urlencode(perfMonthInput($month));
+    // Coming back in the same mode: an Operations user typing on a
+    // manager's behalf should land back on the open boxes, not a read-only
+    // page. The flag is presentation only — perfCanRemark() below is the
+    // gate, and it does not consult it.
+    $back  = 'index.php?page=perf_review&loc=' . $locId . '&month=' . urlencode(perfMonthInput($month))
+           . (($_POST['justify'] ?? '') === '1' ? '&justify=1' : '');
 
     if (!perfSchemaReady()) { flash('error', perfSchemaNotice()); header('Location: index.php'); exit; }
     if ($month === '' || !perfCanViewLocation($locId) || !perfCanRemark($locId)) {
-        flash('error', 'Access denied — you can only remark on your own outlet.');
+        flash('error', 'Access denied — you cannot write remarks for that outlet.');
         header('Location: index.php?page=perf_review'); exit;
     }
 
@@ -668,7 +694,9 @@ function doPerfSaveRemarks(): void {
     $st = $db->prepare('SELECT status FROM perf_reviews WHERE id = ?');
     $st->execute([$reviewId]);
     if ((string)$st->fetchColumn() === 'concluded' && !isSuperadmin()) {
-        flash('error', 'This month is already concluded. Ask Operations to reopen it before editing remarks.');
+        flash('error', perfCanConclude($locId)
+            ? 'This month is already concluded. Reopen it before editing remarks.'
+            : 'This month is already concluded. Ask Operations to reopen it before editing remarks.');
         header('Location: ' . $back); exit;
     }
 
@@ -1076,6 +1104,18 @@ function pagePerfReviews(): void {
                 <td class="actions">
                     <a class="btn btn-sm btn-primary"
                        href="index.php?page=perf_review&loc=<?= (int)$o['location_id'] ?>&month=<?= h(perfMonthInput($month)) ?>">Open</a>
+                    <?php // Not on a concluded month: the remarks are locked there, so
+                          // the button would open a page that cannot be typed into.
+                          // Reopen it from the review first.
+                          if (perfCanAdmin() && ($r['status'] ?? '') !== 'concluded'): ?>
+                        <!-- Same page, remark boxes open. Operations may write the
+                             per-parameter remarks for a manager who is sitting with
+                             them or has not logged in; it is a deliberate mode
+                             rather than boxes that are always live, so a normal
+                             read-through cannot be typed into by accident. -->
+                        <a class="btn btn-sm btn-ghost"
+                           href="index.php?page=perf_review&loc=<?= (int)$o['location_id'] ?>&month=<?= h(perfMonthInput($month)) ?>&justify=1">Justify</a>
+                    <?php endif; ?>
                 </td>
             </tr>
         <?php endforeach; ?>
@@ -1185,9 +1225,19 @@ function pagePerfReview(): void {
     $status   = (string)($review['status'] ?? 'pending');
 
     $isConcluded  = $status === 'concluded';
-    $canRemark    = perfCanRemark($locId) && (!$isConcluded || isSuperadmin());
     $canConclude  = perfCanConclude($locId);
     $myRemarks    = $remarks[$month] ?? [];
+
+    // Writing remarks for an outlet that is not yours is "on behalf of"
+    // the Store Manager, and takes the explicit Justify link to switch
+    // into — the boxes are not live during an ordinary read. The manager
+    // on their own outlet always has them.
+    $ownsOutlet = $locId === perfMyLocation();
+    $justify    = ($_GET['justify'] ?? '') === '1';
+    $onBehalf   = !$ownsOutlet;
+    $canRemark  = perfCanRemark($locId)
+                  && (!$isConcluded || isSuperadmin())
+                  && (!$onBehalf || $justify);
 
     // Outlet picker — only outlets that actually carry data, so the list
     // is short and every entry leads somewhere.
@@ -1206,7 +1256,7 @@ function pagePerfReview(): void {
         'page' => 'perf_review', 'loc' => $locId,
         'month' => perfMonthInput($month), 'n' => $window,
         'remarks' => $showRemarks ? '1' : '0',
-    ], $over));
+    ] + ($justify ? ['justify' => '1'] : []), $over));
 ?>
 <style>
 /* The grid is wide by design — one column per month, up to 36 of them, so
@@ -1240,6 +1290,9 @@ function pagePerfReview(): void {
 .perf-cell-remark{margin-top:5px;padding-top:5px;border-top:1px dashed rgba(255,255,255,.12);
     font-family:inherit;font-size:11px;font-style:italic;color:var(--muted);
     text-align:left;white-space:normal;line-height:1.45}
+/* Who typed it. Operations may write a remark for a manager, so the name
+   is part of the remark rather than a tooltip nobody hovers. */
+.perf-remark-by{font-style:normal;font-size:10px;opacity:.75;margin-top:2px}
 .perf-grid textarea.form-control{display:block;width:100%;margin-top:6px;
     font-size:11.5px;padding:5px 7px;min-height:56px;
     white-space:normal;font-family:inherit;resize:vertical}
@@ -1256,6 +1309,11 @@ function pagePerfReview(): void {
 <div class="page-header">
     <h2>📈 <?= h($locName) ?> · <?= h(perfMonthLabel($month)) ?></h2>
     <div class="actions">
+        <?php if ($onBehalf && perfCanRemark($locId) && !$justify && !$isConcluded): ?>
+            <a class="btn btn-sm btn-primary" href="<?= h($qs(['justify' => '1'])) ?>">Justify</a>
+        <?php elseif ($justify): ?>
+            <a class="btn btn-sm btn-ghost" href="<?= h($qs(['justify' => '0'])) ?>">Done justifying</a>
+        <?php endif; ?>
         <a class="btn btn-ghost btn-sm" href="<?= h($qs(['page' => 'export_perf_review'])) ?>">Export CSV</a>
         <?php if (perfCanViewAll()): ?>
             <a class="btn btn-ghost btn-sm" href="index.php?page=perf_reviews&month=<?= h(perfMonthInput($month)) ?>">All outlets</a>
@@ -1265,6 +1323,7 @@ function pagePerfReview(): void {
 
 <form method="GET" class="filter-bar">
     <input type="hidden" name="page" value="perf_review">
+    <?php if ($justify): ?><input type="hidden" name="justify" value="1"><?php endif; ?>
     <?php if (perfCanViewAll() && $pickable): ?>
         <label class="text-muted">Outlet</label>
         <select name="loc" class="form-control" style="width:230px" onchange="this.form.submit()">
@@ -1306,7 +1365,7 @@ function pagePerfReview(): void {
 
 <div class="perf-meta">
     <span><b>Status</b> <?= perfStatusBadge($review['status'] ?? null) ?></span>
-    <span class="text-muted"><b>Store Manager remarks</b>
+    <span class="text-muted"><b>Remarks</b>
         <?= $review && $review['remarked_at']
             ? h((string)$review['remarked_name']) . ' · ' . h((string)$review['remarked_at'])
             : 'not submitted' ?></span>
@@ -1321,14 +1380,28 @@ function pagePerfReview(): void {
         review. <?= perfCanAdmin() ? '<a href="index.php?page=perf_upload" style="color:var(--accent)">Upload a month</a>.' : '' ?></div>
 <?php endif; ?>
 
-<?php if ($isConcluded && perfCanRemark($locId) && !isSuperadmin()): ?>
-    <div class="alert alert-success">This month is concluded. Remarks are locked — ask Operations to reopen it if something needs changing.</div>
+<?php if ($isConcluded && perfCanRemark($locId) && !$canRemark): ?>
+    <div class="alert alert-success">This month is concluded, so remarks are locked.
+        <?= $canConclude ? 'Reopen it below to change them.' : 'Ask Operations to reopen it if something needs changing.' ?></div>
+<?php endif; ?>
+
+<?php if ($justify && $canRemark):
+    $smName = perfStoreManagerName($locId); ?>
+    <div class="alert alert-error">
+        <b>Entering remarks on behalf of <?= $smName !== '' ? h($smName) : 'the Store Manager' ?></b>
+        — <?= h($locName) ?>, <?= h(perfMonthLabel($month)) ?>.
+        Each remark is saved against your own name, <?= h(myName()) ?>, so the record shows who typed it.
+    </div>
+<?php elseif ($onBehalf && perfCanRemark($locId) && !$isConcluded): ?>
+    <div class="text-muted" style="margin-bottom:12px">Reading only — use <b>Justify</b> above to write
+        remarks on the Store Manager's behalf.</div>
 <?php endif; ?>
 
 <form method="POST" id="perfRemarkForm">
     <input type="hidden" name="action" value="perf_save_remarks">
     <input type="hidden" name="location_id" value="<?= $locId ?>">
     <input type="hidden" name="period_month" value="<?= h($month) ?>">
+    <?php if ($justify): ?><input type="hidden" name="justify" value="1"><?php endif; ?>
 
     <div class="table-wrap">
     <table class="table perf-grid" style="--perf-col:<?= $showRemarks ? '180px' : '112px' ?>">
@@ -1409,8 +1482,12 @@ function pagePerfReview(): void {
                                       maxlength="4000"
                                       placeholder="Remark…"><?= h((string)($myRemarks[$code]['remark'] ?? '')) ?></textarea>
                         <?php elseif ($showRemarks && $pastRemark !== ''): ?>
-                            <div class="perf-cell-remark" title="<?= h((string)($remarks[$m][$code]['full_name'] ?? '')) ?>">
+                            <?php $by = trim((string)($remarks[$m][$code]['full_name'] ?? '')); ?>
+                            <div class="perf-cell-remark">
                                 <?= nl2br(h($pastRemark)) ?>
+                                <?php if ($by !== ''): ?>
+                                    <div class="perf-remark-by">— <?= h($by) ?></div>
+                                <?php endif; ?>
                             </div>
                         <?php endif; ?>
                     </td>
