@@ -76,8 +76,17 @@ Details that matter in practice:
 - **Re-uploading a month overwrites that month's numbers and leaves remarks
   and conclusions untouched** — correcting a figure never costs a review.
 
-`Download the template` on the upload page gives the long layout pre-filled
-with the 18 parameter labels and a note column saying how each one is written.
+The upload page offers both layouts as templates, **every active outlet
+already listed** so the file is the month's whole grid ready to fill in:
+
+- **wide** — one row per outlet, one column per parameter. Quickest to type a
+  month into, and the shape to reach for.
+- **long** — one row per number, grouped outlet by outlet, with a trailing
+  note column saying how each parameter is written. The importer only reads
+  columns it recognises, so that note column can be left in place.
+
+Both import as they stand once values are typed in; outlets left blank are
+skipped, so a half-finished file uploads fine and the rest can follow.
 
 ### Percentages
 

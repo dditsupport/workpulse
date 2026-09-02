@@ -851,8 +851,12 @@ function pagePerfUpload(): void {
         <div class="form-group">
             <label>CSV file <span class="required">*</span></label>
             <input type="file" name="csv" class="form-control" accept=".csv,text/csv" required>
-            <small class="text-muted">Max <?= (int)(PERF_CSV_MAX_BYTES / 1024 / 1024) ?> MB.
-                <a href="index.php?page=perf_sample_csv" style="color:var(--accent)">Download the template</a>.</small>
+            <small class="text-muted">Max <?= (int)(PERF_CSV_MAX_BYTES / 1024 / 1024) ?> MB. Templates,
+                every active outlet already listed:
+                <a href="index.php?page=perf_sample_csv&amp;layout=wide" style="color:var(--accent)">wide</a>
+                (one row per outlet — quickest to fill) or
+                <a href="index.php?page=perf_sample_csv" style="color:var(--accent)">long</a>
+                (one row per number).</small>
         </div>
         <div class="form-group" style="grid-column:1 / -1">
             <label>Percentages in this file are written as</label>
@@ -920,25 +924,49 @@ function pagePerfUpload(): void {
 function perfSampleCsv(): void {
     if (!perfCanAdmin()) { echo 'Access denied.'; exit; }
 
-    $locs   = getActiveLocations();
-    $sample = $locs ? (string)$locs[0]['location_name'] : 'AHD - Example';
+    // Every active outlet, so the file is the month's whole grid ready to
+    // fill in rather than an example of one store. Inactive outlets are
+    // left out: you would not be reporting a month for a closed store.
+    $locs  = getActiveLocations();
+    if (!$locs) $locs = [['location_id' => 0, 'location_name' => 'AHD - Example']];
+    $params = perfParameters();
     $month  = date('Y/m', strtotime('first day of last month'));
+    $wide   = ($_GET['layout'] ?? '') === 'wide';
 
     header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename="performance_upload_template.csv"');
+    header('Content-Disposition: attachment; filename="performance_template_'
+         . ($wide ? 'wide' : 'long') . '.csv"');
     $out = fopen('php://output', 'w');
+
+    if ($wide) {
+        // One row per outlet, one column per parameter — the quickest
+        // shape to type a month into. No note row: every row here is read
+        // as an outlet, and a note would come back as an unmatched name.
+        $head = ['Outlet'];
+        foreach ($params as $p) $head[] = perfParamLabel($p);
+        fputcsv($out, $head, escape: '');
+        foreach ($locs as $l) {
+            fputcsv($out, array_merge([(string)$l['location_name']],
+                                      array_fill(0, count($params), '')), escape: '');
+        }
+        fclose($out);
+        exit;
+    }
+
+    // Long layout, outlet by outlet so a store is filled in one block.
     // The trailing note column is documentation, not data: the importer
     // only reads columns it recognises, so it can be left in place or
-    // deleted. Value is left blank so nothing here can be uploaded by
-    // accident.
+    // deleted. Values are left blank so nothing here uploads by accident.
     fputcsv($out, ['Month', 'Outlet', 'Parameter', 'Value', 'How to write it'], escape: '');
-    foreach (perfParameters() as $p) {
-        $hint = match ($p['value_type']) {
-            'percent' => 'fraction — 0.03 for 3% (or write 3%)',
-            'amount'  => 'rupees — 445000',
-            default   => 'count — 1036',
-        };
-        fputcsv($out, [$month, $sample, perfParamLabel($p), '', $hint], escape: '');
+    foreach ($locs as $l) {
+        foreach ($params as $p) {
+            $hint = match ($p['value_type']) {
+                'percent' => 'fraction — 0.03 for 3% (or write 3%)',
+                'amount'  => 'rupees — 445000',
+                default   => 'count — 1036',
+            };
+            fputcsv($out, [$month, (string)$l['location_name'], perfParamLabel($p), '', $hint], escape: '');
+        }
     }
     fclose($out);
     exit;
