@@ -1173,53 +1173,24 @@ function pageChecklistOverview(): void {
             $totalQ = (int)($tq->fetchColumn() ?: 0);
         }
 
+        // Items answered per (location, day). chkDoneByLocationDay() spreads a
+        // weekly or monthly answer across every day of the cycle it covers, so
+        // a once-a-month task does not leave the other 30 days a task short of
+        // the denominator above.
+        $secFilter = $sectionFilterActive ? $sections : [];
         if ($mode === 'day') {
             // Day mode — one aggregate row per location for the chosen date.
-            if ($sectionFilterActive) {
-                $ph = implode(',', array_fill(0, count($sections), '?'));
-                $st = $db->prepare(
-                    "SELECT r.location_id, COUNT(*) AS done
-                     FROM chk_daily_responses r
-                     JOIN chk_items i ON i.id = r.item_id
-                     WHERE r.checklist_id = ? AND r.log_date = ? AND i.section_name IN ($ph)
-                     GROUP BY r.location_id"
-                );
-                $st->execute(array_merge([$checklistId, $selectedDay], $sections));
-            } else {
-                $st = $db->prepare(
-                    "SELECT location_id, COUNT(*) AS done
-                     FROM chk_daily_responses
-                     WHERE checklist_id = ? AND log_date = ?
-                     GROUP BY location_id"
-                );
-                $st->execute([$checklistId, $selectedDay]);
-            }
-            foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
-                $dayCell[(int)$r['location_id']] = (int)$r['done'];
+            $done = chkDoneByLocationDay($checklistId, $selectedDay, $selectedDay, $selectedLocs, $secFilter);
+            foreach ($done as $locId => $byDay) {
+                $dayCell[(int)$locId] = (int)($byDay[$selectedDay] ?? 0);
             }
         } else {
-            // Month mode — items answered per (location, day) in chosen month.
-            if ($sectionFilterActive) {
-                $ph = implode(',', array_fill(0, count($sections), '?'));
-                $st = $db->prepare(
-                    "SELECT r.location_id, DAY(r.log_date) AS day, COUNT(*) AS done
-                     FROM chk_daily_responses r
-                     JOIN chk_items i ON i.id = r.item_id
-                     WHERE r.checklist_id = ? AND r.log_date BETWEEN ? AND ? AND i.section_name IN ($ph)
-                     GROUP BY r.location_id, DAY(r.log_date)"
-                );
-                $st->execute(array_merge([$checklistId, $monthStart, $monthEnd], $sections));
-            } else {
-                $st = $db->prepare(
-                    "SELECT location_id, DAY(log_date) AS day, COUNT(*) AS done
-                     FROM chk_daily_responses
-                     WHERE checklist_id = ? AND log_date BETWEEN ? AND ?
-                     GROUP BY location_id, DAY(log_date)"
-                );
-                $st->execute([$checklistId, $monthStart, $monthEnd]);
-            }
-            foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
-                $cell[(int)$r['location_id']][(int)$r['day']] = (int)$r['done'];
+            // Month mode — one figure per (location, day) in the chosen month.
+            $done = chkDoneByLocationDay($checklistId, $monthStart, $monthEnd, $selectedLocs, $secFilter);
+            foreach ($done as $locId => $byDay) {
+                foreach ($byDay as $isoDay => $n) {
+                    $cell[(int)$locId][(int)substr($isoDay, 8, 2)] = (int)$n;
+                }
             }
         }
     }

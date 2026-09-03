@@ -286,11 +286,10 @@ function pendingForMe_checklist(int $locId): array {
         $tq->execute([$storeId]);
         $totalQ = (int)$tq->fetchColumn();
         if ($totalQ === 0) return [];
-        $st = getDb()->prepare(
-            "SELECT COUNT(DISTINCT item_id) FROM chk_daily_responses WHERE checklist_id = ? AND location_id = ? AND log_date = ?"
-        );
-        $st->execute([$storeId, $locId, $today]);
-        $done = (int)$st->fetchColumn();
+        // $totalQ spans every cycle, so the count has to as well: a monthly
+        // task answered once counts for the rest of its month, otherwise this
+        // tile would report today incomplete every day of the year.
+        $done = (int)(chkDoneByLocationDay($storeId, $today, $today, [$locId])[$locId][$today] ?? 0);
         if ($done < $totalQ) {
             $rows[] = [
                 'source'     => 'Checklist · today',
