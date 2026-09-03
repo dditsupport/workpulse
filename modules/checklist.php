@@ -1776,6 +1776,95 @@ function chkDoneCount(int $checklistId, int $locationId, string $logDate, ?strin
     }
 }
 
+// Answered items per location per calendar day, for one checklist over a date
+// range: [location_id][Y-m-d] => int. Feeds the Overview grid, the fill page's
+// month tiles and the dashboard reminder, so all three agree on what "done"
+// means.
+//
+// A weekly or monthly answer is credited to *every* day of the cycle it
+// covers. Counting by log_date alone would put a monthly answer on the 1st and
+// nowhere else, leaving 30 of 31 days a task short for work that was done —
+// which is exactly what the "out of N" denominators compare against.
+//
+// log_date is already the cycle anchor for anything written since the cycles
+// moved onto sections, but a task promoted from daily to monthly leaves older
+// rows on their original day; those are normalised to their anchor here, so
+// two such rows in one month collapse into one instead of counting twice.
+//
+// $locationIds / $sectionNames narrow the scan; an empty array means no
+// filter. $sectionNames matches chk_items.section_name, the denormalised copy
+// the Overview's Section multi-select already filters on.
+function chkDoneByLocationDay(
+    int $checklistId,
+    string $from,
+    string $to,
+    array $locationIds = [],
+    array $sectionNames = []
+): array {
+    if ($from > $to) return [];
+    $f = chkItemFreqSql();
+    // Reach back to the start of the week $from sits in and forward to the end
+    // of the month $to sits in, so a cycle straddling either edge is not lost.
+    $scanFrom = min(chkPeriodStart('weekly', $from), chkPeriodStart('monthly', $from));
+    $scanTo   = chkPeriodEnd('monthly', $to);
+
+    $where = ["r.checklist_id = ?", "r.log_date BETWEEN ? AND ?",
+              "r.response_value IS NOT NULL", "r.response_value <> ''"];
+    $args  = [$checklistId, $scanFrom, $scanTo];
+    if ($locationIds) {
+        $where[] = 'r.location_id IN (' . implode(',', array_fill(0, count($locationIds), '?')) . ')';
+        foreach ($locationIds as $lid) $args[] = (int)$lid;
+    }
+    if ($sectionNames) {
+        $where[] = 'i.section_name IN (' . implode(',', array_fill(0, count($sectionNames), '?')) . ')';
+        foreach ($sectionNames as $sn) $args[] = (string)$sn;
+    }
+    // DAYOFWEEK() is Sunday = 1, matching chkPeriodStart('weekly', …). Every
+    // branch is formatted, so the anchor comes back as a plain Y-m-d string
+    // whichever cycle it took — the fan-out below compares it as one.
+    $anchorSql = "CASE {$f}
+                      WHEN 'monthly' THEN DATE_FORMAT(r.log_date, '%Y-%m-01')
+                      WHEN 'weekly'  THEN DATE_FORMAT(DATE_SUB(r.log_date, INTERVAL DAYOFWEEK(r.log_date) - 1 DAY), '%Y-%m-%d')
+                      ELSE DATE_FORMAT(r.log_date, '%Y-%m-%d')
+                  END";
+    try {
+        // COUNT(DISTINCT item_id) is not decoration: uq_response includes
+        // employee_code, so two people at one location answering the same task
+        // hold a row each.
+        $st = getDb()->prepare(
+            "SELECT r.location_id, {$anchorSql} AS anchor, {$f} AS freq,
+                    COUNT(DISTINCT r.item_id) AS done
+             FROM chk_daily_responses r
+             JOIN chk_items i ON i.id = r.item_id
+             JOIN chk_checklists c ON c.id = i.checklist_id
+             LEFT JOIN chk_sections sec ON sec.id = i.section_id
+             WHERE " . implode(' AND ', $where) . "
+             GROUP BY r.location_id, anchor, freq");
+        $st->execute($args);
+        $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) {
+        return [];
+    }
+
+    $out = [];
+    foreach ($rows as $r) {
+        $loc    = (int)$r['location_id'];
+        $anchor = (string)$r['anchor'];
+        $done   = (int)$r['done'];
+        if ($done <= 0) continue;
+        $freq = (string)$r['freq'];
+        if (!in_array($freq, CHK_FREQS, true)) $freq = 'daily';
+        $day = $anchor > $from ? $anchor : $from;
+        $end = chkPeriodEnd($freq, $anchor);
+        if ($end > $to) $end = $to;
+        while ($day <= $end) {
+            $out[$loc][$day] = ($out[$loc][$day] ?? 0) + $done;
+            $day = date('Y-m-d', strtotime('+1 day', strtotime($day)));
+        }
+    }
+    return $out;
+}
+
 // ── Hub: list every checklist assigned to the user ────────
 // One card per checklist, carrying a line for each cycle it actually holds.
 // A checklist can mix Daily, Weekly and Monthly sections, so grouping the
@@ -1920,9 +2009,9 @@ function pageChecklistFill(int $checklistId): void {
     // ── Day picker ───────────────────────────────────────
     // One tile per day of the month. Picking a day drives every section: the
     // daily ones show that day, the weekly and monthly ones the week and month
-    // containing it. The tile figures count daily work only — on the 1st of a
-    // month the daily and monthly anchors are the same date, so counting by
-    // log_date alone would fold monthly tasks into that day's tile.
+    // containing it. A tile's figure is measured the same way, against every
+    // cycle — a monthly task answered once reads as done for the rest of its
+    // month rather than leaving every other tile a task short.
     // Are a task's minutes kept per day worked? Decides both what the duration
     // box is pre-filled with and whether the cycle total is worth showing.
     $perDayUi = chkHasTaskTimeDay();
@@ -1942,11 +2031,6 @@ function pageChecklistFill(int $checklistId): void {
     }
     $tileMin  = $navFirst;
     $tileMax  = $navLast;
-    // The grace-day banner reads its figures out of the same count. On the 1st
-    // of a month yesterday sits in the month before, so reach back for it —
-    // the extra row has no tile and is simply not drawn.
-    $countMin = ($graceDate !== null && $graceDate < $tileMin) ? $graceDate : $tileMin;
-    $countMax = ($graceDate !== null && $graceDate > $tileMax) ? $graceDate : $tileMax;
     $tileWide = 72;
     $locQS    = $isLoc && $locationId > 0 ? "&location_id={$locationId}" : '';
 
@@ -1961,24 +2045,10 @@ function pageChecklistFill(int $checklistId): void {
     foreach (CHK_FREQS as $f) $anchors[$f] = chkPeriodStart($f, $displayDate);
 
     if ($haveScope) {
-        // Tile counts — daily work only, see the note on the picker above.
-        $fSql = chkItemFreqSql();
-        try {
-            $st = $db->prepare(
-                "SELECT r.log_date, COUNT(DISTINCT r.item_id) AS done
-                 FROM chk_daily_responses r
-                 JOIN chk_items i ON i.id = r.item_id
-                 JOIN chk_checklists c ON c.id = i.checklist_id
-                 LEFT JOIN chk_sections sec ON sec.id = i.section_id
-                 WHERE r.checklist_id = ? AND r.location_id = ? AND r.log_date BETWEEN ? AND ?
-                   AND r.response_value IS NOT NULL AND r.response_value <> ''
-                   AND {$fSql} = 'daily'
-                 GROUP BY r.log_date");
-            $st->execute([$checklistId, $locationId, $countMin, $countMax]);
-            $existingCounts = $st->fetchAll(PDO::FETCH_KEY_PAIR);
-        } catch (Exception $e) {
-            $existingCounts = [];
-        }
+        // Tile counts. $totalQ is every active item, so the numerator has to
+        // span every cycle too: a monthly answer counts for each day of its
+        // month, otherwise a mixed-cycle checklist could never tile green.
+        $existingCounts = chkDoneByLocationDay($checklistId, $tileMin, $tileMax, [$locationId])[$locationId] ?? [];
 
         // Tasks, each carrying the cycle it runs on so the view can group and
         // label by it and resolve its answer to the right anchor.
@@ -2191,7 +2261,10 @@ $graceDailyTotal = 0; $graceDailyDone = 0;
 $showGraceBanner = false;
 if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
     $graceDailyTotal = (int)(chkItemTotalByFreq($checklistId)['daily'] ?? 0);
-    $graceDailyDone  = (int)($existingCounts[$graceDate] ?? 0);
+    // Not $existingCounts: those credit a monthly answer to every day of its
+    // month, which would report yesterday's daily work as further along than
+    // it is — and on the 1st, as more done than there are daily tasks.
+    $graceDailyDone  = chkDoneCount($checklistId, $locationId, $graceDate, 'daily');
     $showGraceBanner = $graceDailyTotal > 0 && $graceDailyDone < $graceDailyTotal;
 }
 ?>
