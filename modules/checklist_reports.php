@@ -498,6 +498,49 @@ function pageChecklistReport(): void {
 <?php }
 
 // ── Audit Report ──────────────────────────────────────────
+
+// The one answer the audit report shows against a task that several people
+// filled. A "No" always wins: a failure must not sit hidden behind a
+// colleague's later "Yes" — that is the whole point of the report. Otherwise
+// it is the most recent non-empty answer. $rows is oldest first.
+function chkAuditSummaryAnswer(array $rows): string {
+    $latest = '';
+    foreach ($rows as $r) {
+        $v = trim((string)($r['response_value'] ?? ''));
+        if ($v === '') continue;
+        if (mb_strtolower($v) === 'no') return $v;
+        $latest = $v;
+    }
+    return $latest;
+}
+
+// One line per person who filled a task — name, time of day, their own answer,
+// their own minutes and their own remark. Used only where more than one person
+// filled it; with a single filler the caller keeps the original one-line
+// layout, so an outlet checklist with one manager per store reads as it always
+// has.
+function chkAuditFillerLines(array $rows, bool $timeUi): string {
+    $out = '';
+    foreach ($rows as $r) {
+        $who  = (string)($r['staff_member'] ?? $r['staff_code'] ?? '—');
+        $when = !empty($r['submitted_at']) ? date('H:i', strtotime((string)$r['submitted_at'])) : '';
+        $ans  = trim((string)($r['response_value'] ?? ''));
+        $mins = (int)($r['time_minutes'] ?? 0);
+        $rmk  = trim((string)($r['remarks'] ?? ''));
+        $bits = [h($who) . ($when !== '' ? ' · ' . h($when) : '')];
+        if ($ans !== '') {
+            $bits[] = '<span style="font-weight:600;color:'
+                    . (mb_strtolower($ans) === 'no' ? 'var(--red)' : 'var(--green)') . '">'
+                    . h($ans) . '</span>';
+        }
+        if ($timeUi && $mins > 0 && function_exists('fmtMinutes')) $bits[] = h(fmtMinutes($mins));
+        $line = implode(' · ', $bits);
+        if ($rmk !== '') $line .= ' <span style="color:var(--muted)">&ldquo;' . h($rmk) . '&rdquo;</span>';
+        $out .= '<div style="font-size:11px;margin-top:3px">' . $line . '</div>';
+    }
+    return $out;
+}
+
 function pageChecklistAudit(): void {
     $db = getDb();
 
@@ -553,7 +596,8 @@ function pageChecklistAudit(): void {
     }
     $locFilterActive = count($selectedLocs) < count($allLocations);
 
-    $locations = []; $itemsBySection = []; $responsesByLoc = []; $locTree = []; $valByLoc = [];
+    $locations = []; $itemsBySection = []; $locTree = []; $valByLoc = [];
+    $responsesByLoc = [];   // [location_id][item_id] => list of rows, one per filler
     // The filler's own remark on each task, distinct from the validator's.
     $auditRemarks = function_exists('chkHasRemarks') && chkHasRemarks();
     $attByLoc  = [];   // [location_id][item_id] => ['n','img'] for the chosen day
@@ -603,11 +647,22 @@ function pageChecklistAudit(): void {
             $itemsBySection[$sec][] = $it;
         }
 
-        // Responses for the chosen day, indexed by [locId][itemId]. A weekly or
-        // monthly task's answer sits on its cycle's anchor, not on the day being
-        // audited, so all three anchors are fetched and each task is matched to
-        // the one its own cycle resolves to — otherwise every non-daily task
-        // would read unanswered on all but one day of its period.
+        // Responses for the chosen day, indexed by [locId][itemId] as a LIST —
+        // one row per person who filled the task, oldest first.
+        //
+        // It has to be a list. A department checklist is filled by everyone
+        // assigned to it, all under the same location 0, and the unique key on
+        // chk_daily_responses carries employee_code, so each of them holds a
+        // row of their own. Keeping one row per task showed a single filler and
+        // dropped the others — arbitrarily, since nothing ordered the result,
+        // so the name beside a task was whichever row the engine handed over
+        // last. The minutes were already summed across fillers; only the names,
+        // answers and remarks were being thrown away.
+        //
+        // A weekly or monthly task's answer sits on its cycle's anchor, not on
+        // the day being audited, so all three anchors are fetched and each task
+        // is matched to the one its own cycle resolves to — otherwise every
+        // non-daily task would read unanswered on all but one day of its period.
         $anchors = [];
         foreach (['daily', 'weekly', 'monthly'] as $f) {
             $anchors[$f] = function_exists('chkPeriodStart') ? chkPeriodStart($f, $filterDate) : $filterDate;
@@ -616,36 +671,29 @@ function pageChecklistAudit(): void {
         foreach ($allItems as $it) $freqOfItem[(int)$it['id']] = (string)($it['item_freq'] ?? 'daily');
         $respSt = $db->prepare(
             'SELECT a.location_id, a.item_id, a.log_date, a.response_value, a.submitted_at,'
-            . ($auditRemarks ? ' a.remarks,' : '') .
+            . ($auditRemarks ? ' a.remarks,' : '')
+            . ($timeUi ? ' a.time_minutes,' : '') .
             '       e.full_name AS staff_member, e.employee_code AS staff_code
              FROM chk_daily_responses a
              LEFT JOIN employees e ON a.employee_code = e.employee_code
-             WHERE a.checklist_id = ? AND a.log_date IN (?, ?, ?)'
+             WHERE a.checklist_id = ? AND a.log_date IN (?, ?, ?)
+             ORDER BY a.submitted_at ASC, a.id ASC'
         );
         $respSt->execute(array_merge([$checklistId], array_values($anchors)));
+        // Minutes noted against each task: the sum of what every filler logged.
+        // Taken from these same rows rather than a query of its own, so it
+        // inherits the anchor matching above — the separate query it replaces
+        // asked for log_date = the audited day, which found nothing for a
+        // weekly or monthly task on any day but its anchor and left every one
+        // of them reading "—" with its time missing from the day's total.
         foreach ($respSt->fetchAll(PDO::FETCH_ASSOC) as $row) {
             $iid  = (int)$row['item_id'];
             $want = $anchors[$freqOfItem[$iid] ?? 'daily'] ?? $filterDate;
             if ((string)$row['log_date'] !== $want) continue;
-            $responsesByLoc[(int)$row['location_id']][$iid] = $row;
-        }
-
-        // Minutes noted against each task that day. Several people can answer
-        // one outlet's day (the unique key includes employee_code), so the
-        // time for a task is the sum of what each of them logged.
-        if ($timeUi) {
-            try {
-                $tst = $db->prepare(
-                    "SELECT location_id, item_id, SUM(time_minutes) AS mins
-                     FROM chk_daily_responses
-                     WHERE checklist_id = ? AND log_date = ? AND time_minutes IS NOT NULL
-                     GROUP BY location_id, item_id"
-                );
-                $tst->execute([$checklistId, $filterDate]);
-                foreach ($tst->fetchAll(PDO::FETCH_ASSOC) as $row) {
-                    $minsByLoc[(int)$row['location_id']][(int)$row['item_id']] = (int)$row['mins'];
-                }
-            } catch (Exception $e) { /* column not migrated — no time column */ }
+            $lid = (int)$row['location_id'];
+            $responsesByLoc[$lid][$iid][] = $row;
+            $mins = (int)($row['time_minutes'] ?? 0);
+            if ($mins > 0) $minsByLoc[$lid][$iid] = ($minsByLoc[$lid][$iid] ?? 0) + $mins;
         }
 
         // Operation-team validations for the chosen day, indexed by [locId][itemId].
@@ -947,9 +995,14 @@ function pageChecklistAudit(): void {
     <?php $sr = 1; foreach ($sections as $sec): $secItems = $itemsBySection[$sec] ?? []; if (!$secItems) continue; ?>
         <tr><td colspan="<?= $colspan ?>" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px"><?= h($sec) ?></td></tr>
         <?php foreach ($secItems as $it):
-            $iid = (int)$it['id']; $r = $resps0[$iid] ?? null;
-            $ans  = trim((string)($r['response_value'] ?? ''));
-            $isNo = $ans !== '' && mb_strtolower($ans) === 'no';
+            $iid   = (int)$it['id'];
+            $rows  = $resps0[$iid] ?? [];
+            $multi = count($rows) > 1;
+            // The latest filler carries the one-line layout when they are the
+            // only one; with several, each gets a line of their own below.
+            $r     = $rows ? $rows[count($rows) - 1] : null;
+            $ans   = chkAuditSummaryAnswer($rows);
+            $isNo  = $ans !== '' && mb_strtolower($ans) === 'no';
             $cv = $vals0[$iid] ?? null;
         ?>
         <tr>
@@ -960,7 +1013,7 @@ function pageChecklistAudit(): void {
                           ? chkFileBadge($checklistId, $iid, (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, null, $filterDate)
                           : '';
                       echo chkTaskHtml($it['task_description'], $itExtra); ?>
-                <?php $rmk = trim((string)($r['remarks'] ?? '')); if ($rmk !== ''): ?>
+                <?php $rmk = $multi ? '' : trim((string)($r['remarks'] ?? '')); if ($rmk !== ''): ?>
                 <div class="text-muted" style="margin-top:3px;font-size:11px">&ldquo;<?= h($rmk) ?>&rdquo;</div>
                 <?php endif; ?>
             </td>
@@ -969,7 +1022,10 @@ function pageChecklistAudit(): void {
             <td style="white-space:nowrap"><?php if ($im > 0): ?><span style="display:inline-flex;align-items:center;gap:4px"><?= chkClockIcon(12) ?><?= h(fmtMinutes($im)) ?></span><?php else: ?><span class="text-muted">—</span><?php endif; ?></td>
             <?php endif; ?>
             <td style="color:var(--muted);font-size:12px">
-                <?php if ($r): ?><?= h($r['staff_member'] ?? $r['staff_code'] ?? '—') ?> · <?= h(date('H:i', strtotime($r['submitted_at']))) ?><?php else: ?>—<?php endif; ?>
+                <?php if ($multi): ?>
+                    <?= count($rows) ?> people
+                    <?= chkAuditFillerLines($rows, $timeUi) ?>
+                <?php elseif ($r): ?><?= h($r['staff_member'] ?? $r['staff_code'] ?? '—') ?> · <?= h(date('H:i', strtotime($r['submitted_at']))) ?><?php else: ?>—<?php endif; ?>
                 <?php if ($cv): $cvDone = $cv['status'] === 'done'; ?>
                     <div style="margin-top:3px;color:<?= $cvDone ? 'var(--green)' : 'var(--red)' ?>"><?= $cvDone ? '&#10003; Done' : '&#10007; Not done' ?> · <?= h($cv['val_name'] ?? '—') ?><?php if (!empty($cv['remarks'])): ?> · &ldquo;<?= h($cv['remarks']) ?>&rdquo;<?php endif; ?></div>
                 <?php endif; ?>
@@ -1044,9 +1100,11 @@ $minsCell = function (int $m) use ($timeUi): string {
                     <div class="num">—</div>
                 </div>
             <?php else: foreach ($secItems as $it):
-                $r = $resps[(int)$it['id']] ?? null;
-                $ans  = trim((string)($r['response_value'] ?? ''));
-                $isNo = $ans !== '' && mb_strtolower($ans) === 'no';
+                $rows  = $resps[(int)$it['id']] ?? [];
+                $multi = count($rows) > 1;
+                $r     = $rows ? $rows[count($rows) - 1] : null;
+                $ans   = chkAuditSummaryAnswer($rows);
+                $isNo  = $ans !== '' && mb_strtolower($ans) === 'no';
             ?>
                 <div class="chk-tree-row item-row<?= $r ? '' : ' missing' ?>">
                     <div class="name" style="padding-left:74px">
@@ -1056,7 +1114,7 @@ $minsCell = function (int $m) use ($timeUi): string {
                                   ? chkFileBadge($checklistId, (int)$it['id'], (int)($at['n'] ?? 0), (int)($at['img'] ?? 0), $filterDate, $locId, $filterDate)
                                   : '';
                               echo chkTaskHtml($it['task_description'], $itExtra, 'lbl'); ?>
-                        <?php $rmk = trim((string)($r['remarks'] ?? '')); if ($rmk !== ''): ?>
+                        <?php $rmk = $multi ? '' : trim((string)($r['remarks'] ?? '')); if ($rmk !== ''): ?>
                         <div style="font-size:11px;margin-top:3px;color:var(--muted);white-space:normal;word-break:break-word">&ldquo;<?= h($rmk) ?>&rdquo;</div>
                         <?php endif; ?>
                     </div>
@@ -1069,7 +1127,10 @@ $minsCell = function (int $m) use ($timeUi): string {
                     </div>
                     <?= $minsCell((int)($minsByLoc[$locId][(int)$it['id']] ?? 0)) ?>
                     <div class="num" style="color:var(--muted)">
-                        <?php if ($r): ?>
+                        <?php if ($multi): ?>
+                            <?= count($rows) ?> people
+                            <?= chkAuditFillerLines($rows, $timeUi) ?>
+                        <?php elseif ($r): ?>
                             <?= h($r['staff_member'] ?? $r['staff_code'] ?? '—') ?> · <?= h(date('H:i', strtotime($r['submitted_at']))) ?>
                         <?php else: ?>
                             —
