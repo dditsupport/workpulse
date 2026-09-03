@@ -337,7 +337,11 @@ function pageChecklistReport(): void {
                     $logDate = sprintf('%04d-%02d-%02d', $selectedYear, $selectedMonth, $d);
                 ?>
                 <th style="min-width:36px;text-align:center">
-                    <a href="?page=checklist_audit&view=1&log_date=<?= $logDate ?>&location_id=<?= (int)$locationId ?>"
+                    <?php // checklist_id travels with the date: without it the audit
+                          // falls back to the location-assigned Store Checklist, so
+                          // clicking a day on a department report opened someone
+                          // else's list. ?>
+                    <a href="?page=checklist_audit&view=1&checklist_id=<?= $checklistId ?>&log_date=<?= $logDate ?>&location_id=<?= (int)$locationId ?>"
                        style="color:inherit;text-decoration:none"
                        title="Open audit for <?= $logDate ?>"><?= $dayStr ?></a>
                 </th>
@@ -1558,7 +1562,7 @@ function pageChecklistOverview(): void {
             <td class="chk-loc-name"><?= h($loc['location_name']) ?></td>
             <td style="padding:6px 14px;border-bottom:1px solid var(--border)">
                 <a class="chk-ov-tile <?= $cls ?>" style="min-width:80px;display:inline-block;padding:6px 12px;text-align:center"
-                   href="?page=checklist_audit&view=1&log_date=<?= h($selectedDay) ?>&location_id=<?= $locId ?>"
+                   href="?page=checklist_audit&view=1&checklist_id=<?= $checklistId ?>&log_date=<?= h($selectedDay) ?>&location_id=<?= $locId ?>"
                    title="<?= $title ?>">
                     <?= $done ?>/<?= (int)$totalQ ?>
                 </a>
@@ -1614,7 +1618,7 @@ function pageChecklistOverview(): void {
                         </span>
                     <?php else: ?>
                         <a class="chk-ov-tile <?= $cls ?>"
-                           href="?page=checklist_audit&view=1&log_date=<?= h($tileDate) ?>&location_id=<?= $locId ?>"
+                           href="?page=checklist_audit&view=1&checklist_id=<?= $checklistId ?>&log_date=<?= h($tileDate) ?>&location_id=<?= $locId ?>"
                            title="<?= $title ?>">
                             <?= $d ?><br><span><?= $done ?>/<?= (int)$totalQ ?></span>
                         </a>
