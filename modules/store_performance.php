@@ -154,12 +154,26 @@ function perfParameters(): array {
     if ($params !== null) return $params;
     try {
         $params = getDb()->query(
-            'SELECT param_code, param_name, value_type, better
+            'SELECT param_code, param_name, value_type, better, default_target
              FROM perf_parameters WHERE is_active = 1
              ORDER BY sort_order, param_code'
         )->fetchAll(PDO::FETCH_ASSOC);
     } catch (Exception $e) {
-        $params = [];
+        // default_target arrives with the goals migration. Without it the
+        // whole module would otherwise render no parameters at all, so
+        // fall back to the columns that have always been there and treat
+        // every goal as unset.
+        try {
+            $params = getDb()->query(
+                'SELECT param_code, param_name, value_type, better
+                 FROM perf_parameters WHERE is_active = 1
+                 ORDER BY sort_order, param_code'
+            )->fetchAll(PDO::FETCH_ASSOC);
+            foreach ($params as &$p) $p['default_target'] = null;
+            unset($p);
+        } catch (Exception $e2) {
+            $params = [];
+        }
     }
     return $params;
 }
@@ -211,6 +225,47 @@ function perfParamCode(string $raw): ?string {
 // to give another parameter the same treatment.
 function perfBenchmarks(): array {
     return ['02' => '01'];      // Achievement vs Target
+}
+
+// ── Goals ───────────────────────────────────────────────
+// The number a parameter is held to at one outlet: the outlet's own row
+// if it has one, otherwise the company-wide default. A row whose
+// target_value is NULL is a deliberate "not judged here" and beats the
+// default; no row at all falls through to it.
+//   [param_code => float|null]
+function perfGoals(int $locationId): array {
+    static $cache = [];
+    if (isset($cache[$locationId])) return $cache[$locationId];
+    $goals = [];
+    foreach (perfParameters() as $p) {
+        $goals[(string)$p['param_code']] =
+            $p['default_target'] === null ? null : (float)$p['default_target'];
+    }
+    try {
+        $st = getDb()->prepare('SELECT param_code, target_value FROM perf_targets WHERE location_id = ?');
+        $st->execute([$locationId]);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $goals[(string)$r['param_code']] =
+                $r['target_value'] === null ? null : (float)$r['target_value'];
+        }
+    } catch (Exception $e) { /* pre-migration: defaults only */ }
+    return $cache[$locationId] = $goals;
+}
+
+// Did this figure meet its goal? null when there is nothing to judge —
+// no goal, no number, or a parameter with no good direction.
+function perfMeetsGoal(?float $value, ?float $goal, string $better): ?bool {
+    if ($value === null || $goal === null) return null;
+    if ($better === 'up')   return $value >= $goal;
+    if ($better === 'down') return $value <= $goal;
+    return null;
+}
+
+// "at most 2%" / "at least 95%" — how a goal reads for a parameter.
+function perfGoalLabel(?float $goal, array $param): string {
+    if ($goal === null || $param['better'] === 'none') return '';
+    $shown = perfDisplayValue(['value_num' => $goal, 'value_text' => null], $param);
+    return ($param['better'] === 'down' ? '≤ ' : '≥ ') . $shown;
 }
 
 // ── Month handling ──────────────────────────────────────
@@ -722,6 +777,155 @@ function perfOpenRequests(array $rows): array {
     return $open;
 }
 
+// ── Admin: the parameter master ─────────────────────────
+// Operations owns the list of 18 (or however many it grows to). Adding
+// one, renaming it, changing how it reads or what it is held to, and
+// retiring one that no longer matters.
+//
+// Nothing is ever deleted: a retired parameter goes is_active = 0, which
+// drops it out of the grid, the CSV template and the import, while every
+// value and justification already recorded against it stays put and comes
+// back untouched if it is reactivated.
+function doPerfSaveParameter(): void {
+    $back = 'index.php?page=perf_params';
+    if (!perfCanAdmin())    { flash('error', 'Access denied.'); header('Location: ' . $back); exit; }
+    if (!perfSchemaReady()) { flash('error', perfSchemaNotice()); header('Location: ' . $back); exit; }
+
+    $orig = trim((string)($_POST['orig_code'] ?? ''));      // '' = adding
+    $code = trim((string)($_POST['param_code'] ?? ''));
+    $name = trim((string)($_POST['param_name'] ?? ''));
+    $type = (string)($_POST['value_type'] ?? 'number');
+    $bett = (string)($_POST['better'] ?? 'none');
+    $sort = (int)($_POST['sort_order'] ?? 0);
+    $dflt = trim((string)($_POST['default_target'] ?? ''));
+
+    if (!preg_match('/^[A-Za-z0-9]{1,4}$/', $code)) {
+        flash('error', 'The code must be 1–4 letters or digits — it is the sort key and the name the CSV matches on.');
+        header('Location: ' . $back); exit;
+    }
+    if ($name === '') { flash('error', 'Give the parameter a name.'); header('Location: ' . $back); exit; }
+    if (!in_array($type, ['amount', 'number', 'percent', 'decimal'], true)) $type = 'number';
+    if (!in_array($bett, ['up', 'down', 'none'], true)) $bett = 'none';
+
+    [$target, ] = perfParseValue($dflt);
+    if ($dflt !== '' && $target === null) {
+        flash('error', 'The default goal must be a number, or left blank for "not judged".');
+        header('Location: ' . $back); exit;
+    }
+    // A percentage goal is typed the way the grid shows it — 2 for 2% —
+    // rather than as the fraction an upload carries.
+    if ($sort <= 0) $sort = (int)$code ?: 99;
+
+    $db = getDb();
+    try {
+        if ($orig === '') {
+            // Checked here rather than left to the unique index, so the
+            // answer is "that code is taken" and not a driver message —
+            // and so a retired parameter is found, since it is still there.
+            $dup = $db->prepare('SELECT param_name, is_active FROM perf_parameters WHERE param_code = ?');
+            $dup->execute([$code]);
+            $existing = $dup->fetch(PDO::FETCH_ASSOC);
+            if ($existing) {
+                flash('error', 'Code "' . $code . '" is already used by ' . $code . (string)$existing['param_name']
+                    . ((int)$existing['is_active'] === 0
+                        ? ', which is retired — reactivate it rather than adding a second one.'
+                        : '. Pick another code.'));
+                header('Location: ' . $back); exit;
+            }
+            $db->prepare(
+                'INSERT INTO perf_parameters (param_code, param_name, value_type, better, default_target, sort_order, is_active)
+                 VALUES (?, ?, ?, ?, ?, ?, 1)'
+            )->execute([$code, $name, $type, $bett, $target, $sort]);
+            flash('success', 'Added ' . $code . $name . '.');
+        } else {
+            // The code is the identity every value and justification hangs
+            // off, so it is not editable — rename freely, recode never.
+            $db->prepare(
+                'UPDATE perf_parameters
+                 SET param_name = ?, value_type = ?, better = ?, default_target = ?, sort_order = ?
+                 WHERE param_code = ?'
+            )->execute([$name, $type, $bett, $target, $sort, $orig]);
+            flash('success', 'Updated ' . $orig . $name . '.');
+        }
+    } catch (Exception $e) {
+        flash('error', str_contains($e->getMessage(), 'uq_perf_param_code') || str_contains($e->getMessage(), 'Duplicate')
+            ? 'A parameter with code "' . h($code) . '" already exists.'
+            : 'Could not save the parameter: ' . $e->getMessage());
+    }
+    header('Location: ' . $back); exit;
+}
+
+function doPerfToggleParameter(): void {
+    $back = 'index.php?page=perf_params';
+    if (!perfCanAdmin())    { flash('error', 'Access denied.'); header('Location: ' . $back); exit; }
+    if (!perfSchemaReady()) { flash('error', perfSchemaNotice()); header('Location: ' . $back); exit; }
+
+    $code = trim((string)($_POST['param_code'] ?? ''));
+    try {
+        getDb()->prepare('UPDATE perf_parameters SET is_active = 1 - is_active WHERE param_code = ?')
+               ->execute([$code]);
+        $st = getDb()->prepare('SELECT param_name, is_active FROM perf_parameters WHERE param_code = ?');
+        $st->execute([$code]);
+        $row = $st->fetch(PDO::FETCH_ASSOC) ?: [];
+        flash('success', $code . (string)($row['param_name'] ?? '')
+            . ((int)($row['is_active'] ?? 0) === 1
+                ? ' is active again. Its history comes back with it.'
+                : ' retired. Its recorded values and justifications are kept.'));
+    } catch (Exception $e) {
+        flash('error', 'Could not change the parameter: ' . $e->getMessage());
+    }
+    header('Location: ' . $back); exit;
+}
+
+// ── Admin: one outlet's goals ───────────────────────────
+// A blank box means "no goal of its own" and falls back to the
+// company-wide default; there is no way to say "no goal at all" without
+// clearing the default too, which is the honest simplification — a goal
+// that applies everywhere except here is a default with an override.
+function doPerfSaveTargets(): void {
+    $locId = (int)($_POST['location_id'] ?? 0);
+    $back  = 'index.php?page=perf_targets&loc=' . $locId;
+    if (!perfCanAdmin())    { flash('error', 'Access denied.'); header('Location: index.php?page=perf_targets'); exit; }
+    if (!perfSchemaReady()) { flash('error', perfSchemaNotice()); header('Location: ' . $back); exit; }
+    if ($locId <= 0)        { flash('error', 'Pick an outlet first.'); header('Location: index.php?page=perf_targets'); exit; }
+
+    $posted = $_POST['target'] ?? [];
+    if (!is_array($posted)) $posted = [];
+
+    $db  = getDb();
+    $me  = myCode();
+    $set = 0; $cleared = 0; $bad = [];
+    try {
+        $db->beginTransaction();
+        $up = $db->prepare(
+            'INSERT INTO perf_targets (location_id, param_code, target_value, updated_by)
+             VALUES (?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE target_value = VALUES(target_value), updated_by = VALUES(updated_by)');
+        $del = $db->prepare('DELETE FROM perf_targets WHERE location_id = ? AND param_code = ?');
+
+        foreach (perfParameters() as $p) {
+            $code = (string)$p['param_code'];
+            $raw  = trim((string)($posted[$code] ?? ''));
+            if ($raw === '') { $del->execute([$locId, $code]); $cleared++; continue; }
+            [$num, ] = perfParseValue($raw);
+            if ($num === null) { $bad[] = perfParamLabel($p); continue; }
+            $up->execute([$locId, $code, $num, $me]);
+            $set++;
+        }
+        $db->commit();
+    } catch (Exception $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        flash('error', 'Could not save the goals: ' . $e->getMessage());
+        header('Location: ' . $back); exit;
+    }
+
+    $msg = $set . ' goal' . ($set === 1 ? '' : 's') . ' set for ' . perfLocationName($locId)
+         . ($cleared ? ', ' . $cleared . ' left to the company default' : '') . '.';
+    if ($bad) $msg .= ' Not a number, so skipped: ' . implode(', ', $bad) . '.';
+    flash($bad ? 'error' : 'success', $msg);
+    header('Location: ' . $back); exit;
+}
+
 // ── Review: Operations asks for a justification ─────────
 // Ticking a parameter creates the request; the note says what needs
 // explaining. Unticking withdraws it, and removes the row entirely when
@@ -927,6 +1131,19 @@ function doPerfSaveConclusion(): void {
     $db       = getDb();
     $reviewId = perfEnsureReview($locId, $month);
     $me       = myCode();
+
+    // Concluding ends the month for the conclusion too, not only for the
+    // store's justifications. A draft saved afterwards would rewrite what
+    // was signed off without anything recording that it changed.
+    $st = $db->prepare('SELECT status FROM perf_reviews WHERE id = ?');
+    $st->execute([$reviewId]);
+    if ((string)$st->fetchColumn() === 'concluded') {
+        flash('error', perfCanReopen($locId)
+            ? 'This month is already concluded. Reopen it before editing the conclusion.'
+            : 'This month is already concluded. Ask an administrator to reopen it before editing the conclusion.');
+        header('Location: ' . $back); exit;
+    }
+
     try {
         if ($finalise) {
             $db->prepare(
@@ -1161,6 +1378,268 @@ function perfSampleCsv(): void {
     exit;
 }
 
+// ── Page: the parameter master (Operations) ─────────────
+function pagePerfParams(): void {
+    if (!perfCanAdmin()) {
+        echo '<div class="page-header"><h2>Performance Parameters</h2></div>';
+        echo '<div class="rpt-prompt">You don\'t have access to configure performance parameters.</div>';
+        return;
+    }
+    if (!perfSchemaReady()) {
+        echo '<div class="page-header"><h2>Performance Parameters</h2></div>';
+        echo '<div class="rpt-prompt">' . h(perfSchemaNotice()) . '</div>';
+        return;
+    }
+
+    try {
+        $rows = getDb()->query(
+            'SELECT p.param_code, p.param_name, p.value_type, p.better, p.default_target,
+                    p.sort_order, p.is_active,
+                    (SELECT COUNT(*) FROM perf_values v WHERE v.param_code = p.param_code) AS uses,
+                    (SELECT COUNT(*) FROM perf_targets t WHERE t.param_code = p.param_code) AS overrides
+             FROM perf_parameters p ORDER BY p.sort_order, p.param_code')->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) {
+        echo '<div class="page-header"><h2>Performance Parameters</h2></div>';
+        echo '<div class="rpt-prompt">' . h(perfSchemaNotice()) . '</div>';
+        return;
+    }
+
+    // Editing one row = the same form, pre-filled.
+    $editCode = trim((string)($_GET['edit'] ?? ''));
+    $edit = null;
+    foreach ($rows as $r) if ((string)$r['param_code'] === $editCode) $edit = $r;
+?>
+<div class="page-header">
+    <h2>📐 Performance Parameters</h2>
+    <div class="actions">
+        <a class="btn btn-ghost btn-sm" href="index.php?page=perf_targets">Outlet goals</a>
+        <a class="btn btn-ghost btn-sm" href="index.php?page=perf_reviews">Reviews</a>
+    </div>
+</div>
+
+<div class="report-header-box" style="margin-bottom:16px">
+    The code is the sort key and the name the CSV matches on, so it is fixed once a parameter exists —
+    rename freely, recode never. <b>Retiring</b> a parameter takes it out of the grid, the template and
+    the import; every value and justification already recorded against it is kept, and comes back if it
+    is made active again. Nothing here is ever deleted.<br>
+    <b>Default goal</b> is the company-wide number this parameter is held to — typed the way the grid
+    shows it (<code>2</code> for 2%, not 0.02). Whether it reads as a ceiling or a floor comes from
+    <b>Good direction</b>: <i>lower is better</i> makes it a maximum, <i>higher is better</i> a minimum,
+    <i>neither</i> means the figure is reported but not judged. Any outlet can
+    <a href="index.php?page=perf_targets" style="color:var(--accent)">override it</a>.
+</div>
+
+<form method="POST" class="form-card" style="max-width:none;margin-bottom:18px">
+    <input type="hidden" name="action" value="perf_save_parameter">
+    <input type="hidden" name="orig_code" value="<?= h((string)($edit['param_code'] ?? '')) ?>">
+    <div class="form-section-title" style="margin-top:0">
+        <?= $edit ? 'Edit ' . h(perfParamLabel($edit)) : 'Add a parameter' ?>
+    </div>
+    <div class="form-grid" style="grid-template-columns:repeat(3,1fr);max-width:1000px">
+        <div class="form-group">
+            <label>Code <span class="required">*</span></label>
+            <input type="text" name="param_code" class="form-control" maxlength="4" required
+                   value="<?= h((string)($edit['param_code'] ?? '')) ?>"
+                   <?= $edit ? 'readonly' : '' ?> placeholder="19">
+        </div>
+        <div class="form-group" style="grid-column:span 2">
+            <label>Name <span class="required">*</span></label>
+            <input type="text" name="param_name" class="form-control" maxlength="100" required
+                   value="<?= h((string)($edit['param_name'] ?? '')) ?>" placeholder="Delivery Rating">
+        </div>
+        <div class="form-group">
+            <label>Shown as</label>
+            <select name="value_type" class="form-control">
+                <?php foreach ([
+                    'number'  => 'Count — 1,036',
+                    'amount'  => 'Rupees — 4,45,000',
+                    'percent' => 'Percent — 75.10%',
+                    'decimal' => 'Score — 88.75',
+                ] as $v => $lbl): ?>
+                    <option value="<?= $v ?>" <?= ($edit['value_type'] ?? 'number') === $v ? 'selected' : '' ?>><?= h($lbl) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Good direction</label>
+            <select name="better" class="form-control">
+                <?php foreach ([
+                    'up'   => 'Higher is better (goal = minimum)',
+                    'down' => 'Lower is better (goal = maximum)',
+                    'none' => 'Neither — reported, not judged',
+                ] as $v => $lbl): ?>
+                    <option value="<?= $v ?>" <?= ($edit['better'] ?? 'none') === $v ? 'selected' : '' ?>><?= h($lbl) ?></option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+        <div class="form-group">
+            <label>Default goal <span class="hint">blank = none</span></label>
+            <input type="text" name="default_target" class="form-control"
+                   value="<?= $edit && $edit['default_target'] !== null
+                       ? h(rtrim(rtrim(number_format((float)$edit['default_target'], 4, '.', ''), '0'), '.')) : '' ?>"
+                   placeholder="2">
+        </div>
+        <div class="form-group">
+            <label>Sort order <span class="hint">blank = follow the code</span></label>
+            <input type="number" name="sort_order" class="form-control" min="0"
+                   value="<?= h((string)($edit['sort_order'] ?? '')) ?>">
+        </div>
+    </div>
+    <div class="form-actions">
+        <button type="submit" class="btn btn-primary"><?= $edit ? 'Save changes' : 'Add parameter' ?></button>
+        <?php if ($edit): ?><a class="btn btn-ghost" href="index.php?page=perf_params">Cancel</a><?php endif; ?>
+    </div>
+</form>
+
+<div class="table-wrap">
+    <table class="table">
+        <thead><tr>
+            <th>Code</th><th>Name</th><th>Shown as</th><th>Good direction</th>
+            <th>Default goal</th><th>Outlet overrides</th><th>Values recorded</th><th>Status</th><th></th>
+        </tr></thead>
+        <tbody>
+        <?php foreach ($rows as $r):
+            $goal = $r['default_target'] === null ? null : (float)$r['default_target']; ?>
+            <tr class="<?= (int)$r['is_active'] ? '' : 'row-inactive' ?>">
+                <td data-label="Code"><strong><?= h((string)$r['param_code']) ?></strong></td>
+                <td data-label="Name"><?= h((string)$r['param_name']) ?></td>
+                <td data-label="Shown as" class="text-muted"><?= h((string)$r['value_type']) ?></td>
+                <td data-label="Good direction" class="text-muted"><?= h((string)$r['better']) ?></td>
+                <td data-label="Default goal"><?= $goal === null ? '<span class="text-muted">—</span>' : h(perfGoalLabel($goal, $r)) ?></td>
+                <td data-label="Outlet overrides"><?= (int)$r['overrides'] ?: '<span class="text-muted">—</span>' ?></td>
+                <td data-label="Values recorded" class="text-muted"><?= number_format((int)$r['uses']) ?></td>
+                <td data-label="Status"><?= (int)$r['is_active']
+                    ? '<span class="badge badge-green">Active</span>'
+                    : '<span class="badge badge-grey">Retired</span>' ?></td>
+                <td class="actions">
+                    <a class="btn btn-sm btn-ghost" href="index.php?page=perf_params&edit=<?= urlencode((string)$r['param_code']) ?>">Edit</a>
+                    <form method="POST" class="inline-form"
+                          onsubmit="return confirm('<?= (int)$r['is_active'] ? 'Retire' : 'Reactivate' ?> <?= h(perfParamLabel($r)) ?>?')">
+                        <input type="hidden" name="action" value="perf_toggle_parameter">
+                        <input type="hidden" name="param_code" value="<?= h((string)$r['param_code']) ?>">
+                        <button type="submit" class="btn btn-sm <?= (int)$r['is_active'] ? 'btn-danger' : 'btn-success' ?>">
+                            <?= (int)$r['is_active'] ? 'Retire' : 'Reactivate' ?>
+                        </button>
+                    </form>
+                </td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+</div>
+<?php
+}
+
+// ── Page: one outlet's goals (Operations) ───────────────
+function pagePerfTargets(): void {
+    if (!perfCanAdmin()) {
+        echo '<div class="page-header"><h2>Outlet Goals</h2></div>';
+        echo '<div class="rpt-prompt">You don\'t have access to configure outlet goals.</div>';
+        return;
+    }
+    if (!perfSchemaReady()) {
+        echo '<div class="page-header"><h2>Outlet Goals</h2></div>';
+        echo '<div class="rpt-prompt">' . h(perfSchemaNotice()) . '</div>';
+        return;
+    }
+
+    $locations = getActiveLocations();
+    $locId     = (int)($_GET['loc'] ?? 0);
+    if ($locId <= 0 && $locations) $locId = (int)$locations[0]['location_id'];
+    $params = perfParameters();
+    $goals  = $locId > 0 ? perfGoals($locId) : [];
+
+    // Which of them are the outlet's own, as opposed to inherited.
+    $own = [];
+    if ($locId > 0) {
+        try {
+            $st = getDb()->prepare('SELECT param_code, target_value FROM perf_targets WHERE location_id = ?');
+            $st->execute([$locId]);
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+                $own[(string)$r['param_code']] = $r['target_value'] === null ? null : (float)$r['target_value'];
+            }
+        } catch (Exception $e) { $own = []; }
+    }
+?>
+<div class="page-header">
+    <h2>🎯 Outlet Goals</h2>
+    <div class="actions">
+        <a class="btn btn-ghost btn-sm" href="index.php?page=perf_params">Parameters</a>
+        <a class="btn btn-ghost btn-sm" href="index.php?page=perf_reviews">Reviews</a>
+    </div>
+</div>
+
+<form method="GET" class="filter-bar">
+    <input type="hidden" name="page" value="perf_targets">
+    <label class="text-muted">Outlet</label>
+    <select name="loc" class="form-control" style="width:260px" onchange="this.form.submit()">
+        <?php foreach ($locations as $l): ?>
+            <option value="<?= (int)$l['location_id'] ?>" <?= (int)$l['location_id'] === $locId ? 'selected' : '' ?>>
+                <?= h($l['location_name']) ?>
+            </option>
+        <?php endforeach; ?>
+    </select>
+    <noscript><button class="btn btn-secondary btn-sm" type="submit">Go</button></noscript>
+</form>
+
+<div class="report-header-box" style="margin-bottom:16px">
+    What this outlet is held to. <b>Leave a box blank</b> and it follows the company-wide default from
+    <a href="index.php?page=perf_params" style="color:var(--accent)">Parameters</a> — useful when only a
+    few outlets differ. Type the number the way the grid shows it: <code>2</code> for 2%, not 0.02.
+    A goal turns the figure green or red in the review grid; a parameter whose direction is
+    <i>neither</i> is never judged, so a goal there is ignored.
+</div>
+
+<?php if ($locId <= 0): ?>
+    <div class="rpt-prompt">No active outlets to configure.</div>
+<?php else: ?>
+<form method="POST">
+    <input type="hidden" name="action" value="perf_save_targets">
+    <input type="hidden" name="location_id" value="<?= $locId ?>">
+    <div class="table-wrap">
+        <table class="table">
+            <thead><tr>
+                <th style="width:220px">Parameter</th><th style="width:150px">Good direction</th>
+                <th style="width:130px">Company default</th><th style="width:180px">This outlet</th><th>In force</th>
+            </tr></thead>
+            <tbody>
+            <?php foreach ($params as $p):
+                $code = (string)$p['param_code'];
+                $dflt = $p['default_target'] === null ? null : (float)$p['default_target'];
+                $mine = array_key_exists($code, $own) ? $own[$code] : null;
+                $eff  = $goals[$code] ?? null; ?>
+                <tr>
+                    <td data-label="Parameter"><strong><?= h($code) ?></strong> <?= h((string)$p['param_name']) ?></td>
+                    <td data-label="Good direction" class="text-muted">
+                        <?= $p['better'] === 'up' ? 'higher is better' : ($p['better'] === 'down' ? 'lower is better' : '— not judged') ?>
+                    </td>
+                    <td data-label="Company default" class="text-muted">
+                        <?= $dflt === null ? '—' : h(perfGoalLabel($dflt, $p)) ?>
+                    </td>
+                    <td data-label="This outlet">
+                        <input type="text" name="target[<?= h($code) ?>]" class="form-control"
+                               value="<?= $mine === null ? '' : h(rtrim(rtrim(number_format($mine, 4, '.', ''), '0'), '.')) ?>"
+                               placeholder="<?= $dflt === null ? 'none' : 'inherits ' . h(rtrim(rtrim(number_format($dflt, 4, '.', ''), '0'), '.')) ?>">
+                    </td>
+                    <td data-label="In force">
+                        <?php if ($eff === null || $p['better'] === 'none'): ?>
+                            <span class="text-muted">not judged</span>
+                        <?php else: ?>
+                            <?= h(perfGoalLabel($eff, $p)) ?>
+                            <span class="text-muted" style="font-size:11px">(<?= $mine !== null ? 'this outlet' : 'default' ?>)</span>
+                        <?php endif; ?>
+                    </td>
+                </tr>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <div class="form-actions"><button type="submit" class="btn btn-primary">Save goals for <?= h(perfLocationName($locId)) ?></button></div>
+</form>
+<?php endif; ?>
+<?php
+}
+
 // ── Page: Reviews list (Operations / HO) ────────────────
 function pagePerfReviews(): void {
     if (!perfCanViewAll()) {
@@ -1227,6 +1706,8 @@ function pagePerfReviews(): void {
         <!-- The only route to the upload page: it is deliberately not a
              sidebar entry, so this button has to read as an action. -->
         <a class="btn btn-primary" href="index.php?page=perf_upload">Upload month's data</a>
+        <a class="btn btn-ghost" href="index.php?page=perf_targets">Outlet goals</a>
+        <a class="btn btn-ghost" href="index.php?page=perf_params">Parameters</a>
     <?php endif; ?>
 </div>
 
@@ -1394,6 +1875,7 @@ function pagePerfReview(): void {
     $paramByCode = [];
     foreach ($params as $p) $paramByCode[(string)$p['param_code']] = $p;
     $benchmarks  = perfBenchmarks();
+    $goals       = perfGoals($locId);
 
     $grid     = perfValueGrid($locId, $months);
     $reviews  = perfReviewHeaders($locId, $months);
@@ -1454,6 +1936,9 @@ function pagePerfReview(): void {
 .perf-grid thead .perf-param{z-index:3}
 .perf-grid tbody tr:hover .perf-param{background:var(--surface)}
 .perf-grid .perf-code{color:var(--muted);font-weight:400;font-size:11px;margin-right:4px}
+/* What this outlet is held to, next to the name it belongs to — a green
+   or red figure in the row means nothing without it. */
+.perf-goal{font-weight:400;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:.02em}
 .perf-grid th.perf-month{text-align:right;width:var(--perf-col)}
 .perf-grid td.perf-cell{text-align:right;font-family:Consolas,monospace;padding:8px 12px}
 .perf-grid .perf-num{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -1636,6 +2121,10 @@ function pagePerfReview(): void {
             <tr>
                 <th class="perf-param">
                     <span class="perf-code"><?= h($code) ?></span><?= h($p['param_name']) ?>
+                    <?php $goalLabel = perfGoalLabel($goals[$code] ?? null, $p); ?>
+                    <?php if ($goalLabel !== ''): ?>
+                        <div class="perf-goal" title="Goal for this outlet">goal <?= h($goalLabel) ?></div>
+                    <?php endif; ?>
                 </th>
                 <?php foreach ($months as $i => $m):
                     $isReview = $m === $month;
@@ -1669,6 +2158,16 @@ function pagePerfReview(): void {
                             $benchName = $paramByCode[$benchCode]['param_name'] ?? $benchCode;
                             $hitTitle  = ($met ? 'Met ' : 'Below ') . strtolower((string)$benchName)
                                        . ' (' . perfDisplayValue($bench, $paramByCode[$benchCode] ?? $p) . ')';
+                        }
+                    } elseif ($cell && $cell['value_num'] !== null) {
+                        // No month-specific benchmark, so judge against the
+                        // outlet's standing goal — "wastage under 2% here,
+                        // under 5% there".
+                        $goal = $goals[$code] ?? null;
+                        $met  = perfMeetsGoal((float)$cell['value_num'], $goal, (string)$p['better']);
+                        if ($met !== null) {
+                            $hitClass = $met ? 'perf-hit' : 'perf-miss';
+                            $hitTitle = ($met ? 'Met goal ' : 'Missed goal ') . perfGoalLabel($goal, $p);
                         }
                     }
 
@@ -1781,7 +2280,7 @@ function pagePerfReview(): void {
 
 <div class="perf-concl">
     <div class="form-section-title" style="margin-top:0">Operations conclusion · <?= h(perfMonthLabel($month)) ?></div>
-    <?php if ($canConclude): ?>
+    <?php if ($canConclude && !$isConcluded): ?>
         <form method="POST">
             <input type="hidden" name="action" value="perf_save_conclusion">
             <input type="hidden" name="location_id" value="<?= $locId ?>">
@@ -1790,12 +2289,17 @@ function pagePerfReview(): void {
                       placeholder="Closing remarks for the month — what went well, what has to change, what is agreed with the Store Manager."><?= h((string)($review['conclusion'] ?? '')) ?></textarea>
             <div class="form-actions">
                 <button type="submit" class="btn btn-secondary">Save draft</button>
-                <?php if (!$isConcluded): ?>
-                    <button type="submit" name="conclude" value="1" class="btn btn-primary">Conclude month</button>
-                <?php endif; ?>
+                <button type="submit" name="conclude" value="1" class="btn btn-primary">Conclude month</button>
             </div>
         </form>
-        <?php if ($isConcluded && perfCanReopen($locId)): ?>
+    <?php elseif ($isConcluded): ?>
+        <div style="font-size:13px;line-height:1.7"><?= nl2br(h((string)($review['conclusion'] ?? ''))) ?></div>
+        <div class="text-muted" style="margin-top:8px">
+            Concluded by <?= h((string)($review['concluded_name'] ?? '')) ?>
+            on <?= h((string)($review['concluded_at'] ?? '')) ?> — locked.
+            <?= perfCanReopen($locId) ? 'Reopen it below to change anything.' : 'Ask an administrator to reopen it.' ?>
+        </div>
+        <?php if (perfCanReopen($locId)): ?>
             <form method="POST" style="margin-top:10px"
                   onsubmit="return confirm('Reopen <?= h(perfMonthLabel($month)) ?> so justifications can be edited?')">
                 <input type="hidden" name="action" value="perf_reopen_review">

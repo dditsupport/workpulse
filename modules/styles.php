@@ -152,6 +152,14 @@ code{font-family:Consolas,monospace;font-size:12px;background:rgba(255,255,255,.
    Applied to .param-obtain / .param-obtain-pct cells and to <span> wrappers
    in read-only views. Tinted background + bold colour so the score still
    pops on dark and on the muted "—" placeholder. */
+/* Audit List — one block per template, with the block's own count. The
+   header row spans the table, so it reads as a divider rather than a row
+   of data with empty cells. */
+.audit-tpl-group td{background:rgba(26,143,227,.10);font-weight:600;font-size:12.5px;
+    border-top:1px solid rgba(26,143,227,.35);letter-spacing:.01em}
+.audit-tpl-group:first-child td{border-top:none}
+.audit-tpl-count{margin-left:8px;font-weight:400;font-size:11px;color:var(--muted)}
+
 .audit-score-red   {color:var(--red);    background:rgba(220,64,64,.18); font-weight:600}
 .audit-score-orange{color:#ffb347;       background:rgba(255,150,40,.18); font-weight:600}
 .audit-score-green {color:var(--green);  background:rgba(39,174,96,.18); font-weight:600}

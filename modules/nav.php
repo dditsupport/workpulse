@@ -409,7 +409,7 @@ function allowedPages(): array {
         $pages = array_merge($pages, ['perf_review', 'perf_reviews', 'export_perf_review']);
     }
     if (isSuperadmin() || hasTxn('perf_admin')) {
-        $pages = array_merge($pages, ['perf_upload', 'perf_sample_csv']);
+        $pages = array_merge($pages, ['perf_upload', 'perf_sample_csv', 'perf_params', 'perf_targets']);
     }
     if (isSuperadmin() || hasTxn('audit_admin')) {
         $pages = array_merge($pages, ['audit_templates', 'audit_categories', 'audit_parameters', 'audit_conditions', 'export_audit_templates']);
@@ -951,6 +951,8 @@ function dispatchPage(string $page): void {
         case 'perf_upload':      if (function_exists('pagePerfUpload'))   pagePerfUpload();   break;
         case 'perf_reviews':     if (function_exists('pagePerfReviews'))  pagePerfReviews();  break;
         case 'perf_review':      if (function_exists('pagePerfReview'))   pagePerfReview();   break;
+        case 'perf_params':      if (function_exists('pagePerfParams'))   pagePerfParams();   break;
+        case 'perf_targets':     if (function_exists('pagePerfTargets'))  pagePerfTargets();  break;
         case 'perf_sample_csv':  if (function_exists('perfSampleCsv'))    perfSampleCsv();    break;
         case 'export_perf_review': if (function_exists('exportPerfReview')) exportPerfReview(); break;
         // Policies (Phase 5)

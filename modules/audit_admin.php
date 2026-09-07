@@ -42,6 +42,11 @@ function pageAuditTemplates(): void {
     <div class="page-header">
         <h2>Audit Template</h2>
         <div class="actions">
+            <!-- Categories and Parameters are the other half of setting a
+                 template up, so this page carries the way to them rather
+                 than sending people back to the sidebar. -->
+            <a class="btn btn-ghost" href="?page=audit_categories">Audit Categories</a>
+            <a class="btn btn-ghost" href="?page=audit_parameters">Audit Parameters</a>
             <a class="btn btn-ghost"
                href="?page=export_audit_templates<?= $selId > 0 ? '&template_id=' . (int)$selId : '' ?>"
                target="_blank"
