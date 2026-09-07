@@ -25,7 +25,7 @@ require_once __DIR__ . '/modules/attendance.php';
 require_once __DIR__ . '/modules/settings.php';
 
 // Conditionally load modules (graceful if not yet created)
-foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos','store_performance'] as $mod) {
+foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos','store_performance','data_collection'] as $mod) {
     $f = __DIR__ . '/modules/' . $mod . '.php';
     if (file_exists($f)) require_once $f;
 }
@@ -48,7 +48,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_download_zip','dc_export_answers'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
@@ -248,5 +248,15 @@ function routePost(string $a): void {
             if (function_exists('doRequestPolicyOtp')) doRequestPolicyOtp(); break;
         case 'cancel_policy_otp':
             if (function_exists('doCancelPolicyOtp')) doCancelPolicyOtp(); break;
+        // Data Collection — starting, closing and discarding a task need
+        // txn_data_collect; submitting needs only a location, so the gate for
+        // the draft/confirm handlers lives inside them (dcCanEditSubmission).
+        case 'dc_save_request':  if (function_exists('doDcSaveRequest'))  doDcSaveRequest();  break;
+        case 'dc_close_request': if (function_exists('doDcCloseRequest')) doDcCloseRequest(); break;
+        case 'dc_save_draft':    if (function_exists('doDcSaveDraft'))    doDcSaveDraft();    break;
+        case 'dc_confirm':       if (function_exists('doDcConfirm'))      doDcConfirm();      break;
+        case 'dc_reopen':        if (function_exists('doDcReopen'))       doDcReopen();       break;
+        case 'dc_delete_file':   if (function_exists('doDcDeleteFile'))   doDcDeleteFile();   break;
+        case 'dc_discard':       if (function_exists('doDcDiscard'))      doDcDiscard();      break;
     }
 }

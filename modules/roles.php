@@ -44,7 +44,11 @@ $txnGroups = [
                            'txn_price_tags' => 'Price Tags',
                            // Read-only for everyone; this grants editing.
                            'txn_manager_mapping' => 'Manager Mapping · Edit',
-                           'txn_transactions_report' => 'Banking Cash Deposit Report'],
+                           'txn_transactions_report' => 'Banking Cash Deposit Report',
+                           // Starts a collection task, files on behalf of any
+                           // outlet, downloads and discards. Submitting to a
+                           // task needs no flag — a claimed outlet is enough.
+                           'txn_data_collect' => 'Data Collection · Manage'],
     'Policy & Violation' => ['txn_policy_admin' => 'Policy Admin',
                               'txn_policy_dashboard' => 'Policy Consent Dashboard',
                               'txn_violations_view' => 'View All Violations',

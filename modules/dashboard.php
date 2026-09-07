@@ -304,6 +304,42 @@ function pendingForMe_checklist(int $locId): array {
     return $rows;
 }
 
+// Data Collection — one row per open task an outlet this user covers has
+// not CONFIRMED yet. A draft still counts as pending: it is the confirm
+// that finishes the job.
+function pendingForMe_dataCollection(): array {
+    if (!function_exists('dcMyLocations')) return [];
+    $mine = array_keys(dcMyLocations());
+    if (!$mine) return [];
+    $in   = implode(',', array_fill(0, count($mine), '?'));
+    $rows = [];
+    try {
+        $st = getDb()->prepare(
+            "SELECT r.id, r.title, r.created_at, r.due_date, COUNT(*) AS pending_locations
+               FROM dc_request_locations rl
+               JOIN dc_requests r ON r.id = rl.request_id AND r.status = 'open'
+          LEFT JOIN dc_submissions s
+                 ON s.request_id = rl.request_id AND s.location_id = rl.location_id
+              WHERE rl.location_id IN ({$in})
+                AND (s.status IS NULL OR s.status <> 'submitted')
+           GROUP BY r.id, r.title, r.created_at, r.due_date
+           ORDER BY r.id DESC");
+        $st->execute($mine);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $extra = (int)$r['pending_locations'] > 1 ? ' (' . (int)$r['pending_locations'] . ' locations)' : '';
+            $due   = !empty($r['due_date']) ? ' · due ' . date('d M', strtotime((string)$r['due_date'])) : '';
+            $rows[] = [
+                'source'     => 'Data Collection',
+                'icon'       => dbIcon('inbox'),
+                'title'      => 'Submit "' . $r['title'] . '"' . $extra . $due,
+                'url'        => '?page=data_collection&id=' . (int)$r['id'],
+                'created_at' => (string)$r['created_at'],
+            ];
+        }
+    } catch (Exception $e) { }      // un-migrated database: nothing pending
+    return $rows;
+}
+
 // ── Aggregator ───────────────────────────────────────────
 function collectPendingForMe(): array {
     $empCode = myCode();
@@ -317,7 +353,8 @@ function collectPendingForMe(): array {
         pendingForMe_punchRequests(),
         pendingForMe_priceVariations(),
         pendingForMe_inwardItems(),
-        pendingForMe_checklist($locId)
+        pendingForMe_checklist($locId),
+        pendingForMe_dataCollection()
     );
 
     // Sort newest-first by created_at
