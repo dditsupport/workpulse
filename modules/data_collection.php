@@ -1833,7 +1833,7 @@ if ($selected > 0):
 ?>
 <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
     <div style="font-size:12px" class="text-muted">
-        <?= $submittedCount ?> of <?= count($targets) ?> submitted · <?= $confirmed ?> confirmed
+        <?= $sentHere ?> of <?= count($targets) ?> submitted · <?= $confirmed ?> confirmed
         <?= $awaiting > 0 ? ' · ' . $awaiting . ' waiting on you' : '' ?>
     </div>
     <?php if ($awaiting > 0 && $isOpen): ?>
