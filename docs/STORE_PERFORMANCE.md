@@ -37,12 +37,23 @@ need them (see below). Nobody has them until you do.
 
 ## Who can do what
 
-| | Upload | See every outlet | Ask for justification | Answer | Conclusion |
-|---|---|---|---|---|---|
-| Operations Manager — `txn_perf_admin` | yes | yes | yes, via **Justify** | no | yes |
-| Management / HO — `txn_perf_view` | no | yes | no | no | no |
-| Store Manager — `employees.location_id` set | no | own outlet only | no | own outlet only | no |
-| Superadmin | yes | yes | yes | yes | yes |
+| | Upload | See every outlet | Ask | Answer | Conclude | Reopen |
+|---|---|---|---|---|---|---|
+| Operations Manager — `txn_perf_admin` | yes | yes | yes, via **Justify** | no | yes | no |
+| Management / HO — `txn_perf_view` | no | yes | no | no | no | no |
+| Store Manager — `employees.location_id` set | no | own outlet only | no | own outlet only | no | no |
+| Superadmin | yes | yes | yes | no | yes | yes |
+
+**Answering is the outlet's alone.** Only the manager whose employee record
+carries that outlet gets the Save / Submit controls — not Operations, not
+superadmin. A justification any onlooker could type would not be a
+justification, and a submit gate they could satisfy would gate nothing. There
+is deliberately no admin escape hatch: the auditable way to fix a bad entry is
+to reopen the month.
+
+**Reopening a concluded month is superadmin only.** Concluding is meant to be
+the end of it, so undoing it sits a level above the people doing the
+reviewing — Operations concludes, an administrator reverses it.
 
 ### Asking for a justification
 
@@ -173,8 +184,8 @@ column, with the flagged ones marked and required (see *Asking for a
 justification* above). **Save** keeps the month open; **Submit for review**
 tells Operations they are done, and is refused while a request is unanswered.
 Answers stay editable until the month is concluded. Operations then writes the
-conclusion and **Conclude month**, which locks them. Reopening is one button,
-and keeps the conclusion text.
+conclusion and **Conclude month**, which locks them for everyone. Reopening is
+one button for a superadmin, and keeps the conclusion text.
 
 ## Adding or changing a parameter
 

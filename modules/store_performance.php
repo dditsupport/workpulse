@@ -10,11 +10,16 @@
 //     · reads any outlet's history
 //     · flags parameters that need explaining, with a note saying what —
 //       the store cannot submit the month until each is answered
-//     · writes the closing conclusion for a month
+//     · writes the closing conclusion for a month, which locks it.
+//       Reopening a concluded month is superadmin only (perfCanReopen):
+//       concluding is meant to be the end of it, so undoing it sits a
+//       level above the people doing the reviewing.
 //
 //   Store Manager (employees.location_id — no txn flag at all)
 //     · sees ONLY their own outlet
 //     · answers every flagged parameter, and may justify any other
+//     · is the ONLY role that can answer: the Save / Submit controls
+//       exist for whoever owns the outlet and for nobody else
 //
 // The two halves live on one perf_remarks row and stay separate on
 // purpose: the question is a working document for the month under review,
@@ -93,14 +98,17 @@ function perfCanViewLocation(int $locationId): bool {
     return $locationId === perfMyLocation();
 }
 
-// Who answers: the Store Manager who owns the outlet writes the
-// justifications. Operations asks the questions (perfCanFlag) but does not
-// answer them — the point of a request is that the store explains itself,
-// and a submit gate Operations could satisfy on the manager's behalf would
-// gate nothing. Superadmin is included so support can correct an entry.
+// Who answers: the Store Manager whose employee record carries this
+// outlet, and nobody else — not Operations, not superadmin. The point of a
+// request is that the store explains itself, so a justification any
+// onlooker could type would not be a justification, and a submit gate they
+// could satisfy would gate nothing.
+//
+// Deliberately no superadmin escape hatch: the auditable way to fix a bad
+// entry is Operations reopening the month, which is one button and leaves
+// a trace, rather than an admin quietly editing the store's own words.
 function perfCanRemark(int $locationId): bool {
     if ($locationId <= 0) return false;
-    if (isSuperadmin()) return true;
     return $locationId === perfMyLocation();
 }
 
@@ -125,6 +133,14 @@ function perfStoreManagerName(int $locationId): string {
         $st->execute([$locationId]);
         return (string)($st->fetchColumn() ?: '');
     } catch (Exception $e) { return ''; }
+}
+
+// Who may reopen a concluded month: superadmin only. Concluding is meant
+// to be the end of the month, so undoing it sits one level above the
+// people who do the reviewing — Operations concludes, an administrator
+// reverses it.
+function perfCanReopen(int $locationId): bool {
+    return $locationId > 0 && isSuperadmin();
 }
 
 // Who may write the closing conclusion: Operations only.
@@ -800,10 +816,10 @@ function doPerfSaveRemarks(): void {
     // Manager needs to change something after the fact.
     $st = $db->prepare('SELECT status FROM perf_reviews WHERE id = ?');
     $st->execute([$reviewId]);
-    if ((string)$st->fetchColumn() === 'concluded' && !isSuperadmin()) {
-        flash('error', perfCanConclude($locId)
-            ? 'This month is already concluded. Reopen it before editing remarks.'
-            : 'This month is already concluded. Ask Operations to reopen it before editing remarks.');
+    if ((string)$st->fetchColumn() === 'concluded') {
+        flash('error', perfCanReopen($locId)
+            ? 'This month is already concluded. Reopen it before editing justifications.'
+            : 'This month is already concluded. Ask an administrator to reopen it before editing justifications.');
         header('Location: ' . $back); exit;
     }
 
@@ -943,8 +959,8 @@ function doPerfReopenReview(): void {
     $back  = 'index.php?page=perf_review&loc=' . $locId . '&month=' . urlencode(perfMonthInput($month));
 
     if (!perfSchemaReady()) { flash('error', perfSchemaNotice()); header('Location: index.php'); exit; }
-    if ($month === '' || !perfCanConclude($locId)) {
-        flash('error', 'Access denied.');
+    if ($month === '' || !perfCanReopen($locId)) {
+        flash('error', 'Access denied — only an administrator can reopen a concluded month.');
         header('Location: index.php?page=perf_review'); exit;
     }
 
@@ -1398,7 +1414,7 @@ function pagePerfReview(): void {
     // tick the parameters that need explaining and say what to explain.
     // Otherwise the Store Manager answers.
     $flagMode  = $justify && perfCanFlag($locId) && !$isConcluded;
-    $canRemark = !$flagMode && perfCanRemark($locId) && (!$isConcluded || isSuperadmin());
+    $canRemark = !$flagMode && perfCanRemark($locId) && !$isConcluded;
     $openReqs  = perfOpenRequests($myRemarks);
     $flagCount = 0;
     foreach ($myRemarks as $r) if ((int)($r['flagged'] ?? 0) === 1) $flagCount++;
@@ -1559,8 +1575,8 @@ function pagePerfReview(): void {
 <?php endif; ?>
 
 <?php if ($isConcluded && perfCanRemark($locId) && !$canRemark): ?>
-    <div class="alert alert-success">This month is concluded, so remarks are locked.
-        <?= $canConclude ? 'Reopen it below to change them.' : 'Ask Operations to reopen it if something needs changing.' ?></div>
+    <div class="alert alert-success">This month is concluded, so justifications are locked.
+        <?= perfCanReopen($locId) ? 'Reopen it below to change them.' : 'Ask an administrator to reopen it if something needs changing.' ?></div>
 <?php endif; ?>
 
 <?php if ($flagMode):
@@ -1779,9 +1795,9 @@ function pagePerfReview(): void {
                 <?php endif; ?>
             </div>
         </form>
-        <?php if ($isConcluded): ?>
+        <?php if ($isConcluded && perfCanReopen($locId)): ?>
             <form method="POST" style="margin-top:10px"
-                  onsubmit="return confirm('Reopen <?= h(perfMonthLabel($month)) ?> so remarks can be edited?')">
+                  onsubmit="return confirm('Reopen <?= h(perfMonthLabel($month)) ?> so justifications can be edited?')">
                 <input type="hidden" name="action" value="perf_reopen_review">
                 <input type="hidden" name="location_id" value="<?= $locId ?>">
                 <input type="hidden" name="period_month" value="<?= h($month) ?>">
