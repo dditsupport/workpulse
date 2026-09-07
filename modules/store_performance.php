@@ -8,13 +8,18 @@
 //   Operations Manager (txn_perf_admin)
 //     · uploads one CSV per month for every outlet
 //     · reads any outlet's history
+//     · flags parameters that need explaining, with a note saying what —
+//       the store cannot submit the month until each is answered
 //     · writes the closing conclusion for a month
-//     · may also write the per-parameter remarks on any outlet, for a
-//       review done side by side with the manager
 //
 //   Store Manager (employees.location_id — no txn flag at all)
 //     · sees ONLY their own outlet
-//     · writes one remark per parameter while the month is reviewed
+//     · answers every flagged parameter, and may justify any other
+//
+// The two halves live on one perf_remarks row and stay separate on
+// purpose: the question is a working document for the month under review,
+// the answer is the record. History shows the answer only — a figure that
+// was questioned is highlighted, and the question itself is not re-aired.
 //
 //   Management / HO (txn_perf_view)
 //     · read-only across every outlet
@@ -88,16 +93,22 @@ function perfCanViewLocation(int $locationId): bool {
     return $locationId === perfMyLocation();
 }
 
-// Who may write the per-parameter remarks: the Store Manager who owns the
-// outlet, and Operations on any outlet — a review often happens with the
-// two of them at one screen, and the manager's words should not have to
-// wait for the manager's login. Whoever types is recorded on the remark
-// (perf_remarks.updated_by) and shown beside it, so an entry made on a
-// manager's behalf never reads as the manager's own.
+// Who answers: the Store Manager who owns the outlet writes the
+// justifications. Operations asks the questions (perfCanFlag) but does not
+// answer them — the point of a request is that the store explains itself,
+// and a submit gate Operations could satisfy on the manager's behalf would
+// gate nothing. Superadmin is included so support can correct an entry.
 function perfCanRemark(int $locationId): bool {
     if ($locationId <= 0) return false;
-    if (isSuperadmin() || perfCanAdmin()) return true;
+    if (isSuperadmin()) return true;
     return $locationId === perfMyLocation();
+}
+
+// Who asks: Operations flags any parameter on any outlet as needing a
+// justification, with a note saying what to explain. A Store Manager
+// cannot flag — they answer.
+function perfCanFlag(int $locationId): bool {
+    return $locationId > 0 && perfCanAdmin();
 }
 
 // The outlet's Store Manager, for the "on behalf of" banner. Read from
@@ -394,9 +405,11 @@ function perfReviewHeaders(int $locationId, array $months): array {
     return $out;
 }
 
-// Per-parameter remarks across the whole window, so past months render
-// their remarks inline next to the number they explain:
-//   [period_month][param_code] => ['remark'=>…, 'updated_by'=>…, 'name'=>…]
+// Per-parameter rows across the whole window, so past months render their
+// justifications inline next to the number they explain:
+//   [period_month][param_code] => ['remark'=>…, 'flagged'=>…, 'flag_note'=>…, …]
+// Both halves are read here; which half a month may show is decided at
+// render time — history shows the answer only, never the question.
 function perfRemarkGrid(array $reviews): array {
     $ids = [];
     foreach ($reviews as $r) $ids[] = (int)$r['id'];
@@ -407,9 +420,11 @@ function perfRemarkGrid(array $reviews): array {
     $ph = implode(',', array_fill(0, count($ids), '?'));
     $st = getDb()->prepare(
         "SELECT m.review_id, m.param_code, m.remark, m.updated_by, m.updated_at,
-                e.full_name
+                m.flagged, m.flag_note, m.flagged_by, m.flagged_at,
+                e.full_name, f.full_name AS flagged_name
          FROM perf_remarks m
          LEFT JOIN employees e ON e.employee_code = m.updated_by
+         LEFT JOIN employees f ON f.employee_code = m.flagged_by
          WHERE m.review_id IN ($ph)");
     $st->execute($ids);
     $out = [];
@@ -677,7 +692,91 @@ function doPerfUpload(): void {
     header('Location: ' . $back); exit;
 }
 
-// ── Review: the Store Manager's per-parameter remarks ───
+// Open justification requests on a review: flagged parameters with no
+// answer yet. This is the list that blocks the Store Manager's submit,
+// and the count Operations reads on the outlet list.
+// $rows is one month's slice of perfRemarkGrid(): [param_code => row].
+function perfOpenRequests(array $rows): array {
+    $open = [];
+    foreach ($rows as $code => $r) {
+        if ((int)($r['flagged'] ?? 0) === 1 && trim((string)($r['remark'] ?? '')) === '') {
+            $open[] = (string)$code;
+        }
+    }
+    return $open;
+}
+
+// ── Review: Operations asks for a justification ─────────
+// Ticking a parameter creates the request; the note says what needs
+// explaining. Unticking withdraws it, and removes the row entirely when
+// the store had not answered yet — a withdrawn question should leave no
+// trace, but an answer already given is the store's and is kept.
+function doPerfSaveFlags(): void {
+    $locId = (int)($_POST['location_id'] ?? 0);
+    $month = perfNormalizeMonth((string)($_POST['period_month'] ?? '')) ?? '';
+    $back  = 'index.php?page=perf_review&loc=' . $locId
+           . '&month=' . urlencode(perfMonthInput($month)) . '&justify=1';
+
+    if (!perfSchemaReady()) { flash('error', perfSchemaNotice()); header('Location: index.php'); exit; }
+    if ($month === '' || !perfCanViewLocation($locId) || !perfCanFlag($locId)) {
+        flash('error', 'Access denied — only Operations can ask for a justification.');
+        header('Location: index.php?page=perf_review'); exit;
+    }
+
+    $db       = getDb();
+    $reviewId = perfEnsureReview($locId, $month);
+    $me       = myCode();
+    $wanted   = $_POST['flag']      ?? [];
+    $notes    = $_POST['flag_note'] ?? [];
+    if (!is_array($wanted)) $wanted = [];
+    if (!is_array($notes))  $notes  = [];
+
+    $asked = 0;
+    try {
+        $db->beginTransaction();
+        $set = $db->prepare(
+            'INSERT INTO perf_remarks (review_id, param_code, flagged, flag_note, flagged_by, flagged_at)
+             VALUES (?, ?, 1, ?, ?, NOW())
+             ON DUPLICATE KEY UPDATE
+               flagged    = 1,
+               flag_note  = VALUES(flag_note),
+               flagged_by = VALUES(flagged_by),
+               flagged_at = VALUES(flagged_at)');
+        // Withdrawing keeps an answer that already exists; it only drops
+        // the question.
+        $clear = $db->prepare(
+            'UPDATE perf_remarks
+             SET flagged = 0, flag_note = NULL, flagged_by = NULL, flagged_at = NULL
+             WHERE review_id = ? AND param_code = ?');
+        $drop = $db->prepare(
+            'DELETE FROM perf_remarks
+             WHERE review_id = ? AND param_code = ? AND COALESCE(remark, \'\') = \'\'');
+
+        foreach (perfParameters() as $p) {
+            $code = (string)$p['param_code'];
+            if (!empty($wanted[$code])) {
+                $set->execute([$reviewId, $code, mb_substr(trim((string)($notes[$code] ?? '')), 0, 1000) ?: null, $me]);
+                $asked++;
+            } else {
+                $clear->execute([$reviewId, $code]);
+                $drop->execute([$reviewId, $code]);
+            }
+        }
+        $db->commit();
+    } catch (Exception $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        flash('error', 'Could not save the justification requests: ' . $e->getMessage());
+        header('Location: ' . $back); exit;
+    }
+
+    flash('success', $asked === 0
+        ? 'No parameters are marked for justification for ' . perfMonthLabel($month) . '.'
+        : $asked . ' parameter' . ($asked === 1 ? '' : 's') . ' marked for justification for '
+          . perfMonthLabel($month) . '. The Store Manager cannot submit until each one is answered.');
+    header('Location: ' . $back); exit;
+}
+
+// ── Review: the Store Manager's per-parameter justifications ───
 function doPerfSaveRemarks(): void {
     $locId = (int)($_POST['location_id'] ?? 0);
     $month = perfNormalizeMonth((string)($_POST['period_month'] ?? '')) ?? '';
@@ -718,29 +817,66 @@ function doPerfSaveRemarks(): void {
             'INSERT INTO perf_remarks (review_id, param_code, remark, updated_by)
              VALUES (?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE remark = VALUES(remark), updated_by = VALUES(updated_by)');
-        $del = $db->prepare('DELETE FROM perf_remarks WHERE review_id = ? AND param_code = ?');
+        // A flagged row survives an emptied box, but the stale answer must
+        // not: blanking it reopens the request, which is what the manager
+        // just asked for by clearing the text.
+        $blank = $db->prepare(
+            'UPDATE perf_remarks SET remark = NULL, updated_by = ?
+             WHERE review_id = ? AND param_code = ? AND flagged = 1');
+        $del = $db->prepare('DELETE FROM perf_remarks WHERE review_id = ? AND param_code = ? AND flagged = 0');
 
         $filled = 0;
         foreach (perfParameters() as $p) {
             $code = (string)$p['param_code'];
             $text = trim((string)($posted[$code] ?? ''));
-            // Clearing the box removes the remark rather than storing an
-            // empty one, so "has a remark" stays a truthful test.
-            if ($text === '') { $del->execute([$reviewId, $code]); continue; }
+            if ($text === '') {
+                // Clearing the box drops the row — unless Operations asked
+                // for this one, where the row IS the open request and
+                // deleting it would quietly withdraw their question.
+                $del->execute([$reviewId, $code]);
+                $blank->execute([$me, $reviewId, $code]);
+                continue;
+            }
             $up->execute([$reviewId, $code, mb_substr($text, 0, 4000), $me]);
             $filled++;
         }
 
-        // "Submit" marks the month reviewed; a plain save leaves it open
-        // so a manager can come back to it later in the day.
-        if (!empty($_POST['submit_review']) && $filled > 0) {
-            $db->prepare(
-                'UPDATE perf_reviews
-                 SET status = \'remarked\', remarked_by = ?, remarked_at = NOW()
-                 WHERE id = ? AND status <> \'concluded\''
-            )->execute([$me, $reviewId]);
+        // "Submit" marks the month reviewed; a plain save leaves it open so
+        // a manager can come back to it later in the day. Submitting with a
+        // requested justification still unanswered is refused: that request
+        // is the reason the month is open.
+        // Refusing the submit must not cost the manager the answers they did
+        // type: everything above is committed either way, and only the
+        // status change is withheld. Losing sixteen answers because the
+        // seventeenth was missed would teach people to avoid the button.
+        $blocked = [];
+        if (!empty($_POST['submit_review'])) {
+            $st = $db->prepare(
+                'SELECT m.param_code
+                 FROM perf_remarks m
+                 WHERE m.review_id = ? AND m.flagged = 1 AND COALESCE(m.remark, \'\') = \'\'');
+            $st->execute([$reviewId]);
+            $blocked = array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN));
+            if (!$blocked) {
+                $db->prepare(
+                    'UPDATE perf_reviews
+                     SET status = \'remarked\', remarked_by = ?, remarked_at = NOW()
+                     WHERE id = ? AND status <> \'concluded\''
+                )->execute([$me, $reviewId]);
+            }
         }
         $db->commit();
+
+        if ($blocked) {
+            $names = [];
+            foreach (perfParameters() as $p) {
+                if (in_array((string)$p['param_code'], $blocked, true)) $names[] = perfParamLabel($p);
+            }
+            flash('error', 'Saved, but not submitted — ' . count($blocked) . ' requested justification'
+                . (count($blocked) === 1 ? '' : 's') . ' still unanswered: ' . implode(', ', $names)
+                . '. Everything else you typed is saved; answer these and submit again.');
+            header('Location: ' . $back); exit;
+        }
     } catch (Exception $e) {
         if ($db->inTransaction()) $db->rollBack();
         flash('error', 'Could not save remarks: ' . $e->getMessage());
@@ -1052,7 +1188,13 @@ function pagePerfReviews(): void {
     $st = $db->prepare(
         'SELECT r.location_id, r.status, r.remarked_at, r.concluded_at, r.conclusion,
                 sm.full_name AS remarked_name, om.full_name AS concluded_name,
-                (SELECT COUNT(*) FROM perf_remarks m WHERE m.review_id = r.id) AS remarks
+                (SELECT COUNT(*) FROM perf_remarks m
+                  WHERE m.review_id = r.id AND COALESCE(m.remark, \'\') <> \'\') AS remarks,
+                (SELECT COUNT(*) FROM perf_remarks m
+                  WHERE m.review_id = r.id AND m.flagged = 1) AS requested,
+                (SELECT COUNT(*) FROM perf_remarks m
+                  WHERE m.review_id = r.id AND m.flagged = 1
+                    AND COALESCE(m.remark, \'\') = \'\') AS unanswered
          FROM perf_reviews r
          LEFT JOIN employees sm ON sm.employee_code = r.remarked_by
          LEFT JOIN employees om ON om.employee_code = r.concluded_by
@@ -1088,18 +1230,28 @@ function pagePerfReviews(): void {
 <div class="table-wrap">
     <table class="table">
         <thead><tr>
-            <th>Outlet</th><th>Status</th><th>Remarks</th>
+            <th>Outlet</th><th>Status</th><th>Justifications</th><th>Remarks</th>
             <th>Store Manager</th><th>Conclusion</th><th></th>
         </tr></thead>
         <tbody>
         <?php if (!$outlets): ?>
-            <tr><td colspan="6" class="empty-row">No outlets have data for this month.</td></tr>
+            <tr><td colspan="7" class="empty-row">No outlets have data for this month.</td></tr>
         <?php endif; ?>
         <?php foreach ($outlets as $o):
             $r = $reviews[(int)$o['location_id']] ?? null; ?>
             <tr>
                 <td data-label="Outlet"><strong><?= h($o['location_name']) ?></strong></td>
                 <td data-label="Status"><?= perfStatusBadge($r['status'] ?? null) ?></td>
+                <td data-label="Justifications">
+                    <?php $req = (int)($r['requested'] ?? 0); $open = (int)($r['unanswered'] ?? 0); ?>
+                    <?php if (!$req): ?>
+                        <span class="text-muted">—</span>
+                    <?php elseif ($open): ?>
+                        <span class="badge badge-amber"><?= $open ?> of <?= $req ?> unanswered</span>
+                    <?php else: ?>
+                        <span class="badge badge-green"><?= $req ?> answered</span>
+                    <?php endif; ?>
+                </td>
                 <td data-label="Remarks">
                     <?= (int)($r['remarks'] ?? 0) ?> / <?= $paramCount ?>
                 </td>
@@ -1241,12 +1393,15 @@ function pagePerfReview(): void {
     // the Store Manager, and takes the explicit Justify link to switch
     // into — the boxes are not live during an ordinary read. The manager
     // on their own outlet always has them.
-    $ownsOutlet = $locId === perfMyLocation();
-    $justify    = ($_GET['justify'] ?? '') === '1';
-    $onBehalf   = !$ownsOutlet;
-    $canRemark  = perfCanRemark($locId)
-                  && (!$isConcluded || isSuperadmin())
-                  && (!$onBehalf || $justify);
+    $justify   = ($_GET['justify'] ?? '') === '1';
+    // Two editing modes, never both at once. Justify is Operations asking:
+    // tick the parameters that need explaining and say what to explain.
+    // Otherwise the Store Manager answers.
+    $flagMode  = $justify && perfCanFlag($locId) && !$isConcluded;
+    $canRemark = !$flagMode && perfCanRemark($locId) && (!$isConcluded || isSuperadmin());
+    $openReqs  = perfOpenRequests($myRemarks);
+    $flagCount = 0;
+    foreach ($myRemarks as $r) if ((int)($r['flagged'] ?? 0) === 1) $flagCount++;
 
     // Outlet picker — only outlets that actually carry data, so the list
     // is short and every entry leads somewhere.
@@ -1299,9 +1454,23 @@ function pagePerfReview(): void {
 .perf-cell-remark{margin-top:5px;padding-top:5px;border-top:1px dashed rgba(255,255,255,.12);
     font-family:inherit;font-size:11px;font-style:italic;color:var(--muted);
     text-align:left;white-space:normal;line-height:1.45}
-/* Who typed it. Operations may write a remark for a manager, so the name
-   is part of the remark rather than a tooltip nobody hovers. */
+/* Who wrote the justification. */
 .perf-remark-by{font-style:normal;font-size:10px;opacity:.75;margin-top:2px}
+/* A figure Operations asked about. In history this highlight is the only
+   trace of the request — the question itself is not shown there, only the
+   store's answer — so it has to carry the meaning on its own. */
+.perf-flagged{background:rgba(245,158,11,.16);border-radius:3px;padding:1px 5px;
+    box-shadow:inset 0 0 0 1px rgba(245,158,11,.45)}
+.perf-cell-flagged{background:rgba(245,158,11,.05)}
+.perf-cell-ask{margin-top:5px;padding:5px 7px;border-left:2px solid var(--yellow);
+    background:rgba(245,158,11,.10);border-radius:0 4px 4px 0;
+    font-family:inherit;font-size:11px;color:#ffce6b;text-align:left;
+    white-space:normal;line-height:1.45}
+.perf-grid textarea.perf-required{border-color:var(--yellow)}
+.perf-flag-tick{display:flex;align-items:center;gap:5px;margin-top:6px;
+    font-family:inherit;font-size:10.5px;color:var(--yellow);text-align:left;
+    white-space:normal;cursor:pointer;user-select:none}
+.perf-flag-tick input{width:13px;height:13px;cursor:pointer;flex:0 0 auto}
 .perf-grid textarea.form-control{display:block;width:100%;margin-top:6px;
     font-size:11.5px;padding:5px 7px;min-height:56px;
     white-space:normal;font-family:inherit;resize:vertical}
@@ -1318,10 +1487,10 @@ function pagePerfReview(): void {
 <div class="page-header">
     <h2>📈 <?= h($locName) ?> · <?= h(perfMonthLabel($month)) ?></h2>
     <div class="actions">
-        <?php if ($onBehalf && perfCanRemark($locId) && !$justify && !$isConcluded): ?>
+        <?php if (perfCanFlag($locId) && !$flagMode && !$isConcluded): ?>
             <a class="btn btn-sm btn-primary" href="<?= h($qs(['justify' => '1'])) ?>">Justify</a>
-        <?php elseif ($justify): ?>
-            <a class="btn btn-sm btn-ghost" href="<?= h($qs(['justify' => '0'])) ?>">Done justifying</a>
+        <?php elseif ($flagMode): ?>
+            <a class="btn btn-sm btn-ghost" href="<?= h($qs(['justify' => '0'])) ?>">Done</a>
         <?php endif; ?>
         <a class="btn btn-ghost btn-sm" href="<?= h($qs(['page' => 'export_perf_review'])) ?>">Export CSV</a>
         <?php if (perfCanViewAll()): ?>
@@ -1394,20 +1563,36 @@ function pagePerfReview(): void {
         <?= $canConclude ? 'Reopen it below to change them.' : 'Ask Operations to reopen it if something needs changing.' ?></div>
 <?php endif; ?>
 
-<?php if ($justify && $canRemark):
+<?php if ($flagMode):
     $smName = perfStoreManagerName($locId); ?>
     <div class="alert alert-error">
-        <b>Entering remarks on behalf of <?= $smName !== '' ? h($smName) : 'the Store Manager' ?></b>
+        <b>Asking <?= $smName !== '' ? h($smName) : 'the Store Manager' ?> for a justification</b>
         — <?= h($locName) ?>, <?= h(perfMonthLabel($month)) ?>.
-        Each remark is saved against your own name, <?= h(myName()) ?>, so the record shows who typed it.
+        Tick any parameter that needs explaining and say what you want explained. The Store Manager
+        cannot submit the month until every ticked parameter is answered.
     </div>
-<?php elseif ($onBehalf && perfCanRemark($locId) && !$isConcluded): ?>
-    <div class="text-muted" style="margin-bottom:12px">Reading only — use <b>Justify</b> above to write
-        remarks on the Store Manager's behalf.</div>
+<?php elseif ($canRemark && $openReqs): ?>
+    <div class="alert alert-error">
+        <b><?= count($openReqs) ?> parameter<?= count($openReqs) === 1 ? '' : 's' ?>
+        need<?= count($openReqs) === 1 ? 's' : '' ?> a justification before you can submit.</b>
+        They are marked below; every other parameter is optional.
+    </div>
+<?php elseif ($canRemark && $flagCount): ?>
+    <div class="alert alert-success">All <?= $flagCount ?> requested justification<?= $flagCount === 1 ? '' : 's' ?>
+        answered. You can submit the month.</div>
+<?php elseif (perfCanFlag($locId) && !$isConcluded): ?>
+    <div class="text-muted" style="margin-bottom:12px">
+        <?php if ($flagCount): ?>
+            <?= $flagCount ?> parameter<?= $flagCount === 1 ? '' : 's' ?> marked for justification,
+            <?= count($openReqs) ?> still unanswered. Use <b>Justify</b> above to change what is asked.
+        <?php else: ?>
+            Reading only — use <b>Justify</b> above to ask the Store Manager to explain a figure.
+        <?php endif; ?>
+    </div>
 <?php endif; ?>
 
 <form method="POST" id="perfRemarkForm">
-    <input type="hidden" name="action" value="perf_save_remarks">
+    <input type="hidden" name="action" value="<?= $flagMode ? 'perf_save_flags' : 'perf_save_remarks' ?>">
     <input type="hidden" name="location_id" value="<?= $locId ?>">
     <input type="hidden" name="period_month" value="<?= h($month) ?>">
     <?php if ($justify): ?><input type="hidden" name="justify" value="1"><?php endif; ?>
@@ -1473,10 +1658,26 @@ function pagePerfReview(): void {
 
                     $shown = perfDisplayValue($cell, $p);
                     $isNote = $cell && $cell['value_num'] === null && $cell['value_text'] !== null;
-                    $pastRemark = $remarks[$m][$code]['remark'] ?? '';
+
+                    // The row holds both halves of the exchange. Which half
+                    // a column may show is the whole rule: the month under
+                    // review shows the question and the answer, because the
+                    // manager has to know what is being asked. Every other
+                    // month shows the answer only — the value is highlighted
+                    // to say a justification was asked for, and the asking
+                    // itself is not re-litigated in the history.
+                    $row       = $remarks[$m][$code] ?? null;
+                    $isFlagged = $row && (int)($row['flagged'] ?? 0) === 1;
+                    $answer    = trim((string)($row['remark'] ?? ''));
+                    $question  = $isReview ? trim((string)($row['flag_note'] ?? '')) : '';
+                    $unanswered = $isFlagged && $answer === '';
                 ?>
-                    <td class="perf-cell <?= $isReview ? 'perf-col-review' : '' ?>">
-                        <div class="perf-num" title="<?= h($hitTitle !== '' ? $hitTitle : $shown) ?>">
+                    <td class="perf-cell <?= $isReview ? 'perf-col-review' : '' ?><?= $isFlagged ? ' perf-cell-flagged' : '' ?>">
+                        <div class="perf-num<?= $isFlagged ? ' perf-flagged' : '' ?>"
+                             title="<?= h($isFlagged
+                                 ? ('Justification ' . ($answer === '' ? 'requested' : 'given')
+                                    . ($hitTitle !== '' ? ' · ' . $hitTitle : ''))
+                                 : ($hitTitle !== '' ? $hitTitle : $shown)) ?>">
                         <?php if ($shown === ''): ?>
                             <span class="text-muted">—</span>
                         <?php elseif ($isNote): ?>
@@ -1486,18 +1687,50 @@ function pagePerfReview(): void {
                         <?php endif; ?>
                         </div>
 
-                        <?php if ($isReview && $canRemark): ?>
-                            <textarea class="form-control" name="remark[<?= h($code) ?>]" rows="2"
-                                      maxlength="4000"
-                                      placeholder="Remark…"><?= h((string)($myRemarks[$code]['remark'] ?? '')) ?></textarea>
-                        <?php elseif ($showRemarks && $pastRemark !== ''): ?>
-                            <?php $by = trim((string)($remarks[$m][$code]['full_name'] ?? '')); ?>
-                            <div class="perf-cell-remark">
-                                <?= nl2br(h($pastRemark)) ?>
-                                <?php if ($by !== ''): ?>
-                                    <div class="perf-remark-by">— <?= h($by) ?></div>
-                                <?php endif; ?>
-                            </div>
+                        <?php if ($isReview && $flagMode): ?>
+                            <label class="perf-flag-tick">
+                                <input type="checkbox" name="flag[<?= h($code) ?>]" value="1"
+                                       <?= $isFlagged ? 'checked' : '' ?>> needs justification
+                            </label>
+                            <textarea class="form-control" name="flag_note[<?= h($code) ?>]" rows="2"
+                                      maxlength="1000"
+                                      placeholder="What needs explaining?"><?= h($question) ?></textarea>
+                            <?php if ($answer !== ''): ?>
+                                <div class="perf-cell-remark"><?= nl2br(h($answer)) ?>
+                                    <div class="perf-remark-by">— <?= h((string)($row['full_name'] ?? '')) ?></div>
+                                </div>
+                            <?php endif; ?>
+
+                        <?php elseif ($isReview && $canRemark): ?>
+                            <?php if ($question !== ''): ?>
+                                <div class="perf-cell-ask">
+                                    <b>Asked:</b> <?= nl2br(h($question)) ?>
+                                    <?php if (!empty($row['flagged_name'])): ?>
+                                        <div class="perf-remark-by">— <?= h((string)$row['flagged_name']) ?></div>
+                                    <?php endif; ?>
+                                </div>
+                            <?php elseif ($isFlagged): ?>
+                                <div class="perf-cell-ask"><b>Justification required</b></div>
+                            <?php endif; ?>
+                            <textarea class="form-control<?= $unanswered ? ' perf-required' : '' ?>"
+                                      name="remark[<?= h($code) ?>]" rows="2" maxlength="4000"
+                                      placeholder="<?= $isFlagged ? 'Justification (required)…' : 'Justification (optional)…' ?>"><?= h($answer) ?></textarea>
+
+                        <?php else: ?>
+                            <?php if ($isReview && $question !== ''): ?>
+                                <div class="perf-cell-ask"><b>Asked:</b> <?= nl2br(h($question)) ?></div>
+                            <?php endif; ?>
+                            <?php if ($showRemarks && $answer !== ''): ?>
+                                <?php $by = trim((string)($row['full_name'] ?? '')); ?>
+                                <div class="perf-cell-remark">
+                                    <?= nl2br(h($answer)) ?>
+                                    <?php if ($by !== ''): ?>
+                                        <div class="perf-remark-by">— <?= h($by) ?></div>
+                                    <?php endif; ?>
+                                </div>
+                            <?php elseif ($showRemarks && $isReview && $unanswered): ?>
+                                <div class="perf-cell-remark">Awaiting justification</div>
+                            <?php endif; ?>
                         <?php endif; ?>
                     </td>
                 <?php endforeach; ?>
@@ -1507,14 +1740,25 @@ function pagePerfReview(): void {
     </table>
     </div>
 
-    <?php if ($canRemark): ?>
+    <?php if ($flagMode): ?>
         <div class="form-actions">
-            <button type="submit" class="btn btn-secondary">Save remarks</button>
-            <button type="submit" name="submit_review" value="1" class="btn btn-primary">Submit for review</button>
+            <button type="submit" class="btn btn-primary">Save justification requests</button>
+            <a class="btn btn-ghost" href="<?= h($qs(['justify' => '0'])) ?>">Cancel</a>
         </div>
         <div class="text-muted" style="margin-top:6px">
-            Save keeps the month open so you can come back to it. Submit tells Operations the
-            remarks are complete; you can still edit until the month is concluded.
+            Unticking a parameter withdraws the request. An answer the store has already given is
+            kept; a question nobody answered leaves no trace.
+        </div>
+    <?php elseif ($canRemark): ?>
+        <div class="form-actions">
+            <button type="submit" class="btn btn-secondary">Save</button>
+            <button type="submit" name="submit_review" value="1" class="btn btn-primary"
+                <?= $openReqs ? 'title="' . count($openReqs) . ' requested justification(s) still unanswered"' : '' ?>>Submit for review</button>
+        </div>
+        <div class="text-muted" style="margin-top:6px">
+            Save keeps the month open so you can come back to it. Submit tells Operations you are done
+            — it is refused while a requested justification is unanswered, and you can still edit
+            until the month is concluded.
         </div>
     <?php endif; ?>
 </form>
@@ -1612,13 +1856,41 @@ function exportPerfReview(): void {
         fputcsv($out, $row, escape: '');
     }
 
+    // The store's own words, every month in the window. The question that
+    // prompted one is not repeated here for past months, the same rule the
+    // screen follows; a * marks a month where one was asked.
     fputcsv($out, [], escape: '');
-    fputcsv($out, ['Store Manager remarks'], escape: '');
+    fputcsv($out, ['Store Manager justifications', '(* = Operations asked for this one)'], escape: '');
     fputcsv($out, $head, escape: '');
     foreach ($params as $p) {
         $row = [perfParamLabel($p)];
-        foreach ($months as $m) $row[] = (string)($remarks[$m][(string)$p['param_code']]['remark'] ?? '');
+        foreach ($months as $m) {
+            $r    = $remarks[$m][(string)$p['param_code']] ?? null;
+            $text = trim((string)($r['remark'] ?? ''));
+            $mark = $r && (int)($r['flagged'] ?? 0) === 1 ? '* ' : '';
+            $row[] = $text === '' && $mark === '' ? '' : $mark . $text;
+        }
         fputcsv($out, $row, escape: '');
+    }
+
+    // What Operations asked for, review month only.
+    $asked = [];
+    foreach ($params as $p) {
+        $r = $remarks[$month][(string)$p['param_code']] ?? null;
+        if ($r && (int)($r['flagged'] ?? 0) === 1) $asked[] = [$p, $r];
+    }
+    if ($asked) {
+        fputcsv($out, [], escape: '');
+        fputcsv($out, ['Justifications requested · ' . perfMonthLabel($month)], escape: '');
+        fputcsv($out, ['Parameter', 'Asked by', 'What needs explaining', 'Answered'], escape: '');
+        foreach ($asked as [$p, $r]) {
+            fputcsv($out, [
+                perfParamLabel($p),
+                (string)($r['flagged_name'] ?? ''),
+                (string)($r['flag_note'] ?? ''),
+                trim((string)($r['remark'] ?? '')) === '' ? 'no' : 'yes',
+            ], escape: '');
+        }
     }
 
     fputcsv($out, [], escape: '');
