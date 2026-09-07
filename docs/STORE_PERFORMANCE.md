@@ -160,11 +160,11 @@ remarks. Reopening is one button, and keeps the conclusion text.
 Edit `perf_parameters`. `param_code` is the sort key and the stable identity
 the CSV matches on and remarks hang off, so keep it once assigned — renaming
 `param_name` is free and orphans nothing. `value_type` picks the display
-format (`amount` uses Indian grouping, `percent` adds one decimal and a `%`),
+format (`amount` uses Indian grouping, `percent` shows two decimals and a `%`),
 and `better` (`up` / `down` / `none`) decides which way the delta arrow is
 good news.
 
 `value_type` options: `amount` (Indian grouping, whole rupees), `percent`
-(one decimal plus `%`), `decimal` (two decimals, trailing zeros trimmed — for
-a graded figure like Audit Score, where 88.75 is not 88), `number` (a grouped
-whole count).
+(two decimals, zeros kept, plus `%` — `75.10%`, `100.00%`), `decimal` (two
+decimals, trailing zeros trimmed — for a graded figure like Audit Score, where
+88.75 is not 88), `number` (a grouped whole count).

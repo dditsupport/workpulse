@@ -33,9 +33,10 @@ CREATE TABLE IF NOT EXISTS `perf_parameters` (
   `id`         int(11)      NOT NULL AUTO_INCREMENT,
   `param_code` varchar(4)   NOT NULL,
   `param_name` varchar(100) NOT NULL,
-  -- Drives display only: amount → ₹ grouped, percent → 1 decimal + %,
-  -- decimal → 2 decimals with trailing zeros trimmed (a graded score,
-  -- where 88.75 differs from 88), number → grouped integer.
+  -- Drives display only: amount → ₹ grouped, percent → 2 decimals padded
+  -- plus % (75.10%, 100.00%), decimal → 2 decimals with trailing zeros
+  -- trimmed (a graded score, where 88.75 differs from 88), number →
+  -- grouped integer.
   `value_type` enum('amount','number','percent','decimal') NOT NULL DEFAULT 'number',
   -- Which way is good news, for the month-on-month delta arrow.
   -- 'none' = neither (a target is a target, not an achievement).
