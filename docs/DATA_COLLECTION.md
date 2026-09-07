@@ -22,13 +22,15 @@ boards, separate folders on disk; discarding one never touches another.
 ## Setup
 
 ```
-migrations/2026-09-07_data_collection.sql          -- four tables + the permission
+migrations/2026-09-07_data_collection.sql              -- five tables + the permission
 migrations/2026-09-08_data_collection_ops_confirm.sql  -- confirming moves to Operations
+migrations/2026-09-09_data_collection_samples.sql      -- the sample / format file
 ```
 
-Both are safe to re-run. The second is only needed on a database that took the
-first before 2026-09-08; the first has since been updated to match, so a fresh
-install gets it either way and the second becomes a no-op. Until they are
+All three are safe to re-run. The second and third are only needed on a
+database that took the first before those dates; the first has since been
+updated to match, so a fresh install gets everything from it and the other two
+become no-ops. Until they are
 applied the page shows a "run the migration" notice rather than an error.
 
 Then, in *Administration → Roles*, tick **Data Collection · Manage** on
@@ -55,12 +57,13 @@ covering five stores files for all five, picking the outlet from a dropdown.
 
 ## The lifecycle
 
-1. **Start** — title, an optional due date, the question, instructions, and the
-   locations to ask. Every retail outlet starts ticked; HO and the factory do
+1. **Start** — title, an optional due date, the question, instructions, an
+   optional **sample / format file**, and the locations to ask. Every retail outlet starts ticked; HO and the factory do
    not, the same default the app's other cross-location screens use. Untick
    *A file must be attached* to run a question on its own, with the written
    answer as the whole submission.
-2. **Submit** — the outlet adds files, writes its answer and presses *Submit*,
+2. **Submit** — the outlet downloads the sample if there is one, fills it in,
+   adds files, writes its answer and presses *Submit*,
    as many times as it likes: submitting again adds files and replaces the
    answer, and it can remove a file it sent by mistake. The board shows it as
    *Submitted*, which is the number to chase — that outlet has done its part.
@@ -95,11 +98,23 @@ covering five stores files for all five, picking the outlet from a dropdown.
    `DISCARD`, and warns in red when nobody has downloaded the task yet.
    **Download before you discard** — the download is the only record.
 
+## The sample / format file
+
+A task can carry the blank format it wants back: the sheet with the right
+columns and headings, an example photo, a one-page instruction PDF. Attach it
+on the task form (several are allowed), and every location sees it in a box
+above its own upload area — *Download this, fill in your figures and upload it
+back below* — so 41 outlets return 41 files with the same shape instead of 41
+layouts. Only `txn_data_collect` attaches or removes one; anyone the task was
+sent to can download it. Samples are erased with everything else on discard.
+
 ## Files
 
 Uploads live in `uploads/data_collection/{task_id}/` under unguessable stored
-names and are only ever served through `index.php?page=dc_file&id=N`, which
-re-checks who may read them. Accepted: `xlsx xls csv pdf doc docx jpg jpeg png
+names and are only ever served through `index.php?page=dc_file&id=N` (or
+`page=dc_sample` for a format file), which re-checks who may read them. Sample
+files sit in the same folder under a `dcs_` prefix, so discarding the task
+takes them too. Accepted: `xlsx xls csv pdf doc docx jpg jpeg png
 webp heic heif`, up to 15 MB each, checked by both extension and sniffed mime
 type. Ten files per save; save again for more.
 
@@ -108,12 +123,14 @@ type. Ten files per save; save again for more.
 | | |
 |---|---|
 | `modules/data_collection.php` | the whole feature — gates, handlers, pages, downloads |
-| `migrations/2026-09-07_data_collection.sql` | `dc_requests`, `dc_request_locations`, `dc_files`, `dc_submissions`, `roles.txn_data_collect` |
+| `migrations/2026-09-07_data_collection.sql` | `dc_requests`, `dc_request_locations`, `dc_files`, `dc_submissions`, `dc_samples`, `roles.txn_data_collect` |
 | `index.php` | the `dc_*` POST actions and the three download pages in the pre-HTML early-exit list |
 | `modules/nav.php` | the sidebar entry, `allowedPages()`, `dispatchPage()` |
 | `modules/dashboard.php` | `pendingForMe_dataCollection()` — open tasks land in *Pending For You* |
 
-`dcSchemaReady()` probes the four tables once per request, so an un-migrated
-database shows a notice instead of a fatal error. `dcZipAvailable()` does the
+`dcSchemaReady()` probes the four core tables once per request, so an
+un-migrated database shows a notice instead of a fatal error, and
+`dcSamplesReady()` does the same for `dc_samples` on its own — a database that
+took only the first migration keeps working, minus the sample box. `dcZipAvailable()` does the
 same for the `ZipArchive` extension: without it the ZIP button is replaced by a
 line telling the user to take the files individually, and everything else works.

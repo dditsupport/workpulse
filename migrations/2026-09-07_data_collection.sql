@@ -14,12 +14,14 @@
 -- disk, rows out of the database, task row deleted. Nothing is kept, by
 -- design; the download is the record.
 --
--- Four tables:
+-- Five tables:
 --   dc_requests          — one collection task. Several run at once and
 --                          none knows about the others.
 --   dc_request_locations — which outlets this task is asking.
 --   dc_files             — the uploaded files, on disk under
 --                          uploads/data_collection/{request_id}/.
+--   dc_samples           — the blank format the task hands out, for the
+--                          outlets to fill in and send back.
 --   dc_submissions       — one row per outlet: its answer text AND its
 --                          lock state. An outlet submits and can keep
 --                          changing what it sent; Operations confirms,
@@ -121,6 +123,27 @@ CREATE TABLE IF NOT EXISTS `dc_submissions` (
     FOREIGN KEY (`request_id`) REFERENCES `dc_requests` (`id`) ON DELETE CASCADE,
   CONSTRAINT `dc_submissions_ibfk_2`
     FOREIGN KEY (`location_id`) REFERENCES `locations` (`location_id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- The blank format a task hands out: the sheet with the right columns and
+-- headings, an example photo, a one-page instruction PDF. Locations
+-- download it, fill it in and upload it back as their submission, so 41
+-- outlets return 41 files with the same shape instead of 41 layouts.
+-- Belongs to the task, not to any location. Lives in the task's own folder
+-- under a dcs_ prefix, so discarding the task takes it with everything else.
+CREATE TABLE IF NOT EXISTS `dc_samples` (
+  `id`            int(11)      NOT NULL AUTO_INCREMENT,
+  `request_id`    int(11)      NOT NULL,
+  `original_name` varchar(255) NOT NULL,
+  `stored_name`   varchar(120) NOT NULL,
+  `mime_type`     varchar(100) DEFAULT NULL,
+  `size_bytes`    int(11)      NOT NULL DEFAULT 0,
+  `uploaded_by`   varchar(20)  DEFAULT NULL,
+  `uploaded_at`   datetime     NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  KEY `ix_dc_samples_request` (`request_id`),
+  CONSTRAINT `dc_samples_ibfk_1`
+    FOREIGN KEY (`request_id`) REFERENCES `dc_requests` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- ── Permission ──────────────────────────────────────────

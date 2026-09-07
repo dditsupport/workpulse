@@ -48,7 +48,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_download_zip','dc_export_answers'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_sample','dc_download_zip','dc_export_answers'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
@@ -252,6 +252,7 @@ function routePost(string $a): void {
         // need txn_data_collect; submitting needs only a location, so the
         // gate for dc_submit lives inside it (dcCanEditSubmission).
         case 'dc_save_request':  if (function_exists('doDcSaveRequest'))  doDcSaveRequest();  break;
+        case 'dc_delete_sample': if (function_exists('doDcDeleteSample')) doDcDeleteSample(); break;
         case 'dc_close_request': if (function_exists('doDcCloseRequest')) doDcCloseRequest(); break;
         case 'dc_submit':        if (function_exists('doDcSubmit'))       doDcSubmit();       break;
         case 'dc_confirm':       if (function_exists('doDcConfirm'))      doDcConfirm();      break;
