@@ -195,10 +195,12 @@ function routePost(string $a): void {
         case 'del_audit_parameter':       if (function_exists('doDelAuditParameter'))      doDelAuditParameter();      break;
         case 'save_audit_condition':      if (function_exists('doSaveAuditCondition'))     doSaveAuditCondition();     break;
         case 'del_audit_condition':       if (function_exists('doDelAuditCondition'))      doDelAuditCondition();      break;
-        // Store performance (monthly MIS). Upload + conclusion are gated on
-        // txn_perf_admin inside the handlers; the per-parameter remarks are
-        // gated on the writer owning the outlet (employees.location_id).
+        // Store performance (monthly MIS). Upload, justification requests and
+        // the conclusion are gated on txn_perf_admin inside the handlers; the
+        // per-parameter justifications are gated on the writer owning the
+        // outlet (employees.location_id).
         case 'perf_upload':           if (function_exists('doPerfUpload'))         doPerfUpload();         break;
+        case 'perf_save_flags':       if (function_exists('doPerfSaveFlags'))      doPerfSaveFlags();      break;
         case 'perf_save_remarks':     if (function_exists('doPerfSaveRemarks'))    doPerfSaveRemarks();    break;
         case 'perf_save_conclusion':  if (function_exists('doPerfSaveConclusion')) doPerfSaveConclusion(); break;
         case 'perf_reopen_review':    if (function_exists('doPerfReopenReview'))   doPerfReopenReview();   break;

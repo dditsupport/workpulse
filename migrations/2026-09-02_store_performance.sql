@@ -90,12 +90,20 @@ CREATE TABLE IF NOT EXISTS `perf_reviews` (
     FOREIGN KEY (`location_id`) REFERENCES `locations` (`location_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+-- One row per (review, parameter), holding both halves of the exchange:
+-- the Operations query (flagged + flag_note) and the Store Manager's
+-- answer (remark). A row with flagged = 1 and no remark is an open
+-- request, which is what blocks the manager's submit.
 CREATE TABLE IF NOT EXISTS `perf_remarks` (
-  `id`         int(11)     NOT NULL AUTO_INCREMENT,
-  `review_id`  int(11)     NOT NULL,
-  `param_code` varchar(4)  NOT NULL,
-  `remark`     text        NOT NULL,
-  `updated_by` varchar(20) DEFAULT NULL,
+  `id`         int(11)       NOT NULL AUTO_INCREMENT,
+  `review_id`  int(11)       NOT NULL,
+  `param_code` varchar(4)    NOT NULL,
+  `flagged`    tinyint(1)    NOT NULL DEFAULT 0,
+  `flag_note`  varchar(1000) DEFAULT NULL,
+  `flagged_by` varchar(20)   DEFAULT NULL,
+  `flagged_at` datetime      DEFAULT NULL,
+  `remark`     text          DEFAULT NULL,
+  `updated_by` varchar(20)   DEFAULT NULL,
   `updated_at` datetime    NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp(),
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_perf_remark` (`review_id`,`param_code`),

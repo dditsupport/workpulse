@@ -18,11 +18,12 @@ being off the sidebar is presentation, not permission.
 migrations/2026-09-02_store_performance.sql          -- tables + the 18 parameters + 2 permissions
 migrations/2026-09-02_store_performance_history.sql  -- Apr 2024 – Jul 2026, 22,951 data points
 migrations/2026-09-07_perf_audit_score_decimals.sql  -- Audit Score keeps its decimals
+migrations/2026-09-07_perf_justification_flags.sql   -- the ask/answer split
 ```
 
-The third file is only needed on a database migrated before 2026-09-07; the
-first has since been updated to match, so a fresh install gets it either way.
-Running it anyway is harmless.
+The two dated 2026-09-07 are only needed on a database migrated before that
+day; the first file has since been updated to match, so a fresh install gets
+both either way. Running them anyway is harmless.
 
 The history file stages the workbook's rows and joins them to
 `locations.location_name`. Its **step 4** query lists any outlet name with no
@@ -36,27 +37,45 @@ need them (see below). Nobody has them until you do.
 
 ## Who can do what
 
-| | Upload | See every outlet | Parameter remarks | Conclusion |
-|---|---|---|---|---|
-| Operations Manager — `txn_perf_admin` | yes | yes | yes, via **Justify** | yes |
-| Management / HO — `txn_perf_view` | no | yes | no | no |
-| Store Manager — `employees.location_id` set | no | own outlet only | own outlet only | no |
-| Superadmin | yes | yes | yes, via **Justify** | yes |
+| | Upload | See every outlet | Ask for justification | Answer | Conclusion |
+|---|---|---|---|---|---|
+| Operations Manager — `txn_perf_admin` | yes | yes | yes, via **Justify** | no | yes |
+| Management / HO — `txn_perf_view` | no | yes | no | no | no |
+| Store Manager — `employees.location_id` set | no | own outlet only | no | own outlet only | no |
+| Superadmin | yes | yes | yes | yes | yes |
 
-### Remarks on a manager's behalf
+### Asking for a justification
 
-Reviews often happen with Operations and the Store Manager at one screen, or
-with a manager who has not logged in, so Operations can write the
-per-parameter remarks for any outlet. It is a deliberate mode rather than
-boxes that are always live: **Justify**, on each row of the review list and in
-the header of the review itself, opens them. An ordinary read-through cannot
-be typed into by accident.
+Operations asks; the store answers. Those are separate fields on the same row,
+and separate permissions — Operations cannot answer for the store, because a
+submit gate they could satisfy themselves would gate nothing.
 
-Whoever types is what gets recorded — `perf_remarks.updated_by`, shown under
-each remark in the grid — so an entry made on a manager's behalf never reads
-as the manager's own. A banner says whose behalf it is and under whose name it
-will be saved. The Store Manager needs none of this on their own outlet: their
-boxes are always live.
+**Justify**, on each row of the review list and in the header of the review,
+puts Operations into asking mode: tick any parameter that needs explaining and
+write what you want explained. Unticking withdraws the request; an answer the
+store already gave is kept, a question nobody answered leaves no trace. Justify
+is not offered on a concluded month — reopen it first.
+
+The Store Manager then sees, in the review month's column, the question against
+each flagged figure and a box to answer it. Answering a flagged parameter is
+required; every other parameter stays optional. **Submit is refused while any
+requested justification is unanswered** — the message names the parameters, and
+everything already typed is saved, so nothing is lost to a missed box. Save
+alone never blocks.
+
+Clearing an answer to a flagged parameter reopens the request rather than
+deleting it.
+
+### What history shows
+
+Past months show **the store's answer only**. The question that prompted it is
+a working document for the month under review and is not re-aired afterwards.
+A figure that was questioned stays highlighted, so the record still shows
+*that* an explanation was asked for — just not the asking.
+
+The CSV export follows the same rule: the justifications block carries the
+answers for every month with a `*` on the ones that were requested, and a
+separate block lists what was asked for the review month only.
 
 A Store Manager needs **no permission flag at all**: access is owning an
 outlet. The outlet on their employee record is the only one they can open, and
@@ -149,11 +168,13 @@ left uncoloured, because every figure clears zero and saying so would be
 noise. The pairing lives in `perfBenchmarks()` in `modules/store_performance.php`;
 one line there gives another parameter the same treatment.
 
-The Store Manager gets a remark box per parameter in the review month's
-column. **Save** keeps the month open; **Submit for review** tells Operations
-the remarks are done, and they stay editable until the month is concluded.
-Operations then writes the conclusion and **Conclude month**, which locks the
-remarks. Reopening is one button, and keeps the conclusion text.
+The Store Manager gets a justification box per parameter in the review month's
+column, with the flagged ones marked and required (see *Asking for a
+justification* above). **Save** keeps the month open; **Submit for review**
+tells Operations they are done, and is refused while a request is unanswered.
+Answers stay editable until the month is concluded. Operations then writes the
+conclusion and **Conclude month**, which locks them. Reopening is one button,
+and keeps the conclusion text.
 
 ## Adding or changing a parameter
 
