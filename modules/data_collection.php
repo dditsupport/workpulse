@@ -303,6 +303,45 @@ function dcQuestionLabel(array $req): string {
     return $q !== '' ? $q : 'Answer / remark';
 }
 
+// The task's questions as one numbered series — the main question first,
+// then the sub-questions under it. They are all questions to the outlet
+// answering them, so they are numbered together rather than the main one
+// standing outside the count.
+//
+// Each entry is ['id' => 0 for the main question else the dc_questions id,
+//                'text' => wording, 'no' => 1-based number or 0 when the
+//                task asks only one thing and a number would be noise].
+function dcQuestionSeries(array $req, array $subQs): array {
+    $main = trim((string)($req['question'] ?? ''));
+
+    // No main question, but sub-questions: the real questions carry the
+    // numbering and the general box goes last, unnumbered — "1. Answer /
+    // remark" ahead of the actual questions would read as nonsense.
+    if ($main === '' && $subQs) {
+        $out = [];
+        foreach ($subQs as $i => $q) {
+            $out[] = ['id' => (int)$q['id'], 'text' => (string)$q['question_text'], 'no' => $i + 1];
+        }
+        $out[] = ['id' => 0, 'text' => 'Any other remark', 'no' => 0];
+        return $out;
+    }
+
+    $out = [['id' => 0, 'text' => dcQuestionLabel($req), 'no' => 0]];
+    foreach ($subQs as $q) {
+        $out[] = ['id' => (int)$q['id'], 'text' => (string)$q['question_text'], 'no' => 0];
+    }
+    // A lone box does not need to be called "1".
+    if (count($out) > 1) {
+        foreach ($out as $i => $_) $out[$i]['no'] = $i + 1;
+    }
+    return $out;
+}
+
+// The number badge in front of a question, empty for a lone question.
+function dcQuestionNo(int $no): string {
+    return $no > 0 ? '<span class="dc-q-n">' . $no . '</span>' : '';
+}
+
 // Anything a filesystem or a zip entry dislikes, for a folder or file name.
 function dcSafeName(string $s): string {
     $s = str_replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], '-', $s);
@@ -1040,10 +1079,14 @@ function dcAnswersCsvString(array $req, array $locIds): string {
     fputcsv($out, ['Task', $req['title']], escape: '');
     fputcsv($out, ['Downloaded', date('d M Y H:i')], escape: '');
     fputcsv($out, [], escape: '');
-    // Each question is its own column, headed by the question itself, so the
-    // sheet can be read and sorted without going back to the app.
-    $head = ['Location', 'Status', dcQuestionLabel($req)];
-    foreach ($subQs as $q) $head[] = (string)$q['question_text'];
+    // Each question is its own column, headed by the question itself and
+    // numbered as it is on screen, so the sheet can be read and sorted
+    // without going back to the app.
+    $series = dcQuestionSeries($req, $subQs);
+    $head   = ['Location', 'Status'];
+    foreach ($series as $q) {
+        $head[] = ((int)$q['no'] > 0 ? $q['no'] . '. ' : '') . $q['text'];
+    }
     $head[] = 'Filed by'; $head[] = 'When'; $head[] = 'Files';
     fputcsv($out, $head, escape: '');
 
@@ -1054,12 +1097,12 @@ function dcAnswersCsvString(array $req, array $locIds): string {
         $who   = (string)($sub['confirmed_name'] ?? $sub['confirmed_by'] ?? $sub['updated_name'] ?? $sub['updated_by'] ?? '');
         if ($who !== '' && (int)($sub['on_behalf'] ?? 0) === 1) $who .= ' (on behalf)';
         $when  = (string)($sub['confirmed_at'] ?? $sub['updated_at'] ?? '');
-        $row = [
-            $names[$lid] ?? ('#' . $lid),
-            dcStateLabel($state),
-            (string)($sub['answer_text'] ?? ''),
-        ];
-        foreach ($subQs as $q) $row[] = (string)($answers[$lid][(int)$q['id']] ?? '');
+        $row = [$names[$lid] ?? ('#' . $lid), dcStateLabel($state)];
+        foreach ($series as $q) {
+            $row[] = (int)$q['id'] === 0
+                ? (string)($sub['answer_text'] ?? '')
+                : (string)($answers[$lid][(int)$q['id']] ?? '');
+        }
         $row[] = $who;
         $row[] = $when !== '' ? date('d M Y H:i', strtotime($when)) : '';
         $row[] = count($files);
@@ -1859,17 +1902,16 @@ if ($selected > 0):
         <?php // The questions come before the file picker: they are what the
               // files are meant to show, and a question printed under the
               // upload hint reads as part of that hint. ?>
+        <?php foreach (dcQuestionSeries($req, $subQs) as $q): ?>
         <div class="form-group">
-            <div class="dc-q"><?= h(dcQuestionLabel($req)) ?></div>
+            <div class="dc-q"><?= dcQuestionNo((int)$q['no']) ?><?= h($q['text']) ?></div>
+            <?php if ((int)$q['id'] === 0): ?>
             <textarea name="answer_text" class="form-control" rows="3" maxlength="<?= DC_MAX_ANSWER ?>"
                       placeholder="Type your answer here"><?= h((string)($sub['answer_text'] ?? '')) ?></textarea>
-        </div>
-
-        <?php foreach ($subQs as $n => $q): $qid = (int)$q['id']; ?>
-        <div class="form-group">
-            <div class="dc-q"><span class="dc-q-n"><?= $n + 1 ?></span><?= h($q['question_text']) ?></div>
-            <textarea name="sub_answers[<?= $qid ?>]" class="form-control" rows="2" maxlength="<?= DC_MAX_ANSWER ?>"
-                      placeholder="Type your answer here"><?= h((string)($myAnswers[$qid] ?? '')) ?></textarea>
+            <?php else: ?>
+            <textarea name="sub_answers[<?= (int)$q['id'] ?>]" class="form-control" rows="3" maxlength="<?= DC_MAX_ANSWER ?>"
+                      placeholder="Type your answer here"><?= h((string)($myAnswers[(int)$q['id']] ?? '')) ?></textarea>
+            <?php endif; ?>
         </div>
         <?php endforeach; ?>
 
@@ -1917,17 +1959,14 @@ if ($selected > 0):
     </div>
     <?php endif; ?>
     <?php else: ?>
+    <?php foreach (dcQuestionSeries($req, $subQs) as $q):
+        $txt = (int)$q['id'] === 0
+            ? trim((string)($sub['answer_text'] ?? ''))
+            : trim((string)($myAnswers[(int)$q['id']] ?? '')); ?>
     <div class="form-group">
-        <div class="dc-q"><?= h(dcQuestionLabel($req)) ?></div>
+        <div class="dc-q"><?= dcQuestionNo((int)$q['no']) ?><?= h($q['text']) ?></div>
         <div class="dc-a">
-            <?= trim((string)($sub['answer_text'] ?? '')) !== '' ? h((string)$sub['answer_text']) : '<span class="text-muted">No answer written.</span>' ?>
-        </div>
-    </div>
-    <?php foreach ($subQs as $n => $q): $qid = (int)$q['id']; ?>
-    <div class="form-group">
-        <div class="dc-q"><span class="dc-q-n"><?= $n + 1 ?></span><?= h($q['question_text']) ?></div>
-        <div class="dc-a">
-            <?= trim((string)($myAnswers[$qid] ?? '')) !== '' ? h((string)$myAnswers[$qid]) : '<span class="text-muted">No answer written.</span>' ?>
+            <?= $txt !== '' ? h($txt) : '<span class="text-muted">No answer written.</span>' ?>
         </div>
     </div>
     <?php endforeach; ?>
@@ -1957,7 +1996,7 @@ if ($selected > 0):
         <tr>
             <th style="width:190px">Location</th>
             <th style="width:110px">Status</th>
-            <th><?= h(dcQuestionLabel($req)) ?><?= $subQs ? ' <span class="text-muted" style="font-weight:400">+ ' . count($subQs) . ' more</span>' : '' ?></th>
+            <th>Answers<?= $subQs ? ' <span class="text-muted" style="font-weight:400">(' . (count($subQs) + 1) . ' questions)</span>' : '' ?></th>
             <th style="width:240px">Files</th>
             <th style="width:170px">Filed by</th>
             <th style="width:150px"></th>
@@ -1978,12 +2017,14 @@ if ($selected > 0):
             <td><?= h($names[$lid] ?? ('#' . $lid)) ?></td>
             <td><?= dcStateBadge($state) ?></td>
             <td style="font-size:12px">
-                <div style="white-space:pre-wrap">
-                    <?= trim((string)($sub['answer_text'] ?? '')) !== '' ? h((string)$sub['answer_text']) : '<span class="text-muted">—</span>' ?>
-                </div>
-                <?php foreach ($subQs as $n => $q): $a = trim((string)($answers[$lid][(int)$q['id']] ?? '')); ?>
-                <div style="margin-top:6px">
-                    <div class="text-muted" style="font-size:11px"><?= $n + 1 ?>. <?= h($q['question_text']) ?></div>
+                <?php foreach (dcQuestionSeries($req, $subQs) as $qi => $q):
+                    $a = (int)$q['id'] === 0
+                        ? trim((string)($sub['answer_text'] ?? ''))
+                        : trim((string)($answers[$lid][(int)$q['id']] ?? '')); ?>
+                <div<?= $qi ? ' style="margin-top:6px"' : '' ?>>
+                    <?php if ((int)$q['no'] > 0): ?>
+                    <div class="text-muted" style="font-size:11px"><?= (int)$q['no'] ?>. <?= h($q['text']) ?></div>
+                    <?php endif; ?>
                     <div style="white-space:pre-wrap"><?= $a !== '' ? h($a) : '<span class="text-muted">—</span>' ?></div>
                 </div>
                 <?php endforeach; ?>
