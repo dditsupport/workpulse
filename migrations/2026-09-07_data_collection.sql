@@ -21,8 +21,9 @@
 --   dc_files             — the uploaded files, on disk under
 --                          uploads/data_collection/{request_id}/.
 --   dc_submissions       — one row per outlet: its answer text AND its
---                          lock state. Draft until the outlet confirms;
---                          confirmed is what the board counts.
+--                          lock state. An outlet submits and can keep
+--                          changing what it sent; Operations confirms,
+--                          and that is what locks the outlet out.
 --
 -- Additive and safe to re-run: every statement is IF NOT EXISTS.
 -- modules/data_collection.php feature-detects the tables (dcSchemaReady())
@@ -92,19 +93,23 @@ CREATE TABLE IF NOT EXISTS `dc_files` (
     FOREIGN KEY (`location_id`) REFERENCES `locations` (`location_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
--- One row per outlet per task. The answer lives here rather than on
--- dc_files so it stands on its own when the task asks for no file, and
--- does not multiply across an outlet's five attachments. status is the
--- lock: while it is 'draft' the outlet may add files, remove them and
--- rewrite its answer; 'submitted' freezes the lot and is what the board
--- counts as filed. Only a txn_data_collect holder can reopen it.
+-- One row per outlet per task, written the first time that outlet sends
+-- anything. The answer lives here rather than on dc_files so it stands on
+-- its own when the task asks for no file, and does not multiply across an
+-- outlet's five attachments.
+--
+-- status is the lock, and only Operations moves it: while it is
+-- 'submitted' the outlet may still add files, remove them and rewrite its
+-- answer; a txn_data_collect holder confirming freezes the lot, and only
+-- they can reopen it.
 CREATE TABLE IF NOT EXISTS `dc_submissions` (
   `request_id`   int(11)     NOT NULL,
   `location_id`  int(11)     NOT NULL,
   `answer_text`  text        DEFAULT NULL,
-  `status`       enum('draft','submitted') NOT NULL DEFAULT 'draft',
+  `status`       enum('submitted','confirmed') NOT NULL DEFAULT 'submitted',
   `updated_by`   varchar(20) DEFAULT NULL,
   `updated_at`   datetime    NOT NULL DEFAULT current_timestamp(),
+  -- Who in Operations accepted it, and when. The outlet cannot set these.
   `confirmed_by` varchar(20) DEFAULT NULL,
   `confirmed_at` datetime    DEFAULT NULL,
   `reopened_by`  varchar(20) DEFAULT NULL,
@@ -120,7 +125,8 @@ CREATE TABLE IF NOT EXISTS `dc_submissions` (
 
 -- ── Permission ──────────────────────────────────────────
 -- txn_data_collect — start a task, edit it, close it, file on behalf of
---                    any targeted outlet, reopen a confirmed submission,
+--                    any targeted outlet, CONFIRM an outlet's submission
+--                    (which locks that outlet out of it) and reopen one,
 --                    download everything and discard the task.
 -- Submitting needs no flag: an employee reaches the task through the
 -- outlet on their profile (employees.location_id) or through Manager

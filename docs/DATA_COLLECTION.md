@@ -3,10 +3,12 @@
 Replaces the WhatsApp group where Operations asks every outlet for the same
 thing: P&P closing stock, a sales sheet, a photo of a device, "how many boxes
 are left in the deep freezer". One person starts a **task**, picks the outlets,
-and types the question each of them answers. Every outlet uploads its files and
-writes its answer, then presses **Confirm submission**, which locks what it
-sent. Operations downloads the lot as one ZIP — a folder per location — and
-then **discards** the task, which erases every file from the server.
+and types the question each of them answers. Every outlet uploads its files,
+writes its answer and presses **Submit** — one button, and it can keep
+correcting what it sent. Operations then **confirms** a submission, and that is
+what locks the outlet out of it. Operations downloads the lot as one ZIP — a
+folder per location — and then **discards** the task, which erases every file
+from the server.
 
 Lives under **Store Operations** in the sidebar, as a single entry: *Data
 Collection*. Both sides of the drive use it — Operations sees every task, a
@@ -20,11 +22,14 @@ boards, separate folders on disk; discarding one never touches another.
 ## Setup
 
 ```
-migrations/2026-09-07_data_collection.sql   -- four tables + the permission
+migrations/2026-09-07_data_collection.sql          -- four tables + the permission
+migrations/2026-09-08_data_collection_ops_confirm.sql  -- confirming moves to Operations
 ```
 
-Safe to re-run. Until it is applied the page shows a "run the migration"
-notice rather than an error.
+Both are safe to re-run. The second is only needed on a database that took the
+first before 2026-09-08; the first has since been updated to match, so a fresh
+install gets it either way and the second becomes a no-op. Until they are
+applied the page shows a "run the migration" notice rather than an error.
 
 Then, in *Administration → Roles*, tick **Data Collection · Manage** on
 whichever roles run these drives. Nobody has it until you do. Submitting needs
@@ -32,12 +37,16 @@ no permission at all.
 
 ## Who can do what
 
-| | Start / edit / close a task | Submit for an outlet | File on behalf | Reopen a confirmed submission | Download | Discard |
+| | Start / edit / close a task | Submit for an outlet | File on behalf | Confirm / reopen a submission | Download | Discard |
 |---|---|---|---|---|---|---|
 | `txn_data_collect` (Operations) | ✅ | ✅ any targeted outlet | ✅ | ✅ | ✅ everything | ✅ |
 | Store user — outlet on their profile | — | ✅ their outlet | — | — | ✅ their own outlet | — |
 | Store / Operation Manager in *Manager Mapping* | — | ✅ every outlet mapped to them | — | — | ✅ those outlets | — |
 | Superadmin | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+
+A location has one button, **Submit**, and never confirms anything. Confirming
+is Operations' acceptance of what came in, and it is what takes the submission
+away from the outlet.
 
 An employee reaches a task through the outlet on their profile
 (`employees.location_id`) or through *Store Operations → Manager Mapping*
@@ -51,20 +60,23 @@ covering five stores files for all five, picking the outlet from a dropdown.
    not, the same default the app's other cross-location screens use. Untick
    *A file must be attached* to run a question on its own, with the written
    answer as the whole submission.
-2. **Draft** — the outlet adds files and writes its answer, as many times as it
-   likes. It can remove a file it sent by mistake and rewrite the answer.
-   Nothing is locked and the board shows the outlet as *Draft*.
-3. **Confirm** — the outlet presses *Confirm submission*. The block goes
-   read-only: no more files in or out, no more edits, and only now does the
-   board count it as *Confirmed*. A confirm is refused if the task wants a file
-   and none is attached.
-4. **Reopen** (if needed) — Operations hands a confirmed submission back as a
-   draft, and the outlet can fix it and confirm again. Operations can also
+2. **Submit** — the outlet adds files, writes its answer and presses *Submit*,
+   as many times as it likes: submitting again adds files and replaces the
+   answer, and it can remove a file it sent by mistake. The board shows it as
+   *Submitted*, which is the number to chase — that outlet has done its part.
+3. **Confirm** — Operations accepts a submission, from the board row or with
+   *Confirm all submitted* once the ZIP is down. Only now does the outlet lose
+   the ability to add, remove or change anything, and only now does the board
+   count it as *Confirmed*. A confirm is refused for an outlet that sent
+   nothing, or that sent no file when the task requires one.
+4. **Reopen** (if needed) — Operations hands a confirmed submission back, and
+   the outlet can change it and it can be confirmed again. Operations can also
    correct a confirmed submission directly, which leaves it confirmed.
 5. **Download** — *Download all (ZIP)*: one folder per location, each file
    under the name the outlet gave it, plus `answers.csv` at the root listing
-   every targeted outlet — status, answer, who filed it, when, file count —
-   including the ones that sent nothing. *Download answers (CSV)* gives that
+   every targeted outlet — status (Not submitted / Submitted / Confirmed),
+   answer, who filed it, when, file count — including the ones that sent
+   nothing. *Download answers (CSV)* gives that
    sheet on its own and needs no ZIP support on the server.
 
    ```
@@ -74,8 +86,9 @@ covering five stores files for all five, picking the outlet from a dropdown.
    ├── AHD - South Bopal/SOBO Physical P&P closing stock 31082026.xls
    └── AHD - Hansol/Physical P&P closing stock hansol outlet.xlsx
    ```
-6. **Close** (optional) — stops further submissions while leaving everything
-   downloadable. Reversible.
+6. **Close** (optional) — stops every outlet editing at once, without
+   confirming them one by one, while leaving everything downloadable.
+   Reversible.
 7. **Discard** — **irreversible, and it leaves no record.** Every uploaded file
    is erased from disk, the upload folder is removed, and the task, its
    answers and its submission history are deleted. The dialog asks you to type
