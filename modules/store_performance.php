@@ -288,7 +288,10 @@ function perfDisplayValue(?array $cell, array $param): string {
     $v = (float)$cell['value_num'];
     return match ($param['value_type']) {
         'amount'  => perfInr($v),
-        'percent' => rtrim(rtrim(number_format($v, 1, '.', ''), '0'), '.') . '%',
+        // Always two places, zeros kept: a column of 75.10% / 94.00% /
+        // 100.00% lines up on the decimal point, and 0.30% does not read
+        // as 0.3 of a point when scanned quickly next to 0.03%.
+        'percent' => number_format($v, 2, '.', '') . '%',
         // Audit Score is a graded figure, not a count: 88.75 is a different
         // result from 88, and rounding it to a whole number threw away
         // precision the audit module had already earned. Trailing zeros are
