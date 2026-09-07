@@ -19,11 +19,12 @@ migrations/2026-09-02_store_performance.sql          -- tables + the 18 paramete
 migrations/2026-09-02_store_performance_history.sql  -- Apr 2024 – Jul 2026, 22,951 data points
 migrations/2026-09-07_perf_audit_score_decimals.sql  -- Audit Score keeps its decimals
 migrations/2026-09-07_perf_justification_flags.sql   -- the ask/answer split
+migrations/2026-09-07_perf_targets.sql               -- per-outlet goals
 ```
 
-The two dated 2026-09-07 are only needed on a database migrated before that
+The three dated 2026-09-07 are only needed on a database migrated before that
 day; the first file has since been updated to match, so a fresh install gets
-both either way. Running them anyway is harmless.
+them all either way. Running them anyway is harmless.
 
 The history file stages the workbook's rows and joins them to
 `locations.location_name`. Its **step 4** query lists any outlet name with no
@@ -184,10 +185,48 @@ column, with the flagged ones marked and required (see *Asking for a
 justification* above). **Save** keeps the month open; **Submit for review**
 tells Operations they are done, and is refused while a request is unanswered.
 Answers stay editable until the month is concluded. Operations then writes the
-conclusion and **Conclude month**, which locks them for everyone. Reopening is
-one button for a superadmin, and keeps the conclusion text.
+conclusion and **Conclude month**, which locks the whole month for everyone —
+the justifications *and* the conclusion itself, so a draft saved afterwards
+cannot rewrite what was signed off. Reopening is one button for a superadmin,
+and keeps the conclusion text.
+
+## Goals
+
+"Wastage under 2%" is not the same instruction at every outlet. Each parameter
+carries a goal, and each outlet can override it:
+
+- **Parameters** (`?page=perf_params`) sets the company-wide default.
+- **Outlet goals** (`?page=perf_targets`) overrides it for one outlet. A blank
+  box inherits the default, so only the outlets that differ need touching.
+
+Type the number the way the grid shows it — `2` for 2%, not `0.02`. Which side
+of it is good news comes from the parameter's **Good direction**: *lower is
+better* makes the goal a ceiling (wastage at or under it is met), *higher is
+better* a floor, *neither* means the figure is reported but never judged, and a
+goal set against it is ignored.
+
+In the review grid the goal prints under the parameter name and turns each
+month's figure green or red against it. Achievement is the exception: it is
+judged against that month's own uploaded Target, which is a moving number, not
+a standing goal.
+
+Nothing is seeded — until Operations sets a goal, the grid reads exactly as it
+did before, because a goal nobody agreed to is not a standard.
 
 ## Adding or changing a parameter
+
+Operations owns the list, on the **Parameters** page: add one, rename it,
+change how it reads, set its default goal, reorder it, or retire it.
+
+The **code** is the sort key and the name the CSV matches on, so it is fixed
+once a parameter exists — rename freely, recode never.
+
+**Retiring** takes a parameter out of the review grid, the CSV template and the
+import. Every value and justification already recorded against it is kept and
+comes back untouched if it is made active again. Nothing is ever deleted, and a
+retired code cannot be reused for something else — reactivate it instead.
+
+### Editing the table directly
 
 Edit `perf_parameters`. `param_code` is the sort key and the stable identity
 the CSV matches on and remarks hang off, so keep it once assigned — renaming

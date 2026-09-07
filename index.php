@@ -200,6 +200,9 @@ function routePost(string $a): void {
         // per-parameter justifications are gated on the writer owning the
         // outlet (employees.location_id).
         case 'perf_upload':           if (function_exists('doPerfUpload'))         doPerfUpload();         break;
+        case 'perf_save_parameter':   if (function_exists('doPerfSaveParameter'))  doPerfSaveParameter();  break;
+        case 'perf_toggle_parameter': if (function_exists('doPerfToggleParameter')) doPerfToggleParameter(); break;
+        case 'perf_save_targets':     if (function_exists('doPerfSaveTargets'))    doPerfSaveTargets();    break;
         case 'perf_save_flags':       if (function_exists('doPerfSaveFlags'))      doPerfSaveFlags();      break;
         case 'perf_save_remarks':     if (function_exists('doPerfSaveRemarks'))    doPerfSaveRemarks();    break;
         case 'perf_save_conclusion':  if (function_exists('doPerfSaveConclusion')) doPerfSaveConclusion(); break;

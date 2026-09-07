@@ -38,9 +38,13 @@ CREATE TABLE IF NOT EXISTS `perf_parameters` (
   -- trimmed (a graded score, where 88.75 differs from 88), number →
   -- grouped integer.
   `value_type` enum('amount','number','percent','decimal') NOT NULL DEFAULT 'number',
-  -- Which way is good news, for the month-on-month delta arrow.
+  -- Which way is good news, for the month-on-month delta arrow and for
+  -- reading default_target as a ceiling ('down') or a floor ('up').
   -- 'none' = neither (a target is a target, not an achievement).
   `better`     enum('up','down','none') NOT NULL DEFAULT 'none',
+  -- Company-wide goal for this parameter; an outlet may override it in
+  -- perf_targets. NULL = the figure is reported, not judged.
+  `default_target` decimal(18,4) DEFAULT NULL,
   `sort_order` int(11)      NOT NULL DEFAULT 0,
   `is_active`  tinyint(1)   NOT NULL DEFAULT 1,
   PRIMARY KEY (`id`),
