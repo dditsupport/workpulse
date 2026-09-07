@@ -289,6 +289,11 @@ function perfDisplayValue(?array $cell, array $param): string {
     return match ($param['value_type']) {
         'amount'  => perfInr($v),
         'percent' => rtrim(rtrim(number_format($v, 1, '.', ''), '0'), '.') . '%',
+        // Audit Score is a graded figure, not a count: 88.75 is a different
+        // result from 88, and rounding it to a whole number threw away
+        // precision the audit module had already earned. Trailing zeros are
+        // trimmed, so 88 stays 88 and 99.10 reads 99.1.
+        'decimal' => rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.'),
         default   => perfInr($v),
     };
 }
@@ -991,6 +996,7 @@ function perfSampleCsv(): void {
             $hint = match ($p['value_type']) {
                 'percent' => 'fraction — 0.03 for 3% (or write 3%)',
                 'amount'  => 'rupees — 445000',
+                'decimal' => 'score, 2 decimals — 88.75',
                 default   => 'count — 1036',
             };
             fputcsv($out, [$month, (string)$l['location_name'], perfParamLabel($p), '', $hint], escape: '');

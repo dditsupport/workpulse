@@ -34,8 +34,9 @@ CREATE TABLE IF NOT EXISTS `perf_parameters` (
   `param_code` varchar(4)   NOT NULL,
   `param_name` varchar(100) NOT NULL,
   -- Drives display only: amount → ₹ grouped, percent → 1 decimal + %,
-  -- number → grouped integer.
-  `value_type` enum('amount','number','percent') NOT NULL DEFAULT 'number',
+  -- decimal → 2 decimals with trailing zeros trimmed (a graded score,
+  -- where 88.75 differs from 88), number → grouped integer.
+  `value_type` enum('amount','number','percent','decimal') NOT NULL DEFAULT 'number',
   -- Which way is good news, for the month-on-month delta arrow.
   -- 'none' = neither (a target is a target, not an achievement).
   `better`     enum('up','down','none') NOT NULL DEFAULT 'none',
@@ -121,7 +122,7 @@ INSERT INTO `perf_parameters` (`param_code`,`param_name`,`value_type`,`better`,`
   ('01','Target',              'amount', 'none',  1),
   ('02','Achivement',          'amount', 'up',    2),
   ('03','Target %',            'percent','up',    3),
-  ('04','Audit Score',         'number', 'up',    4),
+  ('04','Audit Score',         'decimal','up',    4),
   ('05','Wastage %',           'percent','down',  5),
   ('06','Swiggy Basic',        'amount', 'up',    6),
   ('07','Zomato Basic',        'amount', 'up',    7),

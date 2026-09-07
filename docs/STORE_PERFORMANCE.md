@@ -6,8 +6,8 @@ Operations closes the month with a conclusion. The review screen shows the
 history side by side — months across, parameters down — with each month's
 remarks sitting under the number they explain.
 
-Lives under **Audits** in the sidebar, as a single entry — *Performance
-Review*. The upload page is reached from the button on it rather than from the
+Lives under **Audit and Performance** in the sidebar, as a single entry —
+*Performance Review*. The upload page is reached from the button on it rather than from the
 sidebar, the way *Create Audit* is reached from the Audit List: Operations has
 one place to start. It is still gated on `txn_perf_admin` server-side, so
 being off the sidebar is presentation, not permission.
@@ -17,7 +17,12 @@ being off the sidebar is presentation, not permission.
 ```
 migrations/2026-09-02_store_performance.sql          -- tables + the 18 parameters + 2 permissions
 migrations/2026-09-02_store_performance_history.sql  -- Apr 2024 – Jul 2026, 22,951 data points
+migrations/2026-09-07_perf_audit_score_decimals.sql  -- Audit Score keeps its decimals
 ```
+
+The third file is only needed on a database migrated before 2026-09-07; the
+first has since been updated to match, so a fresh install gets it either way.
+Running it anyway is harmless.
 
 The history file stages the workbook's rows and joins them to
 `locations.location_name`. Its **step 4** query lists any outlet name with no
@@ -158,3 +163,8 @@ the CSV matches on and remarks hang off, so keep it once assigned — renaming
 format (`amount` uses Indian grouping, `percent` adds one decimal and a `%`),
 and `better` (`up` / `down` / `none`) decides which way the delta arrow is
 good news.
+
+`value_type` options: `amount` (Indian grouping, whole rupees), `percent`
+(one decimal plus `%`), `decimal` (two decimals, trailing zeros trimmed — for
+a graded figure like Audit Score, where 88.75 is not 88), `number` (a grouped
+whole count).

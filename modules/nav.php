@@ -54,7 +54,7 @@ function buildNav(): array {
             ['page' => 'checklist_audit',    'icon' => navIcon('task_check'),  'label' => 'Checklist Audit'],
             ['page' => 'checklist_validate', 'icon' => navIcon('task_check'),  'label' => 'Validate Checklist'],
         ]],
-        ['group' => 'Audits', 'items' => [
+        ['group' => 'Audit and Performance', 'items' => [
             ['page' => 'audit_list',        'icon' => navIcon('audit_list'),   'label' => 'Audit List'],
             ['page' => 'audit_summary',     'icon' => navIcon('summary'),      'label' => 'Audit Summary'],
             ['page' => 'audit_categories',  'icon' => navIcon('categories'),   'label' => 'Audit Categories'],
@@ -257,7 +257,7 @@ function buildNav(): array {
     if ($issues)   $groups[] = ['group' => 'Tickets',           'items' => $issues];
     if ($discount) $groups[] = ['group' => 'Discount',          'items' => $discount];
     if ($tasks)    $groups[] = ['group' => 'Checklists',   'items' => $tasks];
-    if ($audit)    $groups[] = ['group' => 'Audits',            'items' => $audit];
+    if ($audit)    $groups[] = ['group' => 'Audit and Performance', 'items' => $audit];
     if ($store)    $groups[] = ['group' => 'Store Operations',  'items' => $store];
     if ($violations) $groups[] = ['group' => 'Policy & Violation', 'items' => $violations];
     if ($priceVar)   $groups[] = ['group' => 'Price Variation', 'items' => $priceVar];

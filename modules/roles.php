@@ -29,7 +29,7 @@ $txnGroups = [
                            'txn_checklist_report' => 'Checklist Report', 'txn_checklist_audit' => 'Checklist Audit',
                            'txn_checklist_validate' => 'Validate Checklist'],
     'Gallery'          => ['txn_event_photo_upload' => 'Upload Event Photos'],
-    'Audits'           => ['txn_audit_create' => 'Create Audit', 'txn_audit_approve' => 'Approve Audit',
+    'Audit and Performance' => ['txn_audit_create' => 'Create Audit', 'txn_audit_approve' => 'Approve Audit',
                            'txn_audit_operation' => 'Operation Review',
                            'txn_audit_management' => 'Management Approve',
                            'txn_audit_annotation_resolve' => 'Audit Annotation · Resolve',
