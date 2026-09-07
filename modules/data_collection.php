@@ -291,6 +291,80 @@ function dcSafeName(string $s): string {
     return $s === '' ? 'unnamed' : mb_substr($s, 0, 120);
 }
 
+// Sample files arrived after the first release, so the table is probed
+// rather than assumed: a database that took only the first migration
+// keeps working, minus the sample box. Same idiom as
+// txnHasValidationCols() in modules/transactions.php.
+function dcSamplesReady(): bool {
+    static $ready = null;
+    if ($ready !== null) return $ready;
+    try {
+        getDb()->query('SELECT 1 FROM dc_samples LIMIT 0')->fetch();
+        $ready = true;
+    } catch (Exception $e) {
+        $ready = false;
+    }
+    return $ready;
+}
+
+// The blank formats this task hands out, oldest first.
+function dcSamples(int $requestId): array {
+    if (!dcSamplesReady()) return [];
+    try {
+        $st = getDb()->prepare('SELECT * FROM dc_samples WHERE request_id = ? ORDER BY id');
+        $st->execute([$requestId]);
+        return $st->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) {
+        return [];
+    }
+}
+
+function dcSampleRow(int $id): ?array {
+    if (!dcSamplesReady()) return null;
+    $st = getDb()->prepare('SELECT * FROM dc_samples WHERE id = ?');
+    $st->execute([$id]);
+    return $st->fetch(PDO::FETCH_ASSOC) ?: null;
+}
+
+// The task's folder on disk, created on demand. Returns null when it
+// cannot be written to, which the callers turn into a flash rather than a
+// half-saved submission.
+function dcEnsureDir(int $requestId): ?string {
+    $dir = dcFileDir($requestId);
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    return (is_dir($dir) && is_writable($dir)) ? $dir : null;
+}
+
+// Validate one entry of a $_FILES array-of-files and move it into $dir.
+// Returns ['stored','original','mime','size'] or null, appending a plain
+// reason to $skipped so the user is told which file was dropped and why.
+// Shared by the outlet's submission and the sample files a task ships
+// with: same size cap, same allow-list, same "is it really an .xlsx"
+// sniff. $prefix keeps the two apart on disk (dc_ / dcs_).
+function dcStoreUpload(array $files, int $i, string $dir, string $prefix, array &$skipped): ?array {
+    $err = $files['error'][$i] ?? UPLOAD_ERR_NO_FILE;
+    if ($err === UPLOAD_ERR_NO_FILE) return null;
+    $orig = basename((string)$files['name'][$i]);
+    if ($err !== UPLOAD_ERR_OK) { $skipped[] = "{$orig} (upload error {$err})"; return null; }
+    if ((int)$files['size'][$i] > DC_MAX_BYTES) {
+        $skipped[] = "{$orig} (over " . (DC_MAX_BYTES / 1024 / 1024) . ' MB)';
+        return null;
+    }
+    $ext = mb_strtolower(pathinfo($orig, PATHINFO_EXTENSION));
+    $ok  = DC_ALLOWED_MIME[$ext] ?? null;
+    if (!$ok) { $skipped[] = "{$orig} (.{$ext} not accepted)"; return null; }
+    $mime = (new finfo(FILEINFO_MIME_TYPE))->file((string)$files['tmp_name'][$i]) ?: 'application/octet-stream';
+    if (!in_array($mime, $ok, true)) { $skipped[] = "{$orig} (not a real .{$ext})"; return null; }
+
+    $stored = uniqid($prefix, true) . '.' . $ext;
+    if (!move_uploaded_file((string)$files['tmp_name'][$i], $dir . $stored)) {
+        $skipped[] = "{$orig} (could not be saved)";
+        return null;
+    }
+    return ['stored' => $stored, 'original' => mb_substr($orig, 0, 255),
+            'mime' => $mime, 'size' => (int)$files['size'][$i]];
+}
+
 // A file name that is free within one folder. Two outlets naming their
 // sheet the same way is fine — they land in different folders — but two
 // files in ONE folder would overwrite each other, so the second becomes
@@ -373,7 +447,11 @@ function doDcSaveRequest(): void {
         $ins = $db->prepare('INSERT INTO dc_request_locations (request_id, location_id) VALUES (?,?)');
         foreach ($final as $lid) $ins->execute([$id, $lid]);
 
-        $msg = 'Collection task saved — ' . count($final) . ' location(s) asked.';
+        // Sample files ride along with the task form, so a new task can be
+        // created and given its format in one go.
+        $sampleMsg = dcSaveSamples($id);
+
+        $msg = 'Collection task saved — ' . count($final) . ' location(s) asked.' . $sampleMsg;
         if ($kept) {
             $names = dcLocationNames();
             $msg .= ' Kept ' . implode(', ', array_map(fn($l) => $names[$l] ?? ('#' . $l), $kept))
@@ -385,6 +463,55 @@ function doDcSaveRequest(): void {
         header("Location: {$form}"); exit;
     }
     header('Location: index.php?page=data_collection&id=' . $id); exit;
+}
+
+// Store whatever came up in the task form's sample picker. Returns a
+// fragment for the caller's flash rather than flashing itself, so saving
+// a task stays one message.
+function dcSaveSamples(int $requestId): string {
+    if (empty($_FILES['samples']['name']) || !is_array($_FILES['samples']['name'])) return '';
+    if (!dcSamplesReady()) {
+        return ' Sample files were ignored — run migrations/2026-09-09_data_collection_samples.sql.';
+    }
+    $dir = dcEnsureDir($requestId);
+    if ($dir === null) return ' Sample files could not be saved — upload directory not writable.';
+
+    $skipped = []; $saved = 0;
+    $ins = getDb()->prepare(
+        'INSERT INTO dc_samples (request_id, original_name, stored_name, mime_type, size_bytes, uploaded_by)
+         VALUES (?,?,?,?,?,?)');
+    $n = min(count($_FILES['samples']['name']), DC_MAX_FILES);
+    for ($i = 0; $i < $n; $i++) {
+        $f = dcStoreUpload($_FILES['samples'], $i, $dir, 'dcs_', $skipped);
+        if ($f === null) continue;
+        try {
+            $ins->execute([$requestId, $f['original'], $f['stored'], $f['mime'], $f['size'], myCode()]);
+            $saved++;
+        } catch (Exception $e) {
+            @unlink($dir . $f['stored']);
+            $skipped[] = $f['original'] . ' (' . $e->getMessage() . ')';
+        }
+    }
+    $msg = $saved ? " {$saved} sample file(s) attached." : '';
+    if ($skipped) $msg .= ' Sample skipped: ' . implode('; ', $skipped) . '.';
+    return $msg;
+}
+
+// ── Handler: remove one sample file ─────────────────────
+function doDcDeleteSample(): void {
+    $row  = dcSampleRow((int)($_POST['sample_id'] ?? 0));
+    if (!$row) { flash('error', 'Sample file not found.'); header('Location: index.php?page=data_collections'); exit; }
+    $id   = (int)$row['request_id'];
+    $back = 'index.php?page=data_collection_new&id=' . $id;
+    if (!dcCanManage()) {
+        flash('error', 'You do not have permission to change this task.');
+        header("Location: index.php?page=data_collection&id={$id}"); exit;
+    }
+    $path = dcFileDir($id) . $row['stored_name'];
+    if (is_file($path)) @unlink($path);
+    getDb()->prepare('DELETE FROM dc_samples WHERE id = ?')->execute([(int)$row['id']]);
+    flash('success', 'Removed the sample file ' . $row['original_name'] . '.');
+    header("Location: {$back}"); exit;
 }
 
 // ── Handler: close / reopen the whole task ──────────────
@@ -446,43 +573,26 @@ function doDcSubmit(): void {
     // ── Files ──
     $saved = 0; $skipped = [];
     if (!empty($_FILES['files']['name']) && is_array($_FILES['files']['name'])) {
-        $dir = dcFileDir($id);
-        if (!is_dir($dir)) @mkdir($dir, 0755, true);
-        if (!is_dir($dir) || !is_writable($dir)) {
+        $dir = dcEnsureDir($id);
+        if ($dir === null) {
             flash('error', 'Upload directory is not writable.');
             header("Location: {$back}"); exit;
         }
-        $finfo = new finfo(FILEINFO_MIME_TYPE);
-        $ins   = getDb()->prepare(
+        $ins = getDb()->prepare(
             'INSERT INTO dc_files
                 (request_id, location_id, original_name, stored_name, mime_type, size_bytes, uploaded_by, on_behalf)
              VALUES (?,?,?,?,?,?,?,?)');
         $n = min(count($_FILES['files']['name']), DC_MAX_FILES);
         for ($i = 0; $i < $n; $i++) {
-            $err = $_FILES['files']['error'][$i] ?? UPLOAD_ERR_NO_FILE;
-            if ($err === UPLOAD_ERR_NO_FILE) continue;
-            $orig = basename((string)$_FILES['files']['name'][$i]);
-            if ($err !== UPLOAD_ERR_OK) { $skipped[] = "{$orig} (upload error {$err})"; continue; }
-            if ((int)$_FILES['files']['size'][$i] > DC_MAX_BYTES) {
-                $skipped[] = "{$orig} (over " . (DC_MAX_BYTES / 1024 / 1024) . ' MB)'; continue;
-            }
-            $ext = mb_strtolower(pathinfo($orig, PATHINFO_EXTENSION));
-            $ok  = DC_ALLOWED_MIME[$ext] ?? null;
-            if (!$ok) { $skipped[] = "{$orig} (.{$ext} not accepted)"; continue; }
-            $mime = $finfo->file((string)$_FILES['files']['tmp_name'][$i]) ?: 'application/octet-stream';
-            if (!in_array($mime, $ok, true)) { $skipped[] = "{$orig} (not a real .{$ext})"; continue; }
-
-            $stored = uniqid('dc_', true) . '.' . $ext;
-            if (!move_uploaded_file((string)$_FILES['files']['tmp_name'][$i], $dir . $stored)) {
-                $skipped[] = "{$orig} (could not be saved)"; continue;
-            }
+            $f = dcStoreUpload($_FILES['files'], $i, $dir, 'dc_', $skipped);
+            if ($f === null) continue;
             try {
-                $ins->execute([$id, $loc, mb_substr($orig, 0, 255), $stored, $mime,
-                               (int)$_FILES['files']['size'][$i], myCode(), $onBehalf]);
+                $ins->execute([$id, $loc, $f['original'], $f['stored'], $f['mime'],
+                               $f['size'], myCode(), $onBehalf]);
                 $saved++;
             } catch (Exception $e) {
-                @unlink($dir . $stored);      // no orphan on disk
-                $skipped[] = "{$orig} (" . $e->getMessage() . ')';
+                @unlink($dir . $f['stored']);      // no orphan on disk
+                $skipped[] = $f['original'] . ' (' . $e->getMessage() . ')';
             }
         }
     }
@@ -680,6 +790,12 @@ function doDcDiscard(): void {
             $files++;
         }
     }
+    // The task's own sample files go the same way.
+    foreach (dcSamples($id) as $r) {
+        $p = dcFileDir($id) . $r['stored_name'];
+        if (is_file($p)) { $bytes += (int)filesize($p); @unlink($p); }
+        $files++;
+    }
     // Anything left in the folder (a file whose row went missing) goes too,
     // then the folder itself — this task must leave nothing behind.
     $dir = dcFileDir($id);
@@ -714,6 +830,30 @@ function dcServeFile(): void {
     if (!dcCanManage() && !isset($mine[$loc])) { http_response_code(403); echo 'Not allowed'; return; }
     $path = dcFilePath($row);
     if (!$path) { http_response_code(404); echo 'File missing'; return; }
+
+    header('Content-Type: ' . ($row['mime_type'] ?: 'application/octet-stream'));
+    header('X-Content-Type-Options: nosniff');
+    header('Content-Disposition: attachment; filename="' . str_replace('"', '', (string)$row['original_name']) . '"');
+    header('Content-Length: ' . (int)filesize($path));
+    header('Cache-Control: private, no-store');
+    readfile($path);
+    exit;
+}
+
+// ── Download: the sample file a task hands out ──────────
+// Readable by anyone the task was sent to, not just Operations — the
+// whole point is that the outlet takes the format and fills it in.
+function dcServeSample(): void {
+    $row = dcSampleRow((int)($_GET['id'] ?? 0));
+    if (!$row) { http_response_code(404); echo 'Not found'; return; }
+    $id  = (int)$row['request_id'];
+    if (!dcCanManage()) {
+        $mine = dcMyLocations();
+        $seen = array_intersect(dcRequestLocationIds($id), array_keys($mine));
+        if (!$seen) { http_response_code(403); echo 'Not allowed'; return; }
+    }
+    $path = dcFileDir($id) . $row['stored_name'];
+    if (!is_file($path)) { http_response_code(404); echo 'File missing'; return; }
 
     header('Content-Type: ' . ($row['mime_type'] ?: 'application/octet-stream'));
     header('X-Content-Type-Options: nosniff');
@@ -1025,7 +1165,7 @@ function pageDataCollectionForm(): void {
     <a href="?page=data_collections" class="btn btn-sm btn-ghost">← All tasks</a>
 </div>
 
-<form method="POST" class="form-card" style="max-width:none">
+<form method="POST" class="form-card" style="max-width:none" enctype="multipart/form-data">
     <input type="hidden" name="action" value="dc_save_request">
     <?php if ($req): ?><input type="hidden" name="id" value="<?= (int)$req['id'] ?>"><?php endif; ?>
 
@@ -1054,6 +1194,34 @@ function pageDataCollectionForm(): void {
         <label>Instructions</label>
         <textarea name="instructions" class="form-control" rows="3"
                   placeholder="Anything the outlet needs to know — which report to export, what the photo must show…"><?= h($req['instructions'] ?? '') ?></textarea>
+    </div>
+
+    <div class="form-group">
+        <label>Sample / format file</label>
+        <?php if (dcSamplesReady()): ?>
+        <?php $samples = $req ? dcSamples((int)$req['id']) : []; ?>
+        <?php if ($samples): ?>
+        <div style="margin-bottom:6px">
+            <?php foreach ($samples as $sf): ?>
+            <div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">
+                <a href="?page=dc_sample&id=<?= (int)$sf['id'] ?>" style="flex:1 1 auto;word-break:break-all"><?= h($sf['original_name']) ?></a>
+                <span class="text-muted" style="font-size:11px;white-space:nowrap"><?= h(dcFormatBytes((int)$sf['size_bytes'])) ?></span>
+                <button type="button" class="btn btn-ghost btn-sm"
+                        value="<?= (int)$sf['id'] ?>" onclick="dcDelSample(this)">Remove</button>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <?php endif; ?>
+        <input type="file" name="samples[]" class="form-control" multiple style="width:100%">
+        <small class="text-muted">
+            Optional. The blank sheet, example photo or instruction PDF each location downloads,
+            fills in and sends back — so 41 outlets return the same shape instead of 41 layouts.
+        </small>
+        <?php else: ?>
+        <small class="text-muted">
+            Sample files need migrations/2026-09-09_data_collection_samples.sql — everything else works without it.
+        </small>
+        <?php endif; ?>
     </div>
 
     <div class="form-group">
@@ -1088,6 +1256,16 @@ function pageDataCollectionForm(): void {
 </form>
 <script>
 function dcTickAll(on){document.querySelectorAll('.dc-loc').forEach(function(c){c.checked=on;});}
+// Removing a sample must not carry the whole task form with it (and must
+// not nest a form inside one), so it posts its own.
+function dcDelSample(btn){
+    if(!confirm('Remove this sample file?')) return;
+    var f=document.createElement('form');
+    f.method='POST'; f.action='index.php';
+    f.innerHTML='<input type="hidden" name="action" value="dc_delete_sample">'
+              + '<input type="hidden" name="sample_id" value="'+parseInt(btn.value,10)+'">';
+    document.body.appendChild(f); f.submit();
+}
 </script>
 <?php
 }
@@ -1153,6 +1331,28 @@ function pageDataCollection(): void {
 
 <?php if (trim((string)($req['instructions'] ?? '')) !== ''): ?>
 <div class="alert alert-info" style="white-space:pre-wrap"><?= h($req['instructions']) ?></div>
+<?php endif; ?>
+
+<?php // The blank format the task hands out. Shown to everyone the task
+      // reached, above their own upload box, because taking this file and
+      // filling it in is the first step of answering.
+$samples = dcSamples($id);
+if ($samples): ?>
+<div class="table-wrap" style="padding:14px;margin-bottom:14px;border-left:3px solid var(--accent)">
+    <div style="font-size:13px;font-weight:600;margin-bottom:4px">
+        <?= count($samples) > 1 ? 'Sample / format files' : 'Sample / format file' ?>
+    </div>
+    <div class="text-muted" style="font-size:12px;margin-bottom:8px">
+        Download this, fill in your figures and upload it back below.
+    </div>
+    <?php foreach ($samples as $sf): ?>
+    <div style="display:flex;align-items:center;gap:8px;padding:5px 0">
+        <a href="?page=dc_sample&id=<?= (int)$sf['id'] ?>" class="btn btn-sm btn-secondary">Download</a>
+        <span style="flex:1 1 auto;word-break:break-all;font-size:13px"><?= h($sf['original_name']) ?></span>
+        <span class="text-muted" style="font-size:11px;white-space:nowrap"><?= h(dcFormatBytes((int)$sf['size_bytes'])) ?></span>
+    </div>
+    <?php endforeach; ?>
+</div>
 <?php endif; ?>
 
 <?php if ($manage): ?>

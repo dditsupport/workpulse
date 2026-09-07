@@ -461,7 +461,7 @@ function allowedPages(): array {
     // named here grants reaching the page, not the data on it.
     if (function_exists('dcCanUsePage') && dcCanUsePage()) {
         $pages = array_merge($pages, ['data_collections', 'data_collection',
-            'dc_file', 'dc_download_zip', 'dc_export_answers']);
+            'dc_file', 'dc_sample', 'dc_download_zip', 'dc_export_answers']);
     }
     if (function_exists('dcCanManage') && dcCanManage()) {
         $pages[] = 'data_collection_new';
@@ -983,6 +983,7 @@ function dispatchPage(string $page): void {
         case 'data_collection':     if (function_exists('pageDataCollection'))     pageDataCollection();     break;
         case 'data_collection_new': if (function_exists('pageDataCollectionForm')) pageDataCollectionForm(); break;
         case 'dc_file':             if (function_exists('dcServeFile'))            dcServeFile();            break;
+        case 'dc_sample':           if (function_exists('dcServeSample'))          dcServeSample();          break;
         case 'dc_download_zip':     if (function_exists('dcDownloadZip'))          dcDownloadZip();          break;
         case 'dc_export_answers':   if (function_exists('dcExportAnswers'))        dcExportAnswers();        break;
         // Inward barcode register
