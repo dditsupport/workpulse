@@ -14,7 +14,7 @@
 -- disk, rows out of the database, task row deleted. Nothing is kept, by
 -- design; the download is the record.
 --
--- Five tables:
+-- Seven tables:
 --   dc_requests          — one collection task. Several run at once and
 --                          none knows about the others.
 --   dc_request_locations — which outlets this task is asking.
@@ -22,6 +22,8 @@
 --                          uploads/data_collection/{request_id}/.
 --   dc_samples           — the blank format the task hands out, for the
 --                          outlets to fill in and send back.
+--   dc_questions         — the task's sub-questions, one box each.
+--   dc_answers           — an outlet's answer to one sub-question.
 --   dc_submissions       — one row per outlet: its answer text AND its
 --                          lock state. An outlet submits and can keep
 --                          changing what it sent; Operations confirms,
@@ -144,6 +146,44 @@ CREATE TABLE IF NOT EXISTS `dc_samples` (
   KEY `ix_dc_samples_request` (`request_id`),
   CONSTRAINT `dc_samples_ibfk_1`
     FOREIGN KEY (`request_id`) REFERENCES `dc_requests` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- One long question ("photo of every AC, and the sub-zero meters from a
+-- distance, no meter reading, and where every meter is zero send the old
+-- AC photos too") is read once and half-answered. Broken into numbered
+-- sub-questions, each with its own box, an outlet answers them one at a
+-- time and the report gets a column per question instead of a paragraph
+-- to re-read.
+--
+-- dc_requests.question stays as the task's main ask, with its own box;
+-- these are the extra ones under it. A task with none behaves exactly as
+-- it did before.
+CREATE TABLE IF NOT EXISTS `dc_questions` (
+  `id`            int(11)      NOT NULL AUTO_INCREMENT,
+  `request_id`    int(11)      NOT NULL,
+  `question_text` varchar(255) NOT NULL,
+  `sort_order`    int(11)      NOT NULL DEFAULT 0,
+  PRIMARY KEY (`id`),
+  KEY `ix_dc_questions_request` (`request_id`,`sort_order`),
+  CONSTRAINT `dc_questions_ibfk_1`
+    FOREIGN KEY (`request_id`) REFERENCES `dc_requests` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- One outlet's answer to one sub-question. question_id already implies the
+-- task, so there is no request_id to keep in step; deleting the task
+-- cascades through dc_questions to here.
+CREATE TABLE IF NOT EXISTS `dc_answers` (
+  `question_id`  int(11)     NOT NULL,
+  `location_id`  int(11)     NOT NULL,
+  `answer_text`  text        DEFAULT NULL,
+  `updated_by`   varchar(20) DEFAULT NULL,
+  `updated_at`   datetime    NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`question_id`,`location_id`),
+  KEY `ix_dc_answers_location` (`location_id`),
+  CONSTRAINT `dc_answers_ibfk_1`
+    FOREIGN KEY (`question_id`) REFERENCES `dc_questions` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `dc_answers_ibfk_2`
+    FOREIGN KEY (`location_id`) REFERENCES `locations` (`location_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 -- ── Permission ──────────────────────────────────────────

@@ -63,6 +63,15 @@ const DC_ALLOWED_MIME = [
     'heif' => ['image/heif', 'image/heic', 'application/octet-stream'],
 ];
 
+// What a browser will render inline. A sample photo is worth far more on
+// the page than in the downloads folder, so these are shown; a .xlsx is
+// still a download.
+const DC_RENDERABLE = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+
+function dcIsImage(?string $mime): bool {
+    return in_array((string)$mime, DC_RENDERABLE, true);
+}
+
 // ── Schema probe ────────────────────────────────────────
 // Every entry point checks this so an un-migrated database shows a
 // notice instead of a 500. Probed once per request.
@@ -139,9 +148,9 @@ function dcCanEditSubmission(array $req, int $locationId, ?array $sub): bool {
 //   nothing   — this outlet has sent neither a file nor an answer
 //   submitted — it has sent something and may still change it
 //   confirmed — Operations accepted it; it is locked
-function dcLocationState(?array $sub, int $fileCount): string {
+function dcLocationState(?array $sub, int $fileCount, bool $hasSubAnswers = false): string {
     if (($sub['status'] ?? '') === 'confirmed') return 'confirmed';
-    if ($fileCount > 0 || trim((string)($sub['answer_text'] ?? '')) !== '') return 'submitted';
+    if ($fileCount > 0 || $hasSubAnswers || trim((string)($sub['answer_text'] ?? '')) !== '') return 'submitted';
     return 'nothing';
 }
 
@@ -166,11 +175,22 @@ function dcStateLabel(string $state): string {
 // agree with dcLocationState() above. $s is the alias of dc_submissions
 // and $rl the alias carrying request_id / location_id.
 function dcSubmittedSql(string $s = 's', string $rl = 'rl'): string {
+    // A task can ask only sub-questions, so a filled box there is a
+    // submission on its own. Left out entirely when those tables are not
+    // there yet, so the fragment stays valid SQL on an older database.
+    $subAnswers = dcQuestionsReady()
+        ? " OR EXISTS (SELECT 1 FROM dc_answers a
+                         JOIN dc_questions q ON q.id = a.question_id
+                        WHERE q.request_id  = {$rl}.request_id
+                          AND a.location_id = {$rl}.location_id
+                          AND TRIM(COALESCE(a.answer_text, '')) <> '')"
+        : '';
     return "({$s}.status = 'confirmed'
              OR TRIM(COALESCE({$s}.answer_text, '')) <> ''
              OR EXISTS (SELECT 1 FROM dc_files f
                          WHERE f.request_id = {$rl}.request_id
-                           AND f.location_id = {$rl}.location_id))";
+                           AND f.location_id = {$rl}.location_id)
+             {$subAnswers})";
 }
 
 // ── Lookups ─────────────────────────────────────────────
@@ -289,6 +309,63 @@ function dcSafeName(string $s): string {
     $s = preg_replace('/[\x00-\x1F\x7F]/', '', $s);
     $s = trim((string)$s, " .\t");
     return $s === '' ? 'unnamed' : mb_substr($s, 0, 120);
+}
+
+// Sub-questions arrived after the first release too, so the pair of
+// tables is probed on its own: a database with only the earlier
+// migrations keeps working with the single answer box.
+function dcQuestionsReady(): bool {
+    static $ready = null;
+    if ($ready !== null) return $ready;
+    try {
+        getDb()->query('SELECT 1 FROM dc_questions LIMIT 0')->fetch();
+        getDb()->query('SELECT 1 FROM dc_answers LIMIT 0')->fetch();
+        $ready = true;
+    } catch (Exception $e) {
+        $ready = false;
+    }
+    return $ready;
+}
+
+// The task's sub-questions, in the order they were written.
+function dcQuestions(int $requestId): array {
+    if (!dcQuestionsReady()) return [];
+    try {
+        $st = getDb()->prepare('SELECT * FROM dc_questions WHERE request_id = ? ORDER BY sort_order, id');
+        $st->execute([$requestId]);
+        return $st->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) {
+        return [];
+    }
+}
+
+// [location_id => [question_id => answer_text]] for one task.
+function dcAnswers(int $requestId): array {
+    if (!dcQuestionsReady()) return [];
+    try {
+        $st = getDb()->prepare(
+            'SELECT a.question_id, a.location_id, a.answer_text
+               FROM dc_answers a
+               JOIN dc_questions q ON q.id = a.question_id
+              WHERE q.request_id = ?');
+        $st->execute([$requestId]);
+        $out = [];
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $out[(int)$r['location_id']][(int)$r['question_id']] = (string)$r['answer_text'];
+        }
+        return $out;
+    } catch (Exception $e) {
+        return [];
+    }
+}
+
+// Has this outlet written anything into the sub-question boxes? Counts as
+// content, so a task that asks only questions can still be submitted.
+function dcHasSubAnswers(array $answersForLocation): bool {
+    foreach ($answersForLocation as $txt) {
+        if (trim((string)$txt) !== '') return true;
+    }
+    return false;
 }
 
 // Sample files arrived after the first release, so the table is probed
@@ -447,6 +524,8 @@ function doDcSaveRequest(): void {
         $ins = $db->prepare('INSERT INTO dc_request_locations (request_id, location_id) VALUES (?,?)');
         foreach ($final as $lid) $ins->execute([$id, $lid]);
 
+        dcSaveQuestions($id);
+
         // Sample files ride along with the task form, so a new task can be
         // created and given its format in one go.
         $sampleMsg = dcSaveSamples($id);
@@ -463,6 +542,49 @@ function doDcSaveRequest(): void {
         header("Location: {$form}"); exit;
     }
     header('Location: index.php?page=data_collection&id=' . $id); exit;
+}
+
+// Rewrite the task's sub-questions from the form. Rows arrive as parallel
+// arrays: sq_id[] carries 0 for a new row and the existing id for one
+// being edited, sq_text[] the wording. A row cleared to blank is deleted,
+// and its answers go with it — the only way to lose an answer, and it
+// takes deliberately emptying the question to do it.
+function dcSaveQuestions(int $requestId): void {
+    if (!dcQuestionsReady()) return;
+    $ids   = array_map('intval', (array)($_POST['sq_id'] ?? []));
+    $texts = (array)($_POST['sq_text'] ?? []);
+    if (!$ids && !$texts) return;
+
+    $db   = getDb();
+    $keep = [];
+    $ins  = $db->prepare('INSERT INTO dc_questions (request_id, question_text, sort_order) VALUES (?,?,?)');
+    $upd  = $db->prepare('UPDATE dc_questions SET question_text = ?, sort_order = ? WHERE id = ? AND request_id = ?');
+    $order = 0;
+    foreach ($texts as $i => $raw) {
+        $text = trim((string)$raw);
+        $qid  = (int)($ids[$i] ?? 0);
+        if ($text === '') continue;                    // blank row: drop it
+        $order++;
+        try {
+            if ($qid > 0) {
+                $upd->execute([mb_substr($text, 0, 255), $order, $qid, $requestId]);
+                $keep[] = $qid;
+            } else {
+                $ins->execute([$requestId, mb_substr($text, 0, 255), $order]);
+                $keep[] = (int)$db->lastInsertId();
+            }
+        } catch (Exception $e) { /* one bad row must not lose the rest */ }
+    }
+    // Anything not in the form any more is gone on purpose.
+    try {
+        $existing = $db->prepare('SELECT id FROM dc_questions WHERE request_id = ?');
+        $existing->execute([$requestId]);
+        foreach ($existing->fetchAll(PDO::FETCH_COLUMN) as $old) {
+            if (!in_array((int)$old, $keep, true)) {
+                $db->prepare('DELETE FROM dc_questions WHERE id = ?')->execute([(int)$old]);
+            }
+        }
+    } catch (Exception $e) { }
 }
 
 // Store whatever came up in the task form's sample picker. Returns a
@@ -597,9 +719,35 @@ function doDcSubmit(): void {
         }
     }
 
+    // ── Sub-question answers ──
+    // Each box posts under its own question id. A cleared box clears the
+    // stored answer rather than leaving yesterday's text behind.
+    $subFilled = false;
+    if (dcQuestionsReady() && isset($_POST['sub_answers']) && is_array($_POST['sub_answers'])) {
+        $valid = [];
+        foreach (dcQuestions($id) as $q) $valid[(int)$q['id']] = true;
+        $up = getDb()->prepare(
+            'INSERT INTO dc_answers (question_id, location_id, answer_text, updated_by, updated_at)
+             VALUES (?,?,?,?,NOW())
+             ON DUPLICATE KEY UPDATE answer_text = VALUES(answer_text),
+                                     updated_by  = VALUES(updated_by),
+                                     updated_at  = NOW()');
+        foreach ($_POST['sub_answers'] as $qid => $txt) {
+            $qid = (int)$qid;
+            if (!isset($valid[$qid])) continue;            // not this task's question
+            $txt = trim((string)$txt);
+            if (mb_strlen($txt) > DC_MAX_ANSWER) $txt = mb_substr($txt, 0, DC_MAX_ANSWER);
+            if ($txt !== '') $subFilled = true;
+            try {
+                $up->execute([$qid, $loc, ($txt === '' ? null : $txt), myCode()]);
+            } catch (Exception $e) { /* one bad box must not lose the rest */ }
+        }
+    }
+
     // A save that adds nothing and says nothing is a mistake, not a submission.
     $existingFiles = count(dcFilesByLocation($id)[$loc] ?? []);
-    if ($saved === 0 && $answer === '' && $existingFiles === 0) {
+    $existingSub   = dcHasSubAnswers(dcAnswers($id)[$loc] ?? []);
+    if ($saved === 0 && $answer === '' && $existingFiles === 0 && !$subFilled && !$existingSub) {
         flash('error', 'Attach a file or write an answer before submitting.'
             . ($skipped ? ' Skipped: ' . implode('; ', $skipped) : ''));
         header("Location: {$back}"); exit;
@@ -655,13 +803,15 @@ function doDcConfirm(): void {
     }
 
     $subs   = dcSubmissions($id);
-    $files  = dcFilesByLocation($id)[$loc] ?? [];
-    $answer = trim((string)($subs[$loc]['answer_text'] ?? ''));
+    $files    = dcFilesByLocation($id)[$loc] ?? [];
+    $answer   = trim((string)($subs[$loc]['answer_text'] ?? ''));
+    // A filled sub-question box is an answer like any other.
+    $answered = $answer !== '' || dcHasSubAnswers(dcAnswers($id)[$loc] ?? []);
     if ((int)$req['requires_file'] === 1 && !$files) {
         flash('error', 'This task asks for a file and this location has not sent one — nothing to confirm.');
         header("Location: {$back}"); exit;
     }
-    if (!$files && $answer === '') {
+    if (!$files && !$answered) {
         flash('error', 'This location has sent nothing yet — nothing to confirm.');
         header("Location: {$back}"); exit;
     }
@@ -693,12 +843,14 @@ function doDcConfirmAll(): void {
         header("Location: {$back}"); exit;
     }
 
-    $subs  = dcSubmissions($id);
-    $byLoc = dcFilesByLocation($id);
-    $done  = 0;
+    $subs    = dcSubmissions($id);
+    $byLoc   = dcFilesByLocation($id);
+    $answers = dcAnswers($id);
+    $done    = 0;
     foreach (dcRequestLocationIds($id) as $lid) {
         $files = $byLoc[$lid] ?? [];
-        if (dcLocationState($subs[$lid] ?? null, count($files)) !== 'submitted') continue;
+        if (dcLocationState($subs[$lid] ?? null, count($files),
+                            dcHasSubAnswers($answers[$lid] ?? [])) !== 'submitted') continue;
         if ((int)$req['requires_file'] === 1 && !$files) continue;
         if (dcConfirmOne($id, $lid)) $done++;
     }
@@ -855,11 +1007,16 @@ function dcServeSample(): void {
     $path = dcFileDir($id) . $row['stored_name'];
     if (!is_file($path)) { http_response_code(404); echo 'File missing'; return; }
 
+    // ?inline=1 on an image is the page previewing it; everything else is
+    // a download. nosniff means a mislabelled file cannot be talked into
+    // running as script either way.
+    $inline = !empty($_GET['inline']) && dcIsImage($row['mime_type']);
     header('Content-Type: ' . ($row['mime_type'] ?: 'application/octet-stream'));
     header('X-Content-Type-Options: nosniff');
-    header('Content-Disposition: attachment; filename="' . str_replace('"', '', (string)$row['original_name']) . '"');
+    header('Content-Disposition: ' . ($inline ? 'inline' : 'attachment')
+         . '; filename="' . str_replace('"', '', (string)$row['original_name']) . '"');
     header('Content-Length: ' . (int)filesize($path));
-    header('Cache-Control: private, no-store');
+    header('Cache-Control: private, max-age=300');
     readfile($path);
     exit;
 }
@@ -869,31 +1026,40 @@ function dcServeSample(): void {
 // not answer" is half of what this sheet is read for. The question is the
 // answer column's header, so the file reads as a finished sheet.
 function dcAnswersCsvString(array $req, array $locIds): string {
-    $names  = dcLocationNames();
-    $subs   = dcSubmissions((int)$req['id']);
-    $byLoc  = dcFilesByLocation((int)$req['id']);
-    $out    = fopen('php://temp', 'r+');
+    $names   = dcLocationNames();
+    $subs    = dcSubmissions((int)$req['id']);
+    $byLoc   = dcFilesByLocation((int)$req['id']);
+    $subQs   = dcQuestions((int)$req['id']);
+    $answers = dcAnswers((int)$req['id']);
+    $out     = fopen('php://temp', 'r+');
     fwrite($out, "\xEF\xBB\xBF");
     fputcsv($out, ['Task', $req['title']], escape: '');
     fputcsv($out, ['Downloaded', date('d M Y H:i')], escape: '');
     fputcsv($out, [], escape: '');
-    fputcsv($out, ['Location', 'Status', dcQuestionLabel($req), 'Filed by', 'When', 'Files'], escape: '');
+    // Each question is its own column, headed by the question itself, so the
+    // sheet can be read and sorted without going back to the app.
+    $head = ['Location', 'Status', dcQuestionLabel($req)];
+    foreach ($subQs as $q) $head[] = (string)$q['question_text'];
+    $head[] = 'Filed by'; $head[] = 'When'; $head[] = 'Files';
+    fputcsv($out, $head, escape: '');
 
     foreach ($locIds as $lid) {
         $sub   = $subs[$lid] ?? null;
         $files = $byLoc[$lid] ?? [];
-        $state = dcLocationState($sub, count($files));
+        $state = dcLocationState($sub, count($files), dcHasSubAnswers($answers[$lid] ?? []));
         $who   = (string)($sub['confirmed_name'] ?? $sub['confirmed_by'] ?? $sub['updated_name'] ?? $sub['updated_by'] ?? '');
         if ($who !== '' && (int)($sub['on_behalf'] ?? 0) === 1) $who .= ' (on behalf)';
         $when  = (string)($sub['confirmed_at'] ?? $sub['updated_at'] ?? '');
-        fputcsv($out, [
+        $row = [
             $names[$lid] ?? ('#' . $lid),
             dcStateLabel($state),
             (string)($sub['answer_text'] ?? ''),
-            $who,
-            $when !== '' ? date('d M Y H:i', strtotime($when)) : '',
-            count($files),
-        ], escape: '');
+        ];
+        foreach ($subQs as $q) $row[] = (string)($answers[$lid][(int)$q['id']] ?? '');
+        $row[] = $who;
+        $row[] = $when !== '' ? date('d M Y H:i', strtotime($when)) : '';
+        $row[] = count($files);
+        fputcsv($out, $row, escape: '');
     }
     rewind($out);
     $csv = (string)stream_get_contents($out);
@@ -994,10 +1160,20 @@ function dcMyStates(): array {
     $mine = array_keys(dcMyLocations());
     if (!$mine || !dcSchemaReady()) return [];
     $in = implode(',', array_fill(0, count($mine), '?'));
+    // Sub-question answers count as a submission, but only ask for them on a
+    // database that has the tables.
+    $hasSub = dcQuestionsReady()
+        ? "EXISTS (SELECT 1 FROM dc_answers a
+                     JOIN dc_questions q ON q.id = a.question_id
+                    WHERE q.request_id  = rl.request_id
+                      AND a.location_id = rl.location_id
+                      AND TRIM(COALESCE(a.answer_text, '')) <> '')"
+        : '0';
     $st = getDb()->prepare(
         "SELECT rl.request_id, rl.location_id, s.status, s.answer_text,
                 (SELECT COUNT(*) FROM dc_files f
-                  WHERE f.request_id = rl.request_id AND f.location_id = rl.location_id) AS file_count
+                  WHERE f.request_id = rl.request_id AND f.location_id = rl.location_id) AS file_count,
+                {$hasSub} AS has_sub
            FROM dc_request_locations rl
       LEFT JOIN dc_submissions s
              ON s.request_id = rl.request_id AND s.location_id = rl.location_id
@@ -1005,8 +1181,10 @@ function dcMyStates(): array {
     $st->execute($mine);
     $out = [];
     foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
-        $out[(int)$r['request_id']][(int)$r['location_id']] =
-            dcLocationState(['status' => $r['status'], 'answer_text' => $r['answer_text']], (int)$r['file_count']);
+        $out[(int)$r['request_id']][(int)$r['location_id']] = dcLocationState(
+            ['status' => $r['status'], 'answer_text' => $r['answer_text']],
+            (int)$r['file_count'],
+            (bool)(int)$r['has_sub']);
     }
     return $out;
 }
@@ -1190,6 +1368,28 @@ function pageDataCollectionForm(): void {
         <small class="text-muted">Printed above the answer box each location fills in. Leave blank to just ask for a remark.</small>
     </div>
 
+    <?php if (dcQuestionsReady()): $subQs = $req ? dcQuestions((int)$req['id']) : []; ?>
+    <div class="form-group">
+        <label>Sub-questions</label>
+        <small class="text-muted" style="display:block;margin-bottom:6px">
+            Break a long ask into separate questions — each one gets its own answer box for the
+            location to fill in, and its own column in the answers sheet. Clear a line to delete it.
+        </small>
+        <div id="dcSubQs">
+            <?php foreach ($subQs as $n => $q): ?>
+            <div class="dc-sq-row" style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+                <span class="text-muted" style="font-size:12px;width:18px;text-align:right"><?= $n + 1 ?>.</span>
+                <input type="hidden" name="sq_id[]" value="<?= (int)$q['id'] ?>">
+                <input type="text" name="sq_text[]" class="form-control" maxlength="255" style="flex:1 1 auto"
+                       value="<?= h($q['question_text']) ?>">
+                <button type="button" class="btn btn-ghost btn-sm" onclick="dcDropSq(this)">&times;</button>
+            </div>
+            <?php endforeach; ?>
+        </div>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="dcAddSq()">+ Add a question</button>
+    </div>
+    <?php endif; ?>
+
     <div class="form-group">
         <label>Instructions</label>
         <textarea name="instructions" class="form-control" rows="3"
@@ -1204,6 +1404,10 @@ function pageDataCollectionForm(): void {
         <div style="margin-bottom:6px">
             <?php foreach ($samples as $sf): ?>
             <div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">
+                <?php if (dcIsImage($sf['mime_type'])): ?>
+                <img src="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1" alt=""
+                     style="height:38px;width:38px;object-fit:cover;border-radius:4px;border:1px solid var(--border)">
+                <?php endif; ?>
                 <a href="?page=dc_sample&id=<?= (int)$sf['id'] ?>" style="flex:1 1 auto;word-break:break-all"><?= h($sf['original_name']) ?></a>
                 <span class="text-muted" style="font-size:11px;white-space:nowrap"><?= h(dcFormatBytes((int)$sf['size_bytes'])) ?></span>
                 <button type="button" class="btn btn-ghost btn-sm"
@@ -1256,6 +1460,28 @@ function pageDataCollectionForm(): void {
 </form>
 <script>
 function dcTickAll(on){document.querySelectorAll('.dc-loc').forEach(function(c){c.checked=on;});}
+// Sub-question rows. A new row carries id 0; the server tells new from
+// edited by that, and treats a row left blank as deleted.
+function dcAddSq(){
+    var box=document.getElementById('dcSubQs');
+    var row=document.createElement('div');
+    row.className='dc-sq-row';
+    row.style.cssText='display:flex;gap:6px;align-items:center;margin-bottom:6px';
+    row.innerHTML='<span class="text-muted" style="font-size:12px;width:18px;text-align:right"></span>'
+      +'<input type="hidden" name="sq_id[]" value="0">'
+      +'<input type="text" name="sq_text[]" class="form-control" maxlength="255" style="flex:1 1 auto" '
+      +'placeholder="e.g. How many ACs are in the outlet?">'
+      +'<button type="button" class="btn btn-ghost btn-sm" onclick="dcDropSq(this)">&times;</button>';
+    box.appendChild(row);
+    dcNumberSq();
+    row.querySelector('input[type=text]').focus();
+}
+function dcDropSq(btn){ btn.closest('.dc-sq-row').remove(); dcNumberSq(); }
+function dcNumberSq(){
+    document.querySelectorAll('#dcSubQs .dc-sq-row').forEach(function(r,i){
+        r.querySelector('span').textContent=(i+1)+'.';
+    });
+}
 // Removing a sample must not carry the whole task form with it (and must
 // not nest a form inside one), so it posts its own.
 function dcDelSample(btn){
@@ -1292,10 +1518,12 @@ function pageDataCollection(): void {
         return;
     }
 
-    $names = dcLocationNames();
-    $subs  = dcSubmissions($id);
-    $byLoc = dcFilesByLocation($id);
-    $isOpen = $req['status'] === 'open';
+    $names   = dcLocationNames();
+    $subs    = dcSubmissions($id);
+    $byLoc   = dcFilesByLocation($id);
+    $subQs   = dcQuestions($id);
+    $answers = dcAnswers($id);
+    $isOpen  = $req['status'] === 'open';
 
     // Which locations may this user file for, and which one is on screen.
     $submitLocs = $manage ? $targets : $myHere;
@@ -1306,12 +1534,22 @@ function pageDataCollection(): void {
     // Operations has accepted (the lock).
     $confirmed = 0; $sentHere = 0;
     foreach ($targets as $lid) {
-        $st = dcLocationState($subs[$lid] ?? null, count($byLoc[$lid] ?? []));
+        $st = dcLocationState($subs[$lid] ?? null, count($byLoc[$lid] ?? []),
+                              dcHasSubAnswers($answers[$lid] ?? []));
         if ($st === 'confirmed') $confirmed++;
         if ($st !== 'nothing')   $sentHere++;
     }
     $outstanding = count($targets) - $sentHere;   // still to send
 ?>
+<style>
+/* A question has to read as a question, not as a caption under the file
+   hint — that is exactly how the first version lost it. */
+.dc-q{font-size:13px;font-weight:600;color:var(--text);line-height:1.45;margin-bottom:6px;
+      padding:7px 10px;background:rgba(26,143,227,.10);border-left:3px solid var(--accent);border-radius:0 5px 5px 0}
+.dc-q-n{display:inline-block;min-width:18px;color:var(--accent);font-weight:700}
+.dc-a{white-space:pre-wrap;font-size:13px;padding:8px 10px;border:1px solid var(--border);border-radius:6px}
+.dc-sample-thumb{max-height:150px;max-width:100%;border:1px solid var(--border);border-radius:6px;display:block}
+</style>
 <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
     <div>
         <h2 style="margin:0 0 4px"><?= h($req['title']) ?></h2>
@@ -1330,7 +1568,10 @@ function pageDataCollection(): void {
 </div>
 
 <?php if (trim((string)($req['instructions'] ?? '')) !== ''): ?>
-<div class="alert alert-info" style="white-space:pre-wrap"><?= h($req['instructions']) ?></div>
+<div class="alert alert-info">
+    <div style="font-weight:600;margin-bottom:4px">Instructions</div>
+    <div style="white-space:pre-wrap"><?= h($req['instructions']) ?></div>
+</div>
 <?php endif; ?>
 
 <?php // The blank format the task hands out. Shown to everyone the task
@@ -1351,6 +1592,15 @@ if ($samples): ?>
         <span style="flex:1 1 auto;word-break:break-all;font-size:13px"><?= h($sf['original_name']) ?></span>
         <span class="text-muted" style="font-size:11px;white-space:nowrap"><?= h(dcFormatBytes((int)$sf['size_bytes'])) ?></span>
     </div>
+    <?php if (dcIsImage($sf['mime_type'])): ?>
+    <?php // An example photo says in one look what the words take a paragraph
+          // to say, so it is shown here rather than left as a download. ?>
+    <a href="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1" target="_blank" rel="noopener"
+       style="display:inline-block;margin:2px 0 8px">
+        <img src="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1" class="dc-sample-thumb"
+             alt="<?= h($sf['original_name']) ?>" loading="lazy">
+    </a>
+    <?php endif; ?>
     <?php endforeach; ?>
 </div>
 <?php endif; ?>
@@ -1431,9 +1681,10 @@ document.addEventListener('keydown',function(e){
 if ($selected > 0):
     $sub      = $subs[$selected] ?? null;
     $myFiles  = $byLoc[$selected] ?? [];
-    $state    = dcLocationState($sub, count($myFiles));
-    $canEdit  = dcCanEditSubmission($req, $selected, $sub);
-    $onBehalf = !isset($mine[$selected]);
+    $state     = dcLocationState($sub, count($myFiles), dcHasSubAnswers($answers[$selected] ?? []));
+    $canEdit   = dcCanEditSubmission($req, $selected, $sub);
+    $onBehalf  = !isset($mine[$selected]);
+    $myAnswers = $answers[$selected] ?? [];
 ?>
 <div class="table-wrap" style="padding:16px;margin-bottom:14px">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
@@ -1448,7 +1699,8 @@ if ($selected > 0):
         <label style="font-size:12px;font-weight:600;color:var(--muted)">Location</label>
         <select name="loc" class="form-control" style="max-width:280px" onchange="this.form.submit()">
             <?php foreach ($submitLocs as $lid):
-                $s = dcLocationState($subs[$lid] ?? null, count($byLoc[$lid] ?? [])); ?>
+                $s = dcLocationState($subs[$lid] ?? null, count($byLoc[$lid] ?? []),
+                                     dcHasSubAnswers($answers[$lid] ?? [])); ?>
             <option value="<?= $lid ?>" <?= $lid === $selected ? 'selected' : '' ?>>
                 <?= h($names[$lid] ?? ('#' . $lid)) ?> — <?= h(dcStateLabel($s)) ?>
             </option>
@@ -1496,6 +1748,24 @@ if ($selected > 0):
         <input type="hidden" name="action" value="dc_submit">
         <input type="hidden" name="request_id" value="<?= $id ?>">
         <input type="hidden" name="location_id" value="<?= $selected ?>">
+
+        <?php // The questions come before the file picker: they are what the
+              // files are meant to show, and a question printed under the
+              // upload hint reads as part of that hint. ?>
+        <div class="form-group">
+            <div class="dc-q"><?= h(dcQuestionLabel($req)) ?></div>
+            <textarea name="answer_text" class="form-control" rows="3" maxlength="<?= DC_MAX_ANSWER ?>"
+                      placeholder="Type your answer here"><?= h((string)($sub['answer_text'] ?? '')) ?></textarea>
+        </div>
+
+        <?php foreach ($subQs as $n => $q): $qid = (int)$q['id']; ?>
+        <div class="form-group">
+            <div class="dc-q"><span class="dc-q-n"><?= $n + 1 ?></span><?= h($q['question_text']) ?></div>
+            <textarea name="sub_answers[<?= $qid ?>]" class="form-control" rows="2" maxlength="<?= DC_MAX_ANSWER ?>"
+                      placeholder="Type your answer here"><?= h((string)($myAnswers[$qid] ?? '')) ?></textarea>
+        </div>
+        <?php endforeach; ?>
+
         <div class="form-group">
             <label>Files<?= (int)$req['requires_file'] ? ' <span class="required">*</span>' : '' ?></label>
             <input type="file" name="files[]" class="form-control" multiple style="width:100%">
@@ -1503,11 +1773,6 @@ if ($selected > 0):
                 Excel, CSV, PDF, Word or photos · up to <?= (int)(DC_MAX_BYTES / 1024 / 1024) ?> MB each ·
                 pick several at once<?= (int)$req['requires_file'] ? '' : ' · optional for this task' ?>
             </small>
-        </div>
-        <div class="form-group">
-            <label><?= h(dcQuestionLabel($req)) ?></label>
-            <textarea name="answer_text" class="form-control" rows="3" maxlength="<?= DC_MAX_ANSWER ?>"
-                      placeholder="Type your answer here"><?= h((string)($sub['answer_text'] ?? '')) ?></textarea>
         </div>
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
             <button type="submit" class="btn btn-primary">Submit</button>
@@ -1546,11 +1811,19 @@ if ($selected > 0):
     <?php endif; ?>
     <?php else: ?>
     <div class="form-group">
-        <label><?= h(dcQuestionLabel($req)) ?></label>
-        <div style="white-space:pre-wrap;font-size:13px;padding:8px;border:1px solid var(--border);border-radius:6px">
+        <div class="dc-q"><?= h(dcQuestionLabel($req)) ?></div>
+        <div class="dc-a">
             <?= trim((string)($sub['answer_text'] ?? '')) !== '' ? h((string)$sub['answer_text']) : '<span class="text-muted">No answer written.</span>' ?>
         </div>
     </div>
+    <?php foreach ($subQs as $n => $q): $qid = (int)$q['id']; ?>
+    <div class="form-group">
+        <div class="dc-q"><span class="dc-q-n"><?= $n + 1 ?></span><?= h($q['question_text']) ?></div>
+        <div class="dc-a">
+            <?= trim((string)($myAnswers[$qid] ?? '')) !== '' ? h((string)$myAnswers[$qid]) : '<span class="text-muted">No answer written.</span>' ?>
+        </div>
+    </div>
+    <?php endforeach; ?>
     <?php endif; ?>
 </div>
 <?php endif; // submit card ?>
@@ -1577,7 +1850,7 @@ if ($selected > 0):
         <tr>
             <th style="width:190px">Location</th>
             <th style="width:110px">Status</th>
-            <th><?= h(dcQuestionLabel($req)) ?></th>
+            <th><?= h(dcQuestionLabel($req)) ?><?= $subQs ? ' <span class="text-muted" style="font-weight:400">+ ' . count($subQs) . ' more</span>' : '' ?></th>
             <th style="width:240px">Files</th>
             <th style="width:170px">Filed by</th>
             <th style="width:150px"></th>
@@ -1589,7 +1862,7 @@ if ($selected > 0):
     <?php else: foreach ($targets as $lid):
         $sub   = $subs[$lid] ?? null;
         $files = $byLoc[$lid] ?? [];
-        $state = dcLocationState($sub, count($files));
+        $state = dcLocationState($sub, count($files), dcHasSubAnswers($answers[$lid] ?? []));
         $who   = (string)($sub['confirmed_name'] ?? '') ?: (string)($sub['confirmed_by'] ?? '');
         if ($who === '') $who = (string)($sub['updated_name'] ?? '') ?: (string)($sub['updated_by'] ?? '');
         $when  = (string)($sub['confirmed_at'] ?? '') ?: (string)($sub['updated_at'] ?? '');
@@ -1597,8 +1870,16 @@ if ($selected > 0):
         <tr>
             <td><?= h($names[$lid] ?? ('#' . $lid)) ?></td>
             <td><?= dcStateBadge($state) ?></td>
-            <td style="white-space:pre-wrap;font-size:12px">
-                <?= trim((string)($sub['answer_text'] ?? '')) !== '' ? h((string)$sub['answer_text']) : '<span class="text-muted">—</span>' ?>
+            <td style="font-size:12px">
+                <div style="white-space:pre-wrap">
+                    <?= trim((string)($sub['answer_text'] ?? '')) !== '' ? h((string)$sub['answer_text']) : '<span class="text-muted">—</span>' ?>
+                </div>
+                <?php foreach ($subQs as $n => $q): $a = trim((string)($answers[$lid][(int)$q['id']] ?? '')); ?>
+                <div style="margin-top:6px">
+                    <div class="text-muted" style="font-size:11px"><?= $n + 1 ?>. <?= h($q['question_text']) ?></div>
+                    <div style="white-space:pre-wrap"><?= $a !== '' ? h($a) : '<span class="text-muted">—</span>' ?></div>
+                </div>
+                <?php endforeach; ?>
             </td>
             <td style="font-size:12px">
                 <?php if (!$files): ?>

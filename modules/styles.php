@@ -76,6 +76,9 @@ body{font-family:'Segoe UI',sans-serif;font-size:14px;background:var(--bg);color
 .alert{padding:11px 15px;border-radius:6px;margin-bottom:18px;font-size:13px}
 .alert-success{background:rgba(39,174,96,.1);color:var(--green);border:1px solid rgba(39,174,96,.25)}
 .alert-error{background:rgba(220,64,64,.1);color:var(--red);border:1px solid rgba(220,64,64,.25)}
+/* .alert-info was used by four modules but never had a rule, so an
+   instruction panel rendered as bare text on the page background. */
+.alert-info{background:rgba(26,143,227,.10);color:var(--text);border:1px solid rgba(26,143,227,.30)}
 /* Forms */
 .form-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:22px;max-width:800px}
 .form-grid{display:grid;grid-template-columns:1fr 1fr;gap:15px;margin-bottom:4px}
