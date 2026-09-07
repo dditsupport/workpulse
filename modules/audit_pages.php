@@ -203,7 +203,21 @@ function pageAuditList(): void {
 
     <?php if (!$viewClicked): ?>
     <div class="rpt-prompt">Choose filters above and click <strong>View</strong> to load results.</div>
-    <?php else: ?>
+    <?php else:
+        // One block per template, each still newest-first inside itself —
+        // the query's order is preserved, only the rows are bucketed. A
+        // template with nothing in the window simply has no block.
+        $byTemplate = [];
+        foreach ($rows as $a) {
+            $byTemplate[(string)($a['template_name'] ?? '—')][] = $a;
+        }
+        ksort($byTemplate, SORT_NATURAL | SORT_FLAG_CASE);
+    ?>
+    <div class="table-count" style="margin:0 0 8px">
+        <strong><?= count($rows) ?></strong> audit(s)<?= count($byTemplate) > 1
+            ? ' across ' . count($byTemplate) . ' templates' : '' ?>
+        <?= count($rows) >= 500 ? ' — showing the first 500; narrow the dates to see the rest' : '' ?>
+    </div>
     <div class="table-wrap" data-stack>
         <table class="table">
             <thead>
@@ -216,7 +230,14 @@ function pageAuditList(): void {
             <tbody>
             <?php if (!$rows): ?>
                 <tr><td colspan="11" class="empty-row">No audits found.</td></tr>
-            <?php else: foreach ($rows as $a): ?>
+            <?php else: foreach ($byTemplate as $tplName => $tplRows): ?>
+                <tr class="audit-tpl-group">
+                    <td colspan="11">
+                        <?= h($tplName) ?>
+                        <span class="audit-tpl-count"><?= count($tplRows) ?> audit(s)</span>
+                    </td>
+                </tr>
+                <?php foreach ($tplRows as $a): ?>
                 <tr>
                     <td data-label="Audit #"><code><?= h($a['audit_number']) ?></code></td>
                     <td data-label="Date"><?= h($a['audit_date']) ?></td>
@@ -265,11 +286,11 @@ function pageAuditList(): void {
                         <?php endif; ?>
                     </td>
                 </tr>
+                <?php endforeach; ?>
             <?php endforeach; endif; ?>
             </tbody>
         </table>
     </div>
-    <div class="table-count"><?= count($rows) ?> audit(s)</div>
     <?php endif; ?>
     <?php
 }
