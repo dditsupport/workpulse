@@ -9,6 +9,14 @@ function roleLabel(): string {
     return h(myName());
 }
 
+// Sidebar label for Data Collection. A store user with open tasks gets the
+// count beside it — the label is echoed raw by the renderer, so the badge
+// markup belongs here rather than in the template.
+function dcNavLabel(): string {
+    $n = function_exists('dcOutstandingForMe') ? dcOutstandingForMe() : 0;
+    return 'Data Collection' . ($n > 0 ? ' <span class="badge badge-yellow">' . $n . '</span>' : '');
+}
+
 // Returns nav as a list of groups. Each entry is
 //   ['group' => 'Label', 'items' => [...]]
 // where items have the usual ['page','icon','label'] shape. The renderer
@@ -70,6 +78,7 @@ function buildNav(): array {
             ['page' => 'location_managers',    'icon' => navIcon('locations'), 'label' => 'Manager Mapping'],
             ['page' => 'transactions',         'icon' => navIcon('summary'), 'label' => 'Banking Cash Deposit'],
             ['page' => 'transactions_report',  'icon' => navIcon('report'),  'label' => 'Banking Cash Deposit Report'],
+            ['page' => 'data_collections',     'icon' => navIcon('audit_create'), 'label' => dcNavLabel()],
         ]],
         ['group' => 'Policy & Violation', 'items' => [
             ['page' => 'policies',                'icon' => navIcon('audit_list'),  'label' => 'Policies'],
@@ -207,6 +216,14 @@ function buildNav(): array {
     // the report page is gated by txn_transactions_report.
     if ($locOwner) $store[] = ['page' => 'transactions', 'icon' => navIcon('summary'), 'label' => 'Banking Cash Deposit'];
     if (hasTxn('transactions_report')) $store[] = ['page' => 'transactions_report', 'icon' => navIcon('report'), 'label' => 'Banking Cash Deposit Report'];
+
+    // Data Collection — one entry for both sides of the drive: Operations
+    // (txn_data_collect) starts and downloads tasks, a store user sees the
+    // ones their outlet has been asked for. The label carries a count of
+    // what is still outstanding for them.
+    if (function_exists('dcCanUsePage') && dcCanUsePage()) {
+        $store[] = ['page' => 'data_collections', 'icon' => navIcon('audit_create'), 'label' => dcNavLabel()];
+    }
 
     // Policy & Violation — combined nav group.
     // Policies are visible to every employee (the list filters itself by audience).
@@ -438,6 +455,16 @@ function allowedPages(): array {
     $pages[] = 'download_txn_attachment';
     if (isSuperadmin() || hasTxn('transactions_report')) {
         $pages[] = 'export_transactions_report';
+    }
+    // Data Collection — the list is the nav entry; these are its sub-pages.
+    // Every one of them re-checks who may see the task server-side, so being
+    // named here grants reaching the page, not the data on it.
+    if (function_exists('dcCanUsePage') && dcCanUsePage()) {
+        $pages = array_merge($pages, ['data_collections', 'data_collection',
+            'dc_file', 'dc_download_zip', 'dc_export_answers']);
+    }
+    if (function_exists('dcCanManage') && dcCanManage()) {
+        $pages[] = 'data_collection_new';
     }
     $pages[] = 'sl_image';
     if (isSuperadmin() || hasTxn('shelf_life_upload')) {
@@ -951,6 +978,13 @@ function dispatchPage(string $page): void {
         case 'export_price_variations': if (function_exists('doPriceVariationsExport'))    doPriceVariationsExport();   break;
         case 'price_variation_detail':  if (function_exists('pagePriceVariationDetail'))  pagePriceVariationDetail();  break;
         case 'download_pv_attachment':  if (function_exists('doDownloadPvAttachment'))    doDownloadPvAttachment();    break;
+        // Data Collection
+        case 'data_collections':    if (function_exists('pageDataCollections'))    pageDataCollections();    break;
+        case 'data_collection':     if (function_exists('pageDataCollection'))     pageDataCollection();     break;
+        case 'data_collection_new': if (function_exists('pageDataCollectionForm')) pageDataCollectionForm(); break;
+        case 'dc_file':             if (function_exists('dcServeFile'))            dcServeFile();            break;
+        case 'dc_download_zip':     if (function_exists('dcDownloadZip'))          dcDownloadZip();          break;
+        case 'dc_export_answers':   if (function_exists('dcExportAnswers'))        dcExportAnswers();        break;
         // Inward barcode register
         case 'inward_items':            if (function_exists('pageInwardItems'))        pageInwardItems();        break;
         case 'inward_item_new':         if (function_exists('pageInwardItemNew'))      pageInwardItemNew();      break;
