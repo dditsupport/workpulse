@@ -248,13 +248,14 @@ function routePost(string $a): void {
             if (function_exists('doRequestPolicyOtp')) doRequestPolicyOtp(); break;
         case 'cancel_policy_otp':
             if (function_exists('doCancelPolicyOtp')) doCancelPolicyOtp(); break;
-        // Data Collection — starting, closing and discarding a task need
-        // txn_data_collect; submitting needs only a location, so the gate for
-        // the draft/confirm handlers lives inside them (dcCanEditSubmission).
+        // Data Collection — starting, closing, confirming and discarding all
+        // need txn_data_collect; submitting needs only a location, so the
+        // gate for dc_submit lives inside it (dcCanEditSubmission).
         case 'dc_save_request':  if (function_exists('doDcSaveRequest'))  doDcSaveRequest();  break;
         case 'dc_close_request': if (function_exists('doDcCloseRequest')) doDcCloseRequest(); break;
-        case 'dc_save_draft':    if (function_exists('doDcSaveDraft'))    doDcSaveDraft();    break;
+        case 'dc_submit':        if (function_exists('doDcSubmit'))       doDcSubmit();       break;
         case 'dc_confirm':       if (function_exists('doDcConfirm'))      doDcConfirm();      break;
+        case 'dc_confirm_all':   if (function_exists('doDcConfirmAll'))   doDcConfirmAll();   break;
         case 'dc_reopen':        if (function_exists('doDcReopen'))       doDcReopen();       break;
         case 'dc_delete_file':   if (function_exists('doDcDeleteFile'))   doDcDeleteFile();   break;
         case 'dc_discard':       if (function_exists('doDcDiscard'))      doDcDiscard();      break;

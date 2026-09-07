@@ -305,23 +305,25 @@ function pendingForMe_checklist(int $locId): array {
 }
 
 // Data Collection — one row per open task an outlet this user covers has
-// not CONFIRMED yet. A draft still counts as pending: it is the confirm
-// that finishes the job.
+// not SENT anything for. Once the outlet submits, it is off this list:
+// waiting for Operations to confirm is not the outlet's job.
 function pendingForMe_dataCollection(): array {
-    if (!function_exists('dcMyLocations')) return [];
+    if (!function_exists('dcMyLocations') || !function_exists('dcSubmittedSql')) return [];
     $mine = array_keys(dcMyLocations());
     if (!$mine) return [];
     $in   = implode(',', array_fill(0, count($mine), '?'));
+    $sent = dcSubmittedSql('s', 'rl');
     $rows = [];
     try {
         $st = getDb()->prepare(
             "SELECT r.id, r.title, r.created_at, r.due_date, COUNT(*) AS pending_locations
                FROM dc_request_locations rl
                JOIN dc_requests r ON r.id = rl.request_id AND r.status = 'open'
-          LEFT JOIN dc_submissions s
-                 ON s.request_id = rl.request_id AND s.location_id = rl.location_id
               WHERE rl.location_id IN ({$in})
-                AND (s.status IS NULL OR s.status <> 'submitted')
+                AND NOT EXISTS (SELECT 1 FROM dc_submissions s
+                                 WHERE s.request_id  = rl.request_id
+                                   AND s.location_id = rl.location_id
+                                   AND {$sent})
            GROUP BY r.id, r.title, r.created_at, r.due_date
            ORDER BY r.id DESC");
         $st->execute($mine);

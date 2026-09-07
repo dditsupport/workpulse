@@ -11,9 +11,10 @@
 // Here it is one task:
 //   · a txn_data_collect holder starts it, picks the outlets, and types
 //     the question each of them answers,
-//   · every outlet uploads its files and writes its answer,
-//   · the outlet presses Confirm submission, which LOCKS what it sent —
-//     until then it may add files, remove them and rewrite the answer,
+//   · every outlet uploads its files, writes its answer and presses
+//     Submit — one button, and it may keep correcting what it sent,
+//   · Operations confirms an outlet's submission, and THAT is the lock:
+//     from then on the outlet cannot add, remove or change anything,
 //   · Operations downloads the lot as one ZIP, folder per location,
 //   · and then DISCARDS the task: files off disk, rows out of the
 //     database, task row deleted. Nothing is kept — the download is the
@@ -26,7 +27,8 @@
 //
 // Permissions:
 //   · txn_data_collect — start, edit, close, file on behalf of any
-//     targeted outlet, reopen a confirmed submission, download, discard
+//     targeted outlet, confirm a submission (locking that outlet out of
+//     it) and reopen one, download, discard
 //   · submitting needs no flag: an employee reaches a task through the
 //     outlet on their profile (employees.location_id) or through Manager
 //     Mapping naming them Store Manager / Operation Manager of one
@@ -119,41 +121,56 @@ function dcCanUsePage(): bool {
 }
 
 // May this submission still be changed? The one definition, used by the
-// save handler, the delete handler and the page. A store user edits its
-// own outlet while the submission is a draft; a txn_data_collect holder
-// edits any targeted outlet whatever its state — that is what makes
-// filing on behalf, and the reopen path, work.
+// submit handler, the delete handler and the page. An outlet keeps
+// editing its own submission until Operations confirms it — sending the
+// file is its whole job, and correcting a wrong file should not need
+// anyone's permission. A txn_data_collect holder edits any targeted
+// outlet whatever its state, which is what makes filing on behalf, and
+// fixing a confirmed submission, work.
 function dcCanEditSubmission(array $req, int $locationId, ?array $sub): bool {
     if (($req['status'] ?? '') !== 'open') return false;
     if (dcCanManage()) return true;
     $mine = dcMyLocations();
     if (!isset($mine[$locationId])) return false;
-    return (($sub['status'] ?? 'draft') !== 'submitted');
+    return (($sub['status'] ?? 'submitted') !== 'confirmed');
 }
 
-// 'confirmed' | 'draft' | 'nothing' — only 'confirmed' counts as filed.
-// A draft with files reads as in progress, so Operations can tell an
-// outlet that is working from one that is silent.
+// 'confirmed' | 'submitted' | 'nothing'.
+//   nothing   — this outlet has sent neither a file nor an answer
+//   submitted — it has sent something and may still change it
+//   confirmed — Operations accepted it; it is locked
 function dcLocationState(?array $sub, int $fileCount): string {
-    if (($sub['status'] ?? '') === 'submitted') return 'confirmed';
-    if ($fileCount > 0 || trim((string)($sub['answer_text'] ?? '')) !== '') return 'draft';
+    if (($sub['status'] ?? '') === 'confirmed') return 'confirmed';
+    if ($fileCount > 0 || trim((string)($sub['answer_text'] ?? '')) !== '') return 'submitted';
     return 'nothing';
 }
 
 function dcStateBadge(string $state): string {
     return match ($state) {
         'confirmed' => '<span class="badge badge-green">Confirmed</span>',
-        'draft'     => '<span class="badge badge-yellow">Draft</span>',
-        default     => '<span class="badge badge-grey">Nothing yet</span>',
+        'submitted' => '<span class="badge badge-yellow">Submitted</span>',
+        default     => '<span class="badge badge-grey">Not submitted</span>',
     };
 }
 
 function dcStateLabel(string $state): string {
     return match ($state) {
         'confirmed' => 'Confirmed',
-        'draft'     => 'Draft',
-        default     => 'Nothing yet',
+        'submitted' => 'Submitted',
+        default     => 'Not submitted',
     };
+}
+
+// "This outlet has sent something", as SQL. Kept in one place because the
+// list badge, the sidebar count and the dashboard's pending list must all
+// agree with dcLocationState() above. $s is the alias of dc_submissions
+// and $rl the alias carrying request_id / location_id.
+function dcSubmittedSql(string $s = 's', string $rl = 'rl'): string {
+    return "({$s}.status = 'confirmed'
+             OR TRIM(COALESCE({$s}.answer_text, '')) <> ''
+             OR EXISTS (SELECT 1 FROM dc_files f
+                         WHERE f.request_id = {$rl}.request_id
+                           AND f.location_id = {$rl}.location_id))";
 }
 
 // ── Lookups ─────────────────────────────────────────────
@@ -185,10 +202,16 @@ function dcLocationNames(): array {
 // date — the thing you owe soonest is at the top.
 function dcRequests(): array {
     if (!dcSchemaReady()) return [];
-    $sql = "SELECT r.*,
+    // submitted_count is the chase number — who has sent anything at all —
+    // and confirmed_count is what Operations has accepted. They are
+    // different questions and the list shows both.
+    $sent = dcSubmittedSql('s', 's');
+    $sql  = "SELECT r.*,
                    (SELECT COUNT(*) FROM dc_request_locations rl WHERE rl.request_id = r.id) AS target_count,
                    (SELECT COUNT(*) FROM dc_submissions s
-                     WHERE s.request_id = r.id AND s.status = 'submitted')                   AS confirmed_count,
+                     WHERE s.request_id = r.id AND {$sent})                                  AS submitted_count,
+                   (SELECT COUNT(*) FROM dc_submissions s
+                     WHERE s.request_id = r.id AND s.status = 'confirmed')                   AS confirmed_count,
                    (SELECT COUNT(*) FROM dc_files f WHERE f.request_id = r.id)               AS file_count
               FROM dc_requests r";
     $params = [];
@@ -387,11 +410,14 @@ function doDcCloseRequest(): void {
     header("Location: {$back}"); exit;
 }
 
-// ── Handler: save a location's draft (files + answer) ───
-// One handler for one form. The location comes from the POST and is
+// ── Handler: an outlet submits (files + answer) ─────────
+// One handler for one button. The location comes from the POST and is
 // re-validated against the caller's rights, so the same code serves a
 // store user filing for their own outlet and Operations filing on behalf.
-function doDcSaveDraft(): void {
+// Submitting again adds files and overwrites the answer — an outlet fixes
+// its own mistake without asking anyone, right up until Operations
+// confirms it.
+function doDcSubmit(): void {
     $id  = (int)($_POST['request_id'] ?? 0);
     $loc = (int)($_POST['location_id'] ?? 0);
     $back = 'index.php?page=data_collection&id=' . $id . '&loc=' . $loc;
@@ -407,7 +433,7 @@ function doDcSaveDraft(): void {
     if (!dcCanEditSubmission($req, $loc, $sub)) {
         flash('error', ($req['status'] !== 'open')
             ? 'This task is closed.'
-            : 'This submission is confirmed and can no longer be changed. Ask Operations to reopen it.');
+            : 'Operations has confirmed this submission — it can no longer be changed. Ask them to reopen it.');
         header("Location: {$back}"); exit;
     }
 
@@ -464,12 +490,12 @@ function doDcSaveDraft(): void {
     // A save that adds nothing and says nothing is a mistake, not a submission.
     $existingFiles = count(dcFilesByLocation($id)[$loc] ?? []);
     if ($saved === 0 && $answer === '' && $existingFiles === 0) {
-        flash('error', 'Attach a file or write an answer before saving.'
+        flash('error', 'Attach a file or write an answer before submitting.'
             . ($skipped ? ' Skipped: ' . implode('; ', $skipped) : ''));
         header("Location: {$back}"); exit;
     }
 
-    // The answer, and the draft row it lives on. status is deliberately not
+    // The answer, and the row it lives on. status is deliberately not
     // touched on update: a manager correcting an already-confirmed
     // submission leaves it confirmed — handing it back is what Reopen does.
     try {
@@ -480,70 +506,114 @@ function doDcSaveDraft(): void {
                                      updated_by  = VALUES(updated_by),
                                      updated_at  = NOW(),
                                      on_behalf   = IF(VALUES(on_behalf) = 1, 1, on_behalf)')
-            ->execute([$id, $loc, ($answer === '' ? null : $answer), 'draft', myCode(), $onBehalf]);
+            ->execute([$id, $loc, ($answer === '' ? null : $answer), 'submitted', myCode(), $onBehalf]);
     } catch (Exception $e) {
         flash('error', 'Files saved but the answer could not be: ' . $e->getMessage());
         header("Location: {$back}"); exit;
     }
 
-    $msg = 'Saved as a draft'
+    $msg = 'Submitted'
          . ($saved ? " — {$saved} file(s) added." : '.')
-         . ' Press "Confirm submission" when this location is finished.';
+         . ' You can keep changing this until Operations confirms it.';
     if ($skipped) $msg .= ' Skipped: ' . implode('; ', $skipped) . '.';
     flash($skipped ? 'error' : 'success', $msg);
     header("Location: {$back}"); exit;
 }
 
-// ── Handler: confirm — the lock ─────────────────────────
+// ── Handler: Operations confirms — the lock ─────────────
+// Confirming accepts what an outlet sent and locks that outlet out of it.
+// It is a txn_data_collect action, never the outlet's own: a location's
+// job is to send the file, and it may correct what it sent until someone
+// with the permission says the submission is good.
 function doDcConfirm(): void {
     $id  = (int)($_POST['request_id'] ?? 0);
     $loc = (int)($_POST['location_id'] ?? 0);
-    $back = 'index.php?page=data_collection&id=' . $id . '&loc=' . $loc;
-
+    $back = 'index.php?page=data_collection&id=' . $id;
+    if (!dcCanManage()) {
+        flash('error', 'Only Operations can confirm a submission.');
+        header("Location: {$back}"); exit;
+    }
     $req = dcRequest($id);
     if (!$req) { flash('error', 'Task not found.'); header('Location: index.php?page=data_collections'); exit; }
+    if ($req['status'] !== 'open') {
+        flash('error', 'This task is closed — reopen it to confirm a submission.');
+        header("Location: {$back}"); exit;
+    }
     if (!in_array($loc, dcRequestLocationIds($id), true)) {
         flash('error', 'That location is not part of this task.');
-        header("Location: index.php?page=data_collection&id={$id}"); exit;
-    }
-    $subs = dcSubmissions($id);
-    $sub  = $subs[$loc] ?? null;
-    if (!dcCanEditSubmission($req, $loc, $sub)) {
-        flash('error', 'This submission can no longer be changed.');
         header("Location: {$back}"); exit;
     }
 
+    $subs   = dcSubmissions($id);
     $files  = dcFilesByLocation($id)[$loc] ?? [];
-    $answer = trim((string)($sub['answer_text'] ?? ''));
+    $answer = trim((string)($subs[$loc]['answer_text'] ?? ''));
     if ((int)$req['requires_file'] === 1 && !$files) {
-        flash('error', 'This task asks for a file — attach one before confirming.');
+        flash('error', 'This task asks for a file and this location has not sent one — nothing to confirm.');
         header("Location: {$back}"); exit;
     }
     if (!$files && $answer === '') {
-        flash('error', 'Nothing to confirm — attach a file or write an answer first.');
+        flash('error', 'This location has sent nothing yet — nothing to confirm.');
         header("Location: {$back}"); exit;
     }
 
-    $mine     = dcMyLocations();
-    $onBehalf = isset($mine[$loc]) ? 0 : 1;
+    $names = dcLocationNames();
+    if (dcConfirmOne($id, $loc)) {
+        flash('success', 'Confirmed ' . ($names[$loc] ?? ('#' . $loc)) . ' — that location can no longer change it.');
+    } else {
+        flash('error', 'Could not confirm ' . ($names[$loc] ?? ('#' . $loc)) . '.');
+    }
+    header("Location: {$back}"); exit;
+}
+
+// ── Handler: confirm every outlet that has sent something ──
+// A drive spans forty-odd outlets; locking them one at a time once the
+// ZIP is down is forty clicks. Outlets that sent nothing are untouched,
+// so this never marks a silent store as done.
+function doDcConfirmAll(): void {
+    $id   = (int)($_POST['request_id'] ?? 0);
+    $back = 'index.php?page=data_collection&id=' . $id;
+    if (!dcCanManage()) {
+        flash('error', 'Only Operations can confirm submissions.');
+        header("Location: {$back}"); exit;
+    }
+    $req = dcRequest($id);
+    if (!$req) { flash('error', 'Task not found.'); header('Location: index.php?page=data_collections'); exit; }
+    if ($req['status'] !== 'open') {
+        flash('error', 'This task is closed — reopen it to confirm submissions.');
+        header("Location: {$back}"); exit;
+    }
+
+    $subs  = dcSubmissions($id);
+    $byLoc = dcFilesByLocation($id);
+    $done  = 0;
+    foreach (dcRequestLocationIds($id) as $lid) {
+        $files = $byLoc[$lid] ?? [];
+        if (dcLocationState($subs[$lid] ?? null, count($files)) !== 'submitted') continue;
+        if ((int)$req['requires_file'] === 1 && !$files) continue;
+        if (dcConfirmOne($id, $lid)) $done++;
+    }
+    flash($done > 0 ? 'success' : 'error', $done > 0
+        ? $done . ' submission(s) confirmed and locked.'
+        : 'Nothing to confirm — no location has an unconfirmed submission.');
+    header("Location: {$back}"); exit;
+}
+
+// The write both confirm paths share. on_behalf is left alone here: it
+// records who FILED the submission, not who accepted it.
+function dcConfirmOne(int $requestId, int $locationId): bool {
     try {
         getDb()->prepare(
             'INSERT INTO dc_submissions (request_id, location_id, status, updated_by, updated_at,
-                                         confirmed_by, confirmed_at, on_behalf)
-             VALUES (?,?,?,?,NOW(),?,NOW(),?)
+                                         confirmed_by, confirmed_at)
+             VALUES (?,?,?,?,NOW(),?,NOW())
              ON DUPLICATE KEY UPDATE status       = VALUES(status),
                                      confirmed_by = VALUES(confirmed_by),
-                                     confirmed_at = NOW(),
-                                     updated_at   = NOW(),
-                                     on_behalf    = IF(VALUES(on_behalf) = 1, 1, on_behalf)')
-            ->execute([$id, $loc, 'submitted', myCode(), myCode(), $onBehalf]);
-        $names = dcLocationNames();
-        flash('success', 'Submission confirmed for ' . ($names[$loc] ?? ('#' . $loc))
-            . ' — it is locked now. Ask Operations if something needs changing.');
+                                     confirmed_at = NOW()')
+            ->execute([$requestId, $locationId, 'confirmed', myCode(), myCode()]);
+        return true;
     } catch (Exception $e) {
-        flash('error', 'Could not confirm: ' . $e->getMessage());
+        return false;
     }
-    header("Location: {$back}"); exit;
 }
 
 // ── Handler: reopen one location's submission ───────────
@@ -558,9 +628,9 @@ function doDcReopen(): void {
     getDb()->prepare('UPDATE dc_submissions
                          SET status = ?, reopened_by = ?, reopened_at = NOW()
                        WHERE request_id = ? AND location_id = ?')
-           ->execute(['draft', myCode(), $id, $loc]);
+           ->execute(['submitted', myCode(), $id, $loc]);
     $names = dcLocationNames();
-    flash('success', 'Reopened for ' . ($names[$loc] ?? ('#' . $loc)) . ' — that location can edit and confirm again.');
+    flash('success', 'Reopened for ' . ($names[$loc] ?? ('#' . $loc)) . ' — that location can change what it sent again.');
     header("Location: {$back}"); exit;
 }
 
@@ -576,7 +646,7 @@ function doDcDeleteFile(): void {
     $req  = dcRequest($id);
     $subs = dcSubmissions($id);
     if (!$req || !dcCanEditSubmission($req, $loc, $subs[$loc] ?? null)) {
-        flash('error', 'This submission is confirmed or the task is closed — the file cannot be removed.');
+        flash('error', 'Operations has confirmed this submission, or the task is closed — the file cannot be removed.');
         header("Location: {$back}"); exit;
     }
     $path = dcFilePath($row);
@@ -779,7 +849,7 @@ function dcExportAnswers(): void {
 // ── Per-location state for the current user, across every task ──
 // One query for every outlet this user covers, so the list can show
 // "what do I still owe" without a query per row.
-// [request_id => [location_id => 'confirmed'|'draft'|'nothing']]
+// [request_id => [location_id => 'confirmed'|'submitted'|'nothing']]
 function dcMyStates(): array {
     $mine = array_keys(dcMyLocations());
     if (!$mine || !dcSchemaReady()) return [];
@@ -801,25 +871,29 @@ function dcMyStates(): array {
     return $out;
 }
 
-// How many open tasks still want something from this user's outlets. The
-// sidebar renders on every page, so this is one lean query with its own
-// try/catch rather than the schema probe plus the full list.
+// How many open tasks this user's outlets have not sent anything for. A
+// submission waiting on Operations to confirm is not outstanding — the
+// outlet has done its part. The sidebar renders on every page, so this is
+// one lean query with its own try/catch rather than the schema probe plus
+// the full list.
 function dcOutstandingForMe(): int {
     static $n = null;
     if ($n !== null) return $n;
     $n = 0;
     $mine = array_keys(dcMyLocations());
     if (!$mine) return $n;
-    $in = implode(',', array_fill(0, count($mine), '?'));
+    $in   = implode(',', array_fill(0, count($mine), '?'));
+    $sent = dcSubmittedSql('s', 'rl');
     try {
         $st = getDb()->prepare(
             "SELECT COUNT(DISTINCT rl.request_id)
                FROM dc_request_locations rl
                JOIN dc_requests r ON r.id = rl.request_id AND r.status = 'open'
-          LEFT JOIN dc_submissions s
-                 ON s.request_id = rl.request_id AND s.location_id = rl.location_id
               WHERE rl.location_id IN ({$in})
-                AND (s.status IS NULL OR s.status <> 'submitted')");
+                AND NOT EXISTS (SELECT 1 FROM dc_submissions s
+                                 WHERE s.request_id  = rl.request_id
+                                   AND s.location_id = rl.location_id
+                                   AND {$sent})");
         $st->execute($mine);
         $n = (int)$st->fetchColumn();
     } catch (Exception $e) {
@@ -849,7 +923,7 @@ function pageDataCollections(): void {
 <p class="text-muted" style="font-size:12px;margin:-4px 0 14px">
     <?= $manage
         ? 'Start a task, pick the outlets, and watch them come in. Download everything as one ZIP, then discard the task — that erases every file from the server.'
-        : 'What your location has been asked for. Add your files and answer, then press Confirm submission — after that it is locked.' ?>
+        : 'What your location has been asked for. Add your files, write your answer and press Submit. You can change it until Operations confirms it.' ?>
 </p>
 
 <?php if (!$requests): ?>
@@ -875,7 +949,8 @@ function pageDataCollections(): void {
         $late  = $due !== '' && $r['status'] === 'open' && $due < date('Y-m-d');
         $mineStates = $states[$rid] ?? [];
         $mineDone   = 0;
-        foreach ($mineStates as $s) if ($s === 'confirmed') $mineDone++;
+        // For an outlet, "done" is having sent it — the confirm is not theirs.
+        foreach ($mineStates as $s) if ($s !== 'nothing') $mineDone++;
     ?>
         <tr<?= $r['status'] === 'closed' ? ' style="opacity:.65"' : '' ?>>
             <td>
@@ -892,16 +967,20 @@ function pageDataCollections(): void {
             </td>
             <td style="font-size:12px">
                 <?php if ($manage): ?>
-                    <?php $t = (int)$r['target_count']; $c = (int)$r['confirmed_count']; ?>
-                    <span class="badge <?= $c >= $t && $t > 0 ? 'badge-green' : ($c > 0 ? 'badge-yellow' : 'badge-grey') ?>">
-                        <?= $c ?>/<?= $t ?>
+                    <?php $t = (int)$r['target_count'];
+                          $sent = (int)$r['submitted_count'];
+                          $c = (int)$r['confirmed_count']; ?>
+                    <span class="badge <?= $sent >= $t && $t > 0 ? 'badge-green' : ($sent > 0 ? 'badge-yellow' : 'badge-grey') ?>">
+                        <?= $sent ?>/<?= $t ?> submitted
                     </span>
-                    <span class="text-muted" style="margin-left:4px"><?= (int)$r['file_count'] ?> file(s)</span>
+                    <div class="text-muted" style="font-size:11px;margin-top:2px">
+                        <?= $c ?> confirmed · <?= (int)$r['file_count'] ?> file(s)
+                    </div>
                 <?php elseif (count($mineStates) === 1): ?>
                     <?= dcStateBadge((string)reset($mineStates)) ?>
                 <?php else: ?>
                     <span class="badge <?= $mineDone === count($mineStates) ? 'badge-green' : ($mineDone > 0 ? 'badge-yellow' : 'badge-grey') ?>">
-                        <?= $mineDone ?>/<?= count($mineStates) ?> confirmed
+                        <?= $mineDone ?>/<?= count($mineStates) ?> submitted
                     </span>
                 <?php endif; ?>
             </td>
@@ -1045,19 +1124,26 @@ function pageDataCollection(): void {
     $selected   = (int)($_GET['loc'] ?? 0);
     if (!in_array($selected, $submitLocs, true)) $selected = $submitLocs[0] ?? 0;
 
-    $confirmed = 0;
+    // Two different numbers: who has sent anything (the chase), and what
+    // Operations has accepted (the lock).
+    $confirmed = 0; $sentHere = 0;
     foreach ($targets as $lid) {
-        if (dcLocationState($subs[$lid] ?? null, count($byLoc[$lid] ?? [])) === 'confirmed') $confirmed++;
+        $st = dcLocationState($subs[$lid] ?? null, count($byLoc[$lid] ?? []));
+        if ($st === 'confirmed') $confirmed++;
+        if ($st !== 'nothing')   $sentHere++;
     }
-    $outstanding = count($targets) - $confirmed;
+    $outstanding = count($targets) - $sentHere;   // still to send
 ?>
 <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
     <div>
         <h2 style="margin:0 0 4px"><?= h($req['title']) ?></h2>
         <span class="badge <?= $isOpen ? 'badge-blue' : 'badge-grey' ?>"><?= h(ucfirst((string)$req['status'])) ?></span>
-        <span class="badge <?= $confirmed >= count($targets) ? 'badge-green' : ($confirmed > 0 ? 'badge-yellow' : 'badge-grey') ?>">
-            <?= $confirmed ?>/<?= count($targets) ?> confirmed
+        <span class="badge <?= $sentHere >= count($targets) ? 'badge-green' : ($sentHere > 0 ? 'badge-yellow' : 'badge-grey') ?>">
+            <?= $sentHere ?>/<?= count($targets) ?> submitted
         </span>
+        <?php if ($confirmed > 0): ?>
+        <span class="text-muted" style="font-size:12px"><?= $confirmed ?> confirmed</span>
+        <?php endif; ?>
         <?php if (!empty($req['due_date'])): ?>
         <span class="text-muted" style="font-size:12px;margin-left:6px">Due <?= h(date('d M Y', strtotime((string)$req['due_date']))) ?></span>
         <?php endif; ?>
@@ -1176,8 +1262,8 @@ if ($selected > 0):
 
     <?php if ($state === 'confirmed'): ?>
     <div class="alert alert-success" style="margin-bottom:10px">
-        Confirmed<?= !empty($sub['confirmed_name']) || !empty($sub['confirmed_by'])
-            ? ' by ' . h((string)($sub['confirmed_name'] ?: $sub['confirmed_by'])) : '' ?><?=
+        Confirmed by Operations<?= !empty($sub['confirmed_name']) || !empty($sub['confirmed_by'])
+            ? ' (' . h((string)($sub['confirmed_name'] ?: $sub['confirmed_by'])) . ')' : '' ?><?=
             !empty($sub['confirmed_at']) ? ' on ' . h(date('d M Y H:i', strtotime((string)$sub['confirmed_at']))) : '' ?>.
         This submission is locked<?= $manage ? ' — reopen it from the board below to change it.' : ' — ask Operations to reopen it if something needs changing.' ?>
     </div>
@@ -1207,7 +1293,7 @@ if ($selected > 0):
 
     <?php if ($canEdit): ?>
     <form method="POST" enctype="multipart/form-data">
-        <input type="hidden" name="action" value="dc_save_draft">
+        <input type="hidden" name="action" value="dc_submit">
         <input type="hidden" name="request_id" value="<?= $id ?>">
         <input type="hidden" name="location_id" value="<?= $selected ?>">
         <div class="form-group">
@@ -1223,18 +1309,41 @@ if ($selected > 0):
             <textarea name="answer_text" class="form-control" rows="3" maxlength="<?= DC_MAX_ANSWER ?>"
                       placeholder="Type your answer here"><?= h((string)($sub['answer_text'] ?? '')) ?></textarea>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-            <button type="submit" class="btn btn-secondary">Save draft</button>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+            <button type="submit" class="btn btn-primary">Submit</button>
+            <span class="text-muted" style="font-size:11px">
+                <?= $state === 'nothing'
+                    ? 'You can come back and change this until Operations confirms it.'
+                    : 'Already submitted — sending again adds files and replaces your answer.' ?>
+            </span>
         </div>
     </form>
-    <form method="POST" style="margin-top:8px"
-          onsubmit="return confirm('Confirm this submission? Once confirmed you cannot add, remove or change anything.')">
-        <input type="hidden" name="action" value="dc_confirm">
-        <input type="hidden" name="request_id" value="<?= $id ?>">
-        <input type="hidden" name="location_id" value="<?= $selected ?>">
-        <button type="submit" class="btn btn-primary">Confirm submission</button>
-        <span class="text-muted" style="font-size:11px;margin-left:6px">Save first — confirming locks what is saved.</span>
-    </form>
+    <?php if ($manage): ?>
+    <?php // Confirming is the manager's action, so it sits on their card too —
+          // handy right after filing on behalf of an outlet. Already
+          // confirmed? Then the useful action here is handing it back. ?>
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+        <?php if ($state === 'confirmed'): ?>
+        <form method="POST" class="inline-form"
+              onsubmit="return confirm('Reopen this submission so the location can change it?')">
+            <input type="hidden" name="action" value="dc_reopen">
+            <input type="hidden" name="request_id" value="<?= $id ?>">
+            <input type="hidden" name="location_id" value="<?= $selected ?>">
+            <button type="submit" class="btn btn-secondary">Reopen this submission</button>
+            <span class="text-muted" style="font-size:11px;margin-left:6px">Hands it back to the location.</span>
+        </form>
+        <?php else: ?>
+        <form method="POST" class="inline-form"
+              onsubmit="return confirm('Confirm this submission? The location will not be able to change it afterwards.')">
+            <input type="hidden" name="action" value="dc_confirm">
+            <input type="hidden" name="request_id" value="<?= $id ?>">
+            <input type="hidden" name="location_id" value="<?= $selected ?>">
+            <button type="submit" class="btn btn-secondary" <?= $state === 'nothing' ? 'disabled' : '' ?>>Confirm this submission</button>
+            <span class="text-muted" style="font-size:11px;margin-left:6px">Locks this location out of it.</span>
+        </form>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
     <?php else: ?>
     <div class="form-group">
         <label><?= h(dcQuestionLabel($req)) ?></label>
@@ -1246,7 +1355,22 @@ if ($selected > 0):
 </div>
 <?php endif; // submit card ?>
 
-<?php if ($manage): ?>
+<?php if ($manage):
+    $awaiting = $sentHere - $confirmed;         // sent, not yet accepted
+?>
+<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
+    <div style="font-size:12px" class="text-muted">
+        <?= $submittedCount ?> of <?= count($targets) ?> submitted · <?= $confirmed ?> confirmed
+        <?= $awaiting > 0 ? ' · ' . $awaiting . ' waiting on you' : '' ?>
+    </div>
+    <?php if ($awaiting > 0 && $isOpen): ?>
+    <form method="POST" onsubmit="return confirm('Confirm all <?= $awaiting ?> submitted location(s)? They will not be able to change anything afterwards.')">
+        <input type="hidden" name="action" value="dc_confirm_all">
+        <input type="hidden" name="request_id" value="<?= $id ?>">
+        <button class="btn btn-secondary btn-sm">Confirm all submitted (<?= $awaiting ?>)</button>
+    </form>
+    <?php endif; ?>
+</div>
 <div class="table-wrap" data-stack>
 <table class="table">
     <thead>
@@ -1309,6 +1433,13 @@ if ($selected > 0):
                     <input type="hidden" name="location_id" value="<?= $lid ?>">
                     <button class="btn btn-sm btn-secondary">Reopen</button>
                 </form>
+                <?php elseif ($state === 'submitted' && $isOpen): ?>
+                <form method="POST" class="inline-form" onsubmit="return confirm('Confirm this submission? The location will not be able to change it afterwards.')">
+                    <input type="hidden" name="action" value="dc_confirm">
+                    <input type="hidden" name="request_id" value="<?= $id ?>">
+                    <input type="hidden" name="location_id" value="<?= $lid ?>">
+                    <button class="btn btn-sm btn-primary">Confirm</button>
+                </form>
                 <?php elseif ($isOpen): ?>
                 <a href="?page=data_collection&id=<?= $id ?>&loc=<?= $lid ?>" class="btn btn-sm btn-ghost">File for this</a>
                 <?php endif; ?>
@@ -1318,6 +1449,6 @@ if ($selected > 0):
     </tbody>
 </table>
 </div>
-<div class="table-count"><?= $confirmed ?> of <?= count($targets) ?> location(s) confirmed</div>
+<div class="table-count"><?= $sentHere ?> of <?= count($targets) ?> location(s) submitted · <?= $confirmed ?> confirmed</div>
 <?php endif;
 }
