@@ -65,8 +65,6 @@ function buildNav(): array {
         ['group' => 'Audit and Performance', 'items' => [
             ['page' => 'audit_list',        'icon' => navIcon('audit_list'),   'label' => 'Audit List'],
             ['page' => 'audit_summary',     'icon' => navIcon('summary'),      'label' => 'Audit Summary'],
-            ['page' => 'audit_categories',  'icon' => navIcon('categories'),   'label' => 'Audit Categories'],
-            ['page' => 'audit_parameters',  'icon' => navIcon('audit_param'),  'label' => 'Audit Parameters'],
             ['page' => 'audit_templates',   'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'],
             ['page' => 'perf_reviews',      'icon' => navIcon('summary'),      'label' => 'Performance Review'],
         ]],
@@ -183,8 +181,10 @@ function buildNav(): array {
     if (hasTxn('audit_summary')) $audit[] = ['page' => 'audit_summary',    'icon' => navIcon('summary'),      'label' => 'Audit Summary'];
     // "Create Audit" is no longer a sidebar entry — reach it from the
     // Audit List page. Page itself stays gated server-side via txn_audit_create.
-    if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_categories', 'icon' => navIcon('categories'),   'label' => 'Audit Categories'];
-    if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_parameters', 'icon' => navIcon('audit_param'),  'label' => 'Audit Parameters'];
+    // Audit Categories and Audit Parameters are reached from the Audit
+    // Templates page, which is where you go to set a template up. Both stay
+    // gated on txn_audit_admin in allowedPages() — off the sidebar is
+    // presentation, not permission.
     if (hasTxn('audit_admin'))   $audit[] = ['page' => 'audit_templates',  'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'];
     // Store Performance — the monthly MIS review. One sidebar entry: the
     // review. "Performance Upload" is reached from a button on it, the way
