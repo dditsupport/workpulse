@@ -25,9 +25,10 @@ boards, separate folders on disk; discarding one never touches another.
 migrations/2026-09-07_data_collection.sql              -- five tables + the permission
 migrations/2026-09-08_data_collection_ops_confirm.sql  -- confirming moves to Operations
 migrations/2026-09-09_data_collection_samples.sql      -- the sample / format file
+migrations/2026-09-10_data_collection_sub_questions.sql -- sub-questions, one box each
 ```
 
-All three are safe to re-run. The second and third are only needed on a
+All four are safe to re-run. The later three are only needed on a
 database that took the first before those dates; the first has since been
 updated to match, so a fresh install gets everything from it and the other two
 become no-ops. Until they are
@@ -98,12 +99,33 @@ covering five stores files for all five, picking the outlet from a dropdown.
    `DISCARD`, and warns in red when nobody has downloaded the task yet.
    **Download before you discard** — the download is the only record.
 
+## Questions and sub-questions
+
+A task carries one main **question**, printed above the outlet's answer box, and
+any number of **sub-questions** under it, each with its own box. One long
+sentence — *"photo of every AC, and the sub-zero meters from a distance, no
+meter reading, and where every meter is zero send the old AC photos too"* — is
+read once and half-answered; three numbered boxes get three answers. Each
+sub-question is also its own column in `answers.csv`, so the report reads as a
+table instead of a paragraph to re-read.
+
+Add them on the task form with *+ Add a question*; clearing a line deletes that
+question and its answers. A task with no sub-questions behaves exactly as it did
+before. Questions are free text — there is no validation of what comes back, by
+design: the outlets answer in their own words, including in Hindi or Gujarati.
+
+The **Instructions** box is different: it is the standing note at the top of the
+task ("which report to export, what the photo must show"), not something the
+outlet answers.
+
 ## The sample / format file
 
 A task can carry the blank format it wants back: the sheet with the right
 columns and headings, an example photo, a one-page instruction PDF. Attach it
 on the task form (several are allowed), and every location sees it in a box
-above its own upload area — *Download this, fill in your figures and upload it
+above its own upload area — an image sample is shown inline as a thumbnail
+rather than left as a download, because an example photo says in one look what
+the words take a paragraph to say — *Download this, fill in your figures and upload it
 back below* — so 41 outlets return 41 files with the same shape instead of 41
 layouts. Only `txn_data_collect` attaches or removes one; anyone the task was
 sent to can download it. Samples are erased with everything else on discard.
@@ -123,14 +145,15 @@ type. Ten files per save; save again for more.
 | | |
 |---|---|
 | `modules/data_collection.php` | the whole feature — gates, handlers, pages, downloads |
-| `migrations/2026-09-07_data_collection.sql` | `dc_requests`, `dc_request_locations`, `dc_files`, `dc_submissions`, `dc_samples`, `roles.txn_data_collect` |
+| `migrations/2026-09-07_data_collection.sql` | `dc_requests`, `dc_request_locations`, `dc_files`, `dc_submissions`, `dc_samples`, `dc_questions`, `dc_answers`, `roles.txn_data_collect` |
 | `index.php` | the `dc_*` POST actions and the three download pages in the pre-HTML early-exit list |
 | `modules/nav.php` | the sidebar entry, `allowedPages()`, `dispatchPage()` |
 | `modules/dashboard.php` | `pendingForMe_dataCollection()` — open tasks land in *Pending For You* |
 
 `dcSchemaReady()` probes the four core tables once per request, so an
 un-migrated database shows a notice instead of a fatal error, and
-`dcSamplesReady()` does the same for `dc_samples` on its own — a database that
-took only the first migration keeps working, minus the sample box. `dcZipAvailable()` does the
+`dcSamplesReady()` and `dcQuestionsReady()` do the same for `dc_samples` and the
+sub-question pair on their own — a database that took only the first migration
+keeps working, minus the sample box and the extra questions. `dcZipAvailable()` does the
 same for the `ZipArchive` extension: without it the ZIP button is replaced by a
 line telling the user to take the files individually, and everything else works.
