@@ -15,17 +15,33 @@
 // =========================================================
 
 // ── Duration helpers ─────────────────────────────────────
-// A <select> of duration slots in 15-minute steps (15m … 8h), values in
-// whole minutes, labels like "2h 30m". $value (minutes) pre-selects a slot.
+// The slots the duration dropdown offers, in minutes, ascending. Fine at the
+// short end where the difference actually matters — a five-minute ticket
+// glance had to be rounded up to 15m or left blank — and coarse past 6h,
+// where quarter-hours were only ever length in the list: nobody picks
+// 6h 45m for a day's work.
+function durationSlots(): array {
+    $slots = [5, 10];
+    for ($m = 15; $m <= 6 * 60; $m += 15)      $slots[] = $m;   // 15m … 6h
+    for ($m = 7 * 60; $m <= 12 * 60; $m += 60) $slots[] = $m;   // 7h … 12h
+    return $slots;
+}
+
+// A <select> of those slots, values in whole minutes and labels like
+// "2h 30m". $value (minutes) pre-selects one.
 function durationSelect(string $name, int $value = 0, bool $required = false, string $extraClass = '', string $style = ''): string {
-    $opts = '<option value="">--</option>';
-    for ($mins = 15; $mins <= 8 * 60; $mins += 15) {
+    $slots = durationSlots();
+    $opts  = '<option value="">--</option>';
+    foreach ($slots as $mins) {
         $sel   = $mins === $value ? ' selected' : '';
         $opts .= '<option value="' . $mins . '"' . $sel . '>' . fmtMinutes($mins) . '</option>';
     }
-    // A value that is not on a 15-minute slot (typed before this was a select)
-    // still needs somewhere to sit, or editing the row would silently drop it.
-    if ($value > 0 && $value % 15 !== 0) {
+    // A value that is not on a slot still needs somewhere to sit, or editing
+    // the row would silently drop it. Membership, not arithmetic: 6h 30m is a
+    // round 390 minutes but no longer a slot, and testing divisibility would
+    // let every duration between 6h and 8h picked under the old ladder fall
+    // out of its own row.
+    if ($value > 0 && !in_array($value, $slots, true)) {
         $opts .= '<option value="' . $value . '" selected>' . fmtMinutes($value) . '</option>';
     }
     $req = $required ? ' required' : '';
