@@ -125,7 +125,11 @@ columns and headings, an example photo, a one-page instruction PDF. Attach it
 on the task form (several are allowed), and every location sees it in a box
 above its own upload area — an image sample is shown inline as a thumbnail
 rather than left as a download, because an example photo says in one look what
-the words take a paragraph to say — *Download this, fill in your figures and upload it
+the words take a paragraph to say. Clicking it opens the full picture in a
+preview window (click again to zoom to full resolution, Escape to close), the
+same one the *Review Punch Request* screen uses. Photos an outlet sends back
+open there too, so reviewing forty AC photos on the board does not mean
+downloading forty files — *Download this, fill in your figures and upload it
 back below* — so 41 outlets return 41 files with the same shape instead of 41
 layouts. Only `txn_data_collect` attaches or removes one; anyone the task was
 sent to can download it. Samples are erased with everything else on discard.
