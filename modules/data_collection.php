@@ -1277,31 +1277,35 @@ function dcRenderImageModal(): void {
 <style>
 /* Image preview — same shape as the Review Punch Request modal in
    modules/punch_requests.php, so a photo opens where you are looking
-   instead of in another tab. */
-.dc-overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);display:none;z-index:9100;align-items:flex-start;justify-content:center;padding:14px;overflow:auto}
-.dc-overlay.open{display:flex}
-.dc-modal{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;width:100%;max-width:min(1280px,96vw);max-height:calc(100vh - 28px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 48px rgba(0,0,0,.6)}
-.dc-modal-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-bottom:1px solid var(--border)}
-.dc-modal-head h3{margin:0;font-size:15px;font-weight:600;word-break:break-all}
-.dc-modal-close{background:transparent;border:none;color:var(--muted);font-size:24px;cursor:pointer;line-height:1;padding:0 4px}
-.dc-modal-close:hover{color:var(--text)}
-.dc-modal-body{padding:14px 18px;overflow:auto;flex:1}
-.dc-img-wrap{background:#000;border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;min-height:480px;max-height:78vh;overflow:auto}
-.dc-img-wrap img{max-width:100%;max-height:78vh;display:block;cursor:zoom-in}
-.dc-img-wrap img.dc-img-zoomed{max-height:none;max-width:none;cursor:zoom-out}
-.dc-modal-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-top:1px solid var(--border);background:rgba(0,0,0,.15);flex-wrap:wrap}
-@media(max-width:900px){.dc-img-wrap{min-height:320px}}
-@media(max-width:560px){.dc-img-wrap{min-height:240px}}
+   instead of in another tab.
+   The dc-pv- prefix is deliberate: the Discard dialog further down this
+   file already owns .dc-modal (as its OVERLAY, with display:none), and
+   its rules come later in the page, so sharing the name left this box
+   hidden behind a darkened screen for anyone who could see both. */
+.dc-pv-overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);display:none;z-index:9100;align-items:flex-start;justify-content:center;padding:14px;overflow:auto}
+.dc-pv-overlay.open{display:flex}
+.dc-pv-box{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;width:100%;max-width:min(1280px,96vw);max-height:calc(100vh - 28px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 48px rgba(0,0,0,.6)}
+.dc-pv-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-bottom:1px solid var(--border)}
+.dc-pv-head h3{margin:0;font-size:15px;font-weight:600;word-break:break-all}
+.dc-pv-close{background:transparent;border:none;color:var(--muted);font-size:24px;cursor:pointer;line-height:1;padding:0 4px}
+.dc-pv-close:hover{color:var(--text)}
+.dc-pv-body{padding:14px 18px;overflow:auto;flex:1}
+.dc-pv-img{background:#000;border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;min-height:480px;max-height:78vh;overflow:auto}
+.dc-pv-img img{max-width:100%;max-height:78vh;display:block;cursor:zoom-in}
+.dc-pv-img img.dc-pv-zoomed{max-height:none;max-width:none;cursor:zoom-out}
+.dc-pv-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-top:1px solid var(--border);background:rgba(0,0,0,.15);flex-wrap:wrap}
+@media(max-width:900px){.dc-pv-img{min-height:320px}}
+@media(max-width:560px){.dc-pv-img{min-height:240px}}
 </style>
 <!-- ── Image preview, shared by every photo on the page ── -->
-<div class="dc-overlay" id="dcOverlay" role="dialog" aria-modal="true" aria-labelledby="dcImgTitle">
-    <div class="dc-modal">
-        <div class="dc-modal-head">
+<div class="dc-pv-overlay" id="dcOverlay" role="dialog" aria-modal="true" aria-labelledby="dcImgTitle">
+    <div class="dc-pv-box">
+        <div class="dc-pv-head">
             <h3 id="dcImgTitle"></h3>
-            <button type="button" class="dc-modal-close" aria-label="Close" onclick="dcImgClose()">&times;</button>
+            <button type="button" class="dc-pv-close" aria-label="Close" onclick="dcImgClose()">&times;</button>
         </div>
-        <div class="dc-modal-body"><div class="dc-img-wrap" id="dcImgWrap"></div></div>
-        <div class="dc-modal-foot">
+        <div class="dc-pv-body"><div class="dc-pv-img" id="dcImgWrap"></div></div>
+        <div class="dc-pv-foot">
             <div class="text-muted" style="font-size:12px" id="dcImgMeta"></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
                 <button type="button" class="btn btn-ghost" onclick="dcImgClose()">Close</button>
@@ -1330,7 +1334,7 @@ function dcRenderImageModal(): void {
         img.src = el.getAttribute('data-dc-img');
         img.alt = el.getAttribute('data-dc-name') || '';
         img.title = 'Click to zoom';
-        img.addEventListener('click', function () { img.classList.toggle('dc-img-zoomed'); });
+        img.addEventListener('click', function () { img.classList.toggle('dc-pv-zoomed'); });
         wrap.appendChild(img);
         overlay.classList.add('open');
     });
