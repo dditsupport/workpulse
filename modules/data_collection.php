@@ -303,6 +303,45 @@ function dcQuestionLabel(array $req): string {
     return $q !== '' ? $q : 'Answer / remark';
 }
 
+// The task's questions as one numbered series — the main question first,
+// then the sub-questions under it. They are all questions to the outlet
+// answering them, so they are numbered together rather than the main one
+// standing outside the count.
+//
+// Each entry is ['id' => 0 for the main question else the dc_questions id,
+//                'text' => wording, 'no' => 1-based number or 0 when the
+//                task asks only one thing and a number would be noise].
+function dcQuestionSeries(array $req, array $subQs): array {
+    $main = trim((string)($req['question'] ?? ''));
+
+    // No main question, but sub-questions: the real questions carry the
+    // numbering and the general box goes last, unnumbered — "1. Answer /
+    // remark" ahead of the actual questions would read as nonsense.
+    if ($main === '' && $subQs) {
+        $out = [];
+        foreach ($subQs as $i => $q) {
+            $out[] = ['id' => (int)$q['id'], 'text' => (string)$q['question_text'], 'no' => $i + 1];
+        }
+        $out[] = ['id' => 0, 'text' => 'Any other remark', 'no' => 0];
+        return $out;
+    }
+
+    $out = [['id' => 0, 'text' => dcQuestionLabel($req), 'no' => 0]];
+    foreach ($subQs as $q) {
+        $out[] = ['id' => (int)$q['id'], 'text' => (string)$q['question_text'], 'no' => 0];
+    }
+    // A lone box does not need to be called "1".
+    if (count($out) > 1) {
+        foreach ($out as $i => $_) $out[$i]['no'] = $i + 1;
+    }
+    return $out;
+}
+
+// The number badge in front of a question, empty for a lone question.
+function dcQuestionNo(int $no): string {
+    return $no > 0 ? '<span class="dc-q-n">' . $no . '</span>' : '';
+}
+
 // Anything a filesystem or a zip entry dislikes, for a folder or file name.
 function dcSafeName(string $s): string {
     $s = str_replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], '-', $s);
@@ -983,11 +1022,15 @@ function dcServeFile(): void {
     $path = dcFilePath($row);
     if (!$path) { http_response_code(404); echo 'File missing'; return; }
 
+    // Same rule as the sample files: ?inline=1 on a real image is the
+    // preview modal asking for it, anything else is a download.
+    $inline = !empty($_GET['inline']) && dcIsImage($row['mime_type']);
     header('Content-Type: ' . ($row['mime_type'] ?: 'application/octet-stream'));
     header('X-Content-Type-Options: nosniff');
-    header('Content-Disposition: attachment; filename="' . str_replace('"', '', (string)$row['original_name']) . '"');
+    header('Content-Disposition: ' . ($inline ? 'inline' : 'attachment')
+         . '; filename="' . str_replace('"', '', (string)$row['original_name']) . '"');
     header('Content-Length: ' . (int)filesize($path));
-    header('Cache-Control: private, no-store');
+    header('Cache-Control: private, max-age=300');
     readfile($path);
     exit;
 }
@@ -1036,10 +1079,14 @@ function dcAnswersCsvString(array $req, array $locIds): string {
     fputcsv($out, ['Task', $req['title']], escape: '');
     fputcsv($out, ['Downloaded', date('d M Y H:i')], escape: '');
     fputcsv($out, [], escape: '');
-    // Each question is its own column, headed by the question itself, so the
-    // sheet can be read and sorted without going back to the app.
-    $head = ['Location', 'Status', dcQuestionLabel($req)];
-    foreach ($subQs as $q) $head[] = (string)$q['question_text'];
+    // Each question is its own column, headed by the question itself and
+    // numbered as it is on screen, so the sheet can be read and sorted
+    // without going back to the app.
+    $series = dcQuestionSeries($req, $subQs);
+    $head   = ['Location', 'Status'];
+    foreach ($series as $q) {
+        $head[] = ((int)$q['no'] > 0 ? $q['no'] . '. ' : '') . $q['text'];
+    }
     $head[] = 'Filed by'; $head[] = 'When'; $head[] = 'Files';
     fputcsv($out, $head, escape: '');
 
@@ -1050,12 +1097,12 @@ function dcAnswersCsvString(array $req, array $locIds): string {
         $who   = (string)($sub['confirmed_name'] ?? $sub['confirmed_by'] ?? $sub['updated_name'] ?? $sub['updated_by'] ?? '');
         if ($who !== '' && (int)($sub['on_behalf'] ?? 0) === 1) $who .= ' (on behalf)';
         $when  = (string)($sub['confirmed_at'] ?? $sub['updated_at'] ?? '');
-        $row = [
-            $names[$lid] ?? ('#' . $lid),
-            dcStateLabel($state),
-            (string)($sub['answer_text'] ?? ''),
-        ];
-        foreach ($subQs as $q) $row[] = (string)($answers[$lid][(int)$q['id']] ?? '');
+        $row = [$names[$lid] ?? ('#' . $lid), dcStateLabel($state)];
+        foreach ($series as $q) {
+            $row[] = (int)$q['id'] === 0
+                ? (string)($sub['answer_text'] ?? '')
+                : (string)($answers[$lid][(int)$q['id']] ?? '');
+        }
         $row[] = $who;
         $row[] = $when !== '' ? date('d M Y H:i', strtotime($when)) : '';
         $row[] = count($files);
@@ -1218,6 +1265,88 @@ function dcOutstandingForMe(): int {
         $n = 0;                      // un-migrated database: nothing to nag about
     }
     return $n;
+}
+
+// ── The image preview modal ─────────────────────────────
+// Rendered by both the task page and the task form. Any element carrying
+// data-dc-img opens here: the sample format, a photo an outlet sent, the
+// thumbnails on either. Same shape as the Review Punch Request modal in
+// modules/punch_requests.php, so the two feel like one app.
+function dcRenderImageModal(): void {
+?>
+<style>
+/* Image preview — same shape as the Review Punch Request modal in
+   modules/punch_requests.php, so a photo opens where you are looking
+   instead of in another tab. */
+.dc-overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);display:none;z-index:9100;align-items:flex-start;justify-content:center;padding:14px;overflow:auto}
+.dc-overlay.open{display:flex}
+.dc-modal{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;width:100%;max-width:min(1280px,96vw);max-height:calc(100vh - 28px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 48px rgba(0,0,0,.6)}
+.dc-modal-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-bottom:1px solid var(--border)}
+.dc-modal-head h3{margin:0;font-size:15px;font-weight:600;word-break:break-all}
+.dc-modal-close{background:transparent;border:none;color:var(--muted);font-size:24px;cursor:pointer;line-height:1;padding:0 4px}
+.dc-modal-close:hover{color:var(--text)}
+.dc-modal-body{padding:14px 18px;overflow:auto;flex:1}
+.dc-img-wrap{background:#000;border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;min-height:480px;max-height:78vh;overflow:auto}
+.dc-img-wrap img{max-width:100%;max-height:78vh;display:block;cursor:zoom-in}
+.dc-img-wrap img.dc-img-zoomed{max-height:none;max-width:none;cursor:zoom-out}
+.dc-modal-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-top:1px solid var(--border);background:rgba(0,0,0,.15);flex-wrap:wrap}
+@media(max-width:900px){.dc-img-wrap{min-height:320px}}
+@media(max-width:560px){.dc-img-wrap{min-height:240px}}
+</style>
+<!-- ── Image preview, shared by every photo on the page ── -->
+<div class="dc-overlay" id="dcOverlay" role="dialog" aria-modal="true" aria-labelledby="dcImgTitle">
+    <div class="dc-modal">
+        <div class="dc-modal-head">
+            <h3 id="dcImgTitle"></h3>
+            <button type="button" class="dc-modal-close" aria-label="Close" onclick="dcImgClose()">&times;</button>
+        </div>
+        <div class="dc-modal-body"><div class="dc-img-wrap" id="dcImgWrap"></div></div>
+        <div class="dc-modal-foot">
+            <div class="text-muted" style="font-size:12px" id="dcImgMeta"></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button type="button" class="btn btn-ghost" onclick="dcImgClose()">Close</button>
+                <a id="dcImgFull" class="btn btn-secondary" href="#" target="_blank" rel="noopener" style="padding:4px 12px">Open Original</a>
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+(function () {
+    var overlay = document.getElementById('dcOverlay');
+    if (!overlay) return;
+    var wrap = document.getElementById('dcImgWrap');
+
+    // Anything carrying data-dc-img opens here — the sample format, a
+    // photo an outlet sent, the thumbnails on both.
+    document.addEventListener('click', function (e) {
+        var el = e.target.closest ? e.target.closest('[data-dc-img]') : null;
+        if (!el) return;
+        e.preventDefault();
+        document.getElementById('dcImgTitle').textContent = el.getAttribute('data-dc-name') || 'Photo';
+        document.getElementById('dcImgMeta').textContent  = el.getAttribute('data-dc-meta') || '';
+        document.getElementById('dcImgFull').setAttribute('href', el.getAttribute('data-dc-full') || '#');
+        wrap.innerHTML = '';
+        var img = document.createElement('img');
+        img.src = el.getAttribute('data-dc-img');
+        img.alt = el.getAttribute('data-dc-name') || '';
+        img.title = 'Click to zoom';
+        img.addEventListener('click', function () { img.classList.toggle('dc-img-zoomed'); });
+        wrap.appendChild(img);
+        overlay.classList.add('open');
+    });
+
+    window.dcImgClose = function () {
+        overlay.classList.remove('open');
+        wrap.innerHTML = '';                     // stop the browser holding the bytes
+    };
+    document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && overlay.classList.contains('open')) dcImgClose();
+    });
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) dcImgClose(); });
+})();
+</script>
+
+<?php
 }
 
 // ── Page: the task list ─────────────────────────────────
@@ -1405,8 +1534,13 @@ function pageDataCollectionForm(): void {
             <?php foreach ($samples as $sf): ?>
             <div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border)">
                 <?php if (dcIsImage($sf['mime_type'])): ?>
-                <img src="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1" alt=""
-                     style="height:38px;width:38px;object-fit:cover;border-radius:4px;border:1px solid var(--border)">
+                <a href="?page=dc_sample&id=<?= (int)$sf['id'] ?>"
+                   data-dc-img="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1"
+                   data-dc-full="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1"
+                   data-dc-name="<?= h($sf['original_name']) ?>" data-dc-meta="Sample / format file">
+                    <img src="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1" alt="" title="Click to view"
+                         style="height:38px;width:38px;object-fit:cover;border-radius:4px;border:1px solid var(--border);cursor:zoom-in;display:block">
+                </a>
                 <?php endif; ?>
                 <a href="?page=dc_sample&id=<?= (int)$sf['id'] ?>" style="flex:1 1 auto;word-break:break-all"><?= h($sf['original_name']) ?></a>
                 <span class="text-muted" style="font-size:11px;white-space:nowrap"><?= h(dcFormatBytes((int)$sf['size_bytes'])) ?></span>
@@ -1458,6 +1592,7 @@ function pageDataCollectionForm(): void {
         <a href="?page=<?= $req ? 'data_collection&id=' . (int)$req['id'] : 'data_collections' ?>" class="btn btn-ghost">Cancel</a>
     </div>
 </form>
+<?php dcRenderImageModal(); ?>
 <script>
 function dcTickAll(on){document.querySelectorAll('.dc-loc').forEach(function(c){c.checked=on;});}
 // Sub-question rows. A new row carries id 0; the server tells new from
@@ -1548,7 +1683,7 @@ function pageDataCollection(): void {
       padding:7px 10px;background:rgba(26,143,227,.10);border-left:3px solid var(--accent);border-radius:0 5px 5px 0}
 .dc-q-n{display:inline-block;min-width:18px;color:var(--accent);font-weight:700}
 .dc-a{white-space:pre-wrap;font-size:13px;padding:8px 10px;border:1px solid var(--border);border-radius:6px}
-.dc-sample-thumb{max-height:150px;max-width:100%;border:1px solid var(--border);border-radius:6px;display:block}
+.dc-sample-thumb{max-height:150px;max-width:100%;border:1px solid var(--border);border-radius:6px;display:block;cursor:zoom-in}
 </style>
 <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
     <div>
@@ -1595,15 +1730,20 @@ if ($samples): ?>
     <?php if (dcIsImage($sf['mime_type'])): ?>
     <?php // An example photo says in one look what the words take a paragraph
           // to say, so it is shown here rather than left as a download. ?>
-    <a href="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1" target="_blank" rel="noopener"
-       style="display:inline-block;margin:2px 0 8px">
+    <a href="?page=dc_sample&id=<?= (int)$sf['id'] ?>" style="display:inline-block;margin:2px 0 8px"
+       data-dc-img="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1"
+       data-dc-full="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1"
+       data-dc-name="<?= h($sf['original_name']) ?>"
+       data-dc-meta="Sample / format file · <?= h(dcFormatBytes((int)$sf['size_bytes'])) ?>">
         <img src="?page=dc_sample&id=<?= (int)$sf['id'] ?>&inline=1" class="dc-sample-thumb"
-             alt="<?= h($sf['original_name']) ?>" loading="lazy">
+             alt="<?= h($sf['original_name']) ?>" title="Click to view" loading="lazy">
     </a>
     <?php endif; ?>
     <?php endforeach; ?>
 </div>
 <?php endif; ?>
+
+<?php dcRenderImageModal(); ?>
 
 <?php if ($manage): ?>
 <div class="table-wrap" style="padding:12px;margin-bottom:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -1729,6 +1869,16 @@ if ($selected > 0):
         <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:4px">Files sent (<?= count($myFiles) ?>)</div>
         <?php foreach ($myFiles as $f): ?>
         <div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)">
+            <?php if (dcIsImage($f['mime_type'])): ?>
+            <a href="?page=dc_file&id=<?= (int)$f['id'] ?>"
+               data-dc-img="?page=dc_file&id=<?= (int)$f['id'] ?>&inline=1"
+               data-dc-full="?page=dc_file&id=<?= (int)$f['id'] ?>&inline=1"
+               data-dc-name="<?= h($f['original_name']) ?>"
+               data-dc-meta="<?= h($names[$selected] ?? '') ?> · <?= h(dcFormatBytes((int)$f['size_bytes'])) ?>">
+                <img src="?page=dc_file&id=<?= (int)$f['id'] ?>&inline=1" alt="" loading="lazy" title="Click to view"
+                     style="height:40px;width:40px;object-fit:cover;border-radius:4px;border:1px solid var(--border);cursor:zoom-in;display:block">
+            </a>
+            <?php endif; ?>
             <a href="?page=dc_file&id=<?= (int)$f['id'] ?>" style="flex:1 1 auto;word-break:break-all"><?= h($f['original_name']) ?></a>
             <span class="text-muted" style="font-size:11px;white-space:nowrap"><?= h(dcFormatBytes((int)$f['size_bytes'])) ?></span>
             <?php if ($canEdit): ?>
@@ -1752,17 +1902,16 @@ if ($selected > 0):
         <?php // The questions come before the file picker: they are what the
               // files are meant to show, and a question printed under the
               // upload hint reads as part of that hint. ?>
+        <?php foreach (dcQuestionSeries($req, $subQs) as $q): ?>
         <div class="form-group">
-            <div class="dc-q"><?= h(dcQuestionLabel($req)) ?></div>
+            <div class="dc-q"><?= dcQuestionNo((int)$q['no']) ?><?= h($q['text']) ?></div>
+            <?php if ((int)$q['id'] === 0): ?>
             <textarea name="answer_text" class="form-control" rows="3" maxlength="<?= DC_MAX_ANSWER ?>"
                       placeholder="Type your answer here"><?= h((string)($sub['answer_text'] ?? '')) ?></textarea>
-        </div>
-
-        <?php foreach ($subQs as $n => $q): $qid = (int)$q['id']; ?>
-        <div class="form-group">
-            <div class="dc-q"><span class="dc-q-n"><?= $n + 1 ?></span><?= h($q['question_text']) ?></div>
-            <textarea name="sub_answers[<?= $qid ?>]" class="form-control" rows="2" maxlength="<?= DC_MAX_ANSWER ?>"
-                      placeholder="Type your answer here"><?= h((string)($myAnswers[$qid] ?? '')) ?></textarea>
+            <?php else: ?>
+            <textarea name="sub_answers[<?= (int)$q['id'] ?>]" class="form-control" rows="3" maxlength="<?= DC_MAX_ANSWER ?>"
+                      placeholder="Type your answer here"><?= h((string)($myAnswers[(int)$q['id']] ?? '')) ?></textarea>
+            <?php endif; ?>
         </div>
         <?php endforeach; ?>
 
@@ -1810,17 +1959,14 @@ if ($selected > 0):
     </div>
     <?php endif; ?>
     <?php else: ?>
+    <?php foreach (dcQuestionSeries($req, $subQs) as $q):
+        $txt = (int)$q['id'] === 0
+            ? trim((string)($sub['answer_text'] ?? ''))
+            : trim((string)($myAnswers[(int)$q['id']] ?? '')); ?>
     <div class="form-group">
-        <div class="dc-q"><?= h(dcQuestionLabel($req)) ?></div>
+        <div class="dc-q"><?= dcQuestionNo((int)$q['no']) ?><?= h($q['text']) ?></div>
         <div class="dc-a">
-            <?= trim((string)($sub['answer_text'] ?? '')) !== '' ? h((string)$sub['answer_text']) : '<span class="text-muted">No answer written.</span>' ?>
-        </div>
-    </div>
-    <?php foreach ($subQs as $n => $q): $qid = (int)$q['id']; ?>
-    <div class="form-group">
-        <div class="dc-q"><span class="dc-q-n"><?= $n + 1 ?></span><?= h($q['question_text']) ?></div>
-        <div class="dc-a">
-            <?= trim((string)($myAnswers[$qid] ?? '')) !== '' ? h((string)$myAnswers[$qid]) : '<span class="text-muted">No answer written.</span>' ?>
+            <?= $txt !== '' ? h($txt) : '<span class="text-muted">No answer written.</span>' ?>
         </div>
     </div>
     <?php endforeach; ?>
@@ -1850,7 +1996,7 @@ if ($selected > 0):
         <tr>
             <th style="width:190px">Location</th>
             <th style="width:110px">Status</th>
-            <th><?= h(dcQuestionLabel($req)) ?><?= $subQs ? ' <span class="text-muted" style="font-weight:400">+ ' . count($subQs) . ' more</span>' : '' ?></th>
+            <th>Answers<?= $subQs ? ' <span class="text-muted" style="font-weight:400">(' . (count($subQs) + 1) . ' questions)</span>' : '' ?></th>
             <th style="width:240px">Files</th>
             <th style="width:170px">Filed by</th>
             <th style="width:150px"></th>
@@ -1871,12 +2017,14 @@ if ($selected > 0):
             <td><?= h($names[$lid] ?? ('#' . $lid)) ?></td>
             <td><?= dcStateBadge($state) ?></td>
             <td style="font-size:12px">
-                <div style="white-space:pre-wrap">
-                    <?= trim((string)($sub['answer_text'] ?? '')) !== '' ? h((string)$sub['answer_text']) : '<span class="text-muted">—</span>' ?>
-                </div>
-                <?php foreach ($subQs as $n => $q): $a = trim((string)($answers[$lid][(int)$q['id']] ?? '')); ?>
-                <div style="margin-top:6px">
-                    <div class="text-muted" style="font-size:11px"><?= $n + 1 ?>. <?= h($q['question_text']) ?></div>
+                <?php foreach (dcQuestionSeries($req, $subQs) as $qi => $q):
+                    $a = (int)$q['id'] === 0
+                        ? trim((string)($sub['answer_text'] ?? ''))
+                        : trim((string)($answers[$lid][(int)$q['id']] ?? '')); ?>
+                <div<?= $qi ? ' style="margin-top:6px"' : '' ?>>
+                    <?php if ((int)$q['no'] > 0): ?>
+                    <div class="text-muted" style="font-size:11px"><?= (int)$q['no'] ?>. <?= h($q['text']) ?></div>
+                    <?php endif; ?>
                     <div style="white-space:pre-wrap"><?= $a !== '' ? h($a) : '<span class="text-muted">—</span>' ?></div>
                 </div>
                 <?php endforeach; ?>
@@ -1885,7 +2033,17 @@ if ($selected > 0):
                 <?php if (!$files): ?>
                 <span class="text-muted">—</span>
                 <?php else: foreach ($files as $f): ?>
-                <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
+                <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+                    <?php if (dcIsImage($f['mime_type'])): ?>
+                    <a href="?page=dc_file&id=<?= (int)$f['id'] ?>"
+                       data-dc-img="?page=dc_file&id=<?= (int)$f['id'] ?>&inline=1"
+                       data-dc-full="?page=dc_file&id=<?= (int)$f['id'] ?>&inline=1"
+                       data-dc-name="<?= h($f['original_name']) ?>"
+                       data-dc-meta="<?= h($names[$lid] ?? '') ?> · <?= h(dcFormatBytes((int)$f['size_bytes'])) ?>">
+                        <img src="?page=dc_file&id=<?= (int)$f['id'] ?>&inline=1" alt="" loading="lazy" title="Click to view"
+                             style="height:34px;width:34px;object-fit:cover;border-radius:4px;border:1px solid var(--border);cursor:zoom-in;display:block">
+                    </a>
+                    <?php endif; ?>
                     <a href="?page=dc_file&id=<?= (int)$f['id'] ?>" style="word-break:break-all"><?= h($f['original_name']) ?></a>
                     <?php if (dcCanEditSubmission($req, $lid, $sub)): ?>
                     <form method="POST" class="inline-form" onsubmit="return confirm('Remove this file?')">
