@@ -1768,9 +1768,6 @@ if ($samples): ?>
     </span>
     <?php endif; ?>
     <a href="?page=dc_export_answers&id=<?= $id ?>" class="btn btn-secondary btn-sm">Download answers (CSV)</a>
-    <?php if ($inWindow): ?>
-    <button type="button" class="btn btn-secondary btn-sm" onclick="dcFileOpen()">File on behalf of a location</button>
-    <?php endif; ?>
     <a href="?page=data_collection_new&id=<?= $id ?>" class="btn btn-ghost btn-sm">Edit task</a>
     <form method="POST" class="inline-form">
         <input type="hidden" name="action" value="dc_close_request">
@@ -1993,10 +1990,9 @@ $cardHtml = ob_get_clean();
 if (!$inWindow) {
     echo $cardHtml;
 } else {
-    // Opened by the button in the action bar, by "File for this" on a board
-    // row, or straight away when the URL already names a location — which is
-    // what those row links and the picker inside do, so the window survives
-    // the reload they cause.
+    // "On behalf" on a board row is a link that reloads with the outlet in
+    // the URL, and so is the picker inside the window. Opening whenever the
+    // URL names a location is what makes both survive that reload.
     $autoOpen = isset($_GET['loc']);
 ?>
 <div class="dc-pv-overlay<?= $autoOpen ? ' open' : '' ?>" id="dcFileOverlay" role="dialog" aria-modal="true"
@@ -2016,7 +2012,6 @@ if (!$inWindow) {
 (function () {
     var ov = document.getElementById('dcFileOverlay');
     if (!ov) return;
-    window.dcFileOpen  = function () { ov.classList.add('open'); };
     window.dcFileClose = function () { ov.classList.remove('open'); };
     ov.addEventListener('click', function (e) { if (e.target === ov) dcFileClose(); });
     document.addEventListener('keydown', function (e) {
@@ -2147,8 +2142,14 @@ endif; // submit card
                     <input type="hidden" name="location_id" value="<?= $lid ?>">
                     <button class="btn btn-sm btn-primary">Confirm</button>
                 </form>
-                <?php elseif ($isOpen): ?>
-                <a href="?page=data_collection&id=<?= $id ?>&loc=<?= $lid ?>" class="btn btn-sm btn-ghost">File for this</a>
+                <?php endif; ?>
+                <?php if ($isOpen): ?>
+                <?php // On every row, not only the empty ones: an outlet that
+                      // sent the wrong photo needs Operations to fix it just as
+                      // much as one that sent nothing. Reloads with the outlet
+                      // in the URL, which opens the window on it. ?>
+                <a href="?page=data_collection&id=<?= $id ?>&loc=<?= $lid ?>" class="btn btn-sm btn-ghost"
+                   title="File on behalf of <?= h($names[$lid] ?? '') ?>">On behalf</a>
                 <?php endif; ?>
             </td>
         </tr>
