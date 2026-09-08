@@ -69,7 +69,10 @@ covering five stores files for all five, picking the outlet from a dropdown.
    answer, and it can remove a file it sent by mistake. The board shows it as
    *Submitted*, which is the number to chase — that outlet has done its part.
 3. **Confirm** — Operations accepts a submission, from the board row or with
-   *Confirm all submitted* once the ZIP is down. Only now does the outlet lose
+   *Confirm all submitted* once the ZIP is down. The board filters by state —
+   *Not submitted* to see who to chase, *Waiting on you* for what is ready to
+   accept — and Operations files for an outlet through *File on behalf of a
+   location*, which opens the submission form in a window over the board. Only now does the outlet lose
    the ability to add, remove or change anything, and only now does the board
    count it as *Confirmed*. A confirm is refused for an outlet that sent
    nothing, or that sent no file when the task requires one.
