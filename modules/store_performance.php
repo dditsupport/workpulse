@@ -1703,11 +1703,16 @@ function pagePerfReviews(): void {
 <div class="page-header">
     <h2>📈 Performance Reviews · <?= h(perfMonthLabel($month)) ?></h2>
     <?php if (perfCanAdmin()): ?>
-        <!-- The only route to the upload page: it is deliberately not a
-             sidebar entry, so this button has to read as an action. -->
-        <a class="btn btn-primary" href="index.php?page=perf_upload">Upload month's data</a>
-        <a class="btn btn-ghost" href="index.php?page=perf_targets">Outlet goals</a>
-        <a class="btn btn-ghost" href="index.php?page=perf_params">Parameters</a>
+        <!-- Wrapped in .actions: .page-header is space-between, so loose
+             buttons get spread to the far corners of the page instead of
+             sitting together as one group.
+             Upload is the only route to that page — it is deliberately not
+             a sidebar entry — so it stays the primary of the three. -->
+        <div class="actions">
+            <a class="btn btn-primary btn-sm" href="index.php?page=perf_upload">Upload month's data</a>
+            <a class="btn btn-ghost btn-sm" href="index.php?page=perf_targets">Outlet goals</a>
+            <a class="btn btn-ghost btn-sm" href="index.php?page=perf_params">Parameters</a>
+        </div>
     <?php endif; ?>
 </div>
 
