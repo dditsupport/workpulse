@@ -4,9 +4,20 @@
 // =========================================================
 function renderStyles(): void { ?>
 <style>
-:root{--bg:#1c1c24;--surface:#262632;--border:#363648;--accent:#1a8fe3;--text:#e6e6f0;--muted:#8c8ca0;--green:#27ae60;--yellow:#c9a800;--red:#dc4040;--blue:#1a8fe3;--purple:#9b59b6;--sidebar:220px}
+:root{--bg:#1c1c24;--surface:#262632;--border:#363648;--accent:#1a8fe3;--text:#e6e6f0;--muted:#8c8ca0;--green:#27ae60;--yellow:#c9a800;--red:#dc4040;--blue:#1a8fe3;--purple:#9b59b6;--sidebar:220px;--link:#4aa6ec;--link-hover:#8ecbf5}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',sans-serif;font-size:14px;background:var(--bg);color:var(--text);display:flex;min-height:100vh}
+/* Links never had a colour rule, so every plain <a> — a task title, an
+   uploaded filename, a ticket number — fell back to the browser's #0000EE
+   and its purple visited state. Both are close to unreadable on this dark
+   surface. Buttons and nav items set their own colour and are unaffected;
+   the underline is left to the browser, so this changes colour only.
+   --link is a shade lighter than --accent on purpose: table rows sit on
+   --surface, where the accent itself reaches only 4.33:1 against small
+   text. --link clears 5.6:1 there and 6.4:1 on the page background. */
+a{color:var(--link)}
+a:visited{color:var(--link)}
+a:hover{color:var(--link-hover)}
 /* Sidebar */
 .sidebar{width:var(--sidebar);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;height:100vh;overflow-y:auto}
 .sidebar-brand{padding:18px 16px;font-size:17px;font-weight:700;color:var(--accent);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
