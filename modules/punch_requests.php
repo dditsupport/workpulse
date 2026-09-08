@@ -118,6 +118,50 @@ function doSubmitPunchRequest(): void {
     header('Location: index.php?page=punch_request'); exit;
 }
 
+// ── Delete own punch request (owner, while not approved) ──
+// An approved request has already been written into attendance_logs, so
+// it stays put — only HR can undo that. Pending/rejected rows are the
+// employee's to withdraw or clear.
+function doDeletePunchRequest(): void {
+    $back = 'index.php?page=punch_request';
+    $id   = (int)($_POST['request_id'] ?? 0);
+
+    $db = getDb();
+    $st = $db->prepare('SELECT employee_code, status, punch_date, attachment_stored FROM punch_requests WHERE id = ?');
+    $st->execute([$id]);
+    $req = $st->fetch(PDO::FETCH_ASSOC);
+
+    if (!$req) {
+        flash('error', 'Request not found.');
+        header("Location: {$back}"); exit;
+    }
+    if ($req['employee_code'] !== myCode()) {
+        flash('error', 'You can only delete your own requests.');
+        header("Location: {$back}"); exit;
+    }
+    if ($req['status'] === 'approved') {
+        flash('error', 'Approved requests cannot be deleted.');
+        header("Location: {$back}"); exit;
+    }
+
+    // Only drop the file once the row is gone — and only if the DELETE
+    // actually matched a still-unapproved row (guards a concurrent approval).
+    $del = $db->prepare("DELETE FROM punch_requests WHERE id = ? AND employee_code = ? AND status <> 'approved'");
+    $del->execute([$id, myCode()]);
+    if ($del->rowCount() !== 1) {
+        flash('error', 'Request could not be deleted — it may have just been approved.');
+        header("Location: {$back}"); exit;
+    }
+
+    if (!empty($req['attachment_stored'])) {
+        $path = prAttachmentPath((string)$req['punch_date'], (string)$req['attachment_stored'], false);
+        if (is_file($path)) @unlink($path);
+    }
+
+    flash('success', 'Punch request deleted.');
+    header("Location: {$back}"); exit;
+}
+
 // ── Approve/reject punch request (HR, superadmin) ────────
 function doReviewPunchRequest(): void {
     // Detect AJAX call (modal review on approve_punches). Non-AJAX
@@ -287,6 +331,7 @@ function pagePunchRequest(): void {
                 <th>Status</th>
                 <th>HR Note</th>
                 <th>Reviewed</th>
+                <th style="width:80px;text-align:center">Action</th>
             </tr>
         </thead>
         <tbody>
@@ -301,6 +346,17 @@ function pagePunchRequest(): void {
                 <td><span class="badge <?= $r['status'] === 'approved' ? 'badge-green' : ($r['status'] === 'rejected' ? 'badge-red' : 'badge-yellow') ?>"><?= ucfirst($r['status']) ?></span></td>
                 <td class="text-muted"><?= !empty($r['review_note']) ? h($r['review_note']) : '—' ?></td>
                 <td class="text-muted"><?= $r['reviewed_at'] ? date('d M H:i', strtotime($r['reviewed_at'])) : '—' ?></td>
+                <td style="text-align:center">
+                    <?php if ($r['status'] !== 'approved'): ?>
+                    <form method="POST" style="display:inline" onsubmit="return confirm('Delete this punch request?')">
+                        <input type="hidden" name="action" value="delete_punch_request">
+                        <input type="hidden" name="request_id" value="<?= (int)$r['id'] ?>">
+                        <button type="submit" class="btn btn-sm btn-danger">Delete</button>
+                    </form>
+                    <?php else: ?>
+                    <span class="text-muted">—</span>
+                    <?php endif; ?>
+                </td>
             </tr>
         <?php endforeach; ?>
         </tbody>
