@@ -1277,31 +1277,35 @@ function dcRenderImageModal(): void {
 <style>
 /* Image preview — same shape as the Review Punch Request modal in
    modules/punch_requests.php, so a photo opens where you are looking
-   instead of in another tab. */
-.dc-overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);display:none;z-index:9100;align-items:flex-start;justify-content:center;padding:14px;overflow:auto}
-.dc-overlay.open{display:flex}
-.dc-modal{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;width:100%;max-width:min(1280px,96vw);max-height:calc(100vh - 28px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 48px rgba(0,0,0,.6)}
-.dc-modal-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-bottom:1px solid var(--border)}
-.dc-modal-head h3{margin:0;font-size:15px;font-weight:600;word-break:break-all}
-.dc-modal-close{background:transparent;border:none;color:var(--muted);font-size:24px;cursor:pointer;line-height:1;padding:0 4px}
-.dc-modal-close:hover{color:var(--text)}
-.dc-modal-body{padding:14px 18px;overflow:auto;flex:1}
-.dc-img-wrap{background:#000;border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;min-height:480px;max-height:78vh;overflow:auto}
-.dc-img-wrap img{max-width:100%;max-height:78vh;display:block;cursor:zoom-in}
-.dc-img-wrap img.dc-img-zoomed{max-height:none;max-width:none;cursor:zoom-out}
-.dc-modal-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-top:1px solid var(--border);background:rgba(0,0,0,.15);flex-wrap:wrap}
-@media(max-width:900px){.dc-img-wrap{min-height:320px}}
-@media(max-width:560px){.dc-img-wrap{min-height:240px}}
+   instead of in another tab.
+   The dc-pv- prefix is deliberate: the Discard dialog further down this
+   file already owns .dc-modal (as its OVERLAY, with display:none), and
+   its rules come later in the page, so sharing the name left this box
+   hidden behind a darkened screen for anyone who could see both. */
+.dc-pv-overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);display:none;z-index:9100;align-items:flex-start;justify-content:center;padding:14px;overflow:auto}
+.dc-pv-overlay.open{display:flex}
+.dc-pv-box{background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:10px;width:100%;max-width:min(1280px,96vw);max-height:calc(100vh - 28px);display:flex;flex-direction:column;overflow:hidden;box-shadow:0 16px 48px rgba(0,0,0,.6)}
+.dc-pv-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-bottom:1px solid var(--border)}
+.dc-pv-head h3{margin:0;font-size:15px;font-weight:600;word-break:break-all}
+.dc-pv-close{background:transparent;border:none;color:var(--muted);font-size:24px;cursor:pointer;line-height:1;padding:0 4px}
+.dc-pv-close:hover{color:var(--text)}
+.dc-pv-body{padding:14px 18px;overflow:auto;flex:1}
+.dc-pv-img{background:#000;border:1px solid var(--border);border-radius:6px;display:flex;align-items:center;justify-content:center;min-height:480px;max-height:78vh;overflow:auto}
+.dc-pv-img img{max-width:100%;max-height:78vh;display:block;cursor:zoom-in}
+.dc-pv-img img.dc-pv-zoomed{max-height:none;max-width:none;cursor:zoom-out}
+.dc-pv-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-top:1px solid var(--border);background:rgba(0,0,0,.15);flex-wrap:wrap}
+@media(max-width:900px){.dc-pv-img{min-height:320px}}
+@media(max-width:560px){.dc-pv-img{min-height:240px}}
 </style>
 <!-- ── Image preview, shared by every photo on the page ── -->
-<div class="dc-overlay" id="dcOverlay" role="dialog" aria-modal="true" aria-labelledby="dcImgTitle">
-    <div class="dc-modal">
-        <div class="dc-modal-head">
+<div class="dc-pv-overlay" id="dcOverlay" role="dialog" aria-modal="true" aria-labelledby="dcImgTitle">
+    <div class="dc-pv-box">
+        <div class="dc-pv-head">
             <h3 id="dcImgTitle"></h3>
-            <button type="button" class="dc-modal-close" aria-label="Close" onclick="dcImgClose()">&times;</button>
+            <button type="button" class="dc-pv-close" aria-label="Close" onclick="dcImgClose()">&times;</button>
         </div>
-        <div class="dc-modal-body"><div class="dc-img-wrap" id="dcImgWrap"></div></div>
-        <div class="dc-modal-foot">
+        <div class="dc-pv-body"><div class="dc-pv-img" id="dcImgWrap"></div></div>
+        <div class="dc-pv-foot">
             <div class="text-muted" style="font-size:12px" id="dcImgMeta"></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
                 <button type="button" class="btn btn-ghost" onclick="dcImgClose()">Close</button>
@@ -1330,7 +1334,7 @@ function dcRenderImageModal(): void {
         img.src = el.getAttribute('data-dc-img');
         img.alt = el.getAttribute('data-dc-name') || '';
         img.title = 'Click to zoom';
-        img.addEventListener('click', function () { img.classList.toggle('dc-img-zoomed'); });
+        img.addEventListener('click', function () { img.classList.toggle('dc-pv-zoomed'); });
         wrap.appendChild(img);
         overlay.classList.add('open');
     });
@@ -1664,6 +1668,9 @@ function pageDataCollection(): void {
     $submitLocs = $manage ? $targets : $myHere;
     $selected   = (int)($_GET['loc'] ?? 0);
     if (!in_array($selected, $submitLocs, true)) $selected = $submitLocs[0] ?? 0;
+    // Operations filing for an outlet that is not theirs gets the form in a
+    // window rather than inline; an outlet's own submission stays on the page.
+    $inWindow = $manage && $selected > 0 && !isset($mine[$selected]);
 
     // Two different numbers: who has sent anything (the chase), and what
     // Operations has accepted (the lock).
@@ -1684,6 +1691,10 @@ function pageDataCollection(): void {
 .dc-q-n{display:inline-block;min-width:18px;color:var(--accent);font-weight:700}
 .dc-a{white-space:pre-wrap;font-size:13px;padding:8px 10px;border:1px solid var(--border);border-radius:6px}
 .dc-sample-thumb{max-height:150px;max-width:100%;border:1px solid var(--border);border-radius:6px;display:block;cursor:zoom-in}
+/* The stacked-table rule in styles.php sets tr{display:block} on narrow
+   screens, which outranks the browser's own [hidden] — so a filtered-out
+   row would still show on a phone without this. */
+tr.dc-row[hidden]{display:none!important}
 </style>
 <div class="page-header" style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
     <div>
@@ -1757,6 +1768,9 @@ if ($samples): ?>
     </span>
     <?php endif; ?>
     <a href="?page=dc_export_answers&id=<?= $id ?>" class="btn btn-secondary btn-sm">Download answers (CSV)</a>
+    <?php if ($inWindow): ?>
+    <button type="button" class="btn btn-secondary btn-sm" onclick="dcFileOpen()">File on behalf of a location</button>
+    <?php endif; ?>
     <a href="?page=data_collection_new&id=<?= $id ?>" class="btn btn-ghost btn-sm">Edit task</a>
     <form method="POST" class="inline-form">
         <input type="hidden" name="action" value="dc_close_request">
@@ -1823,14 +1837,16 @@ if ($selected > 0):
     $myFiles  = $byLoc[$selected] ?? [];
     $state     = dcLocationState($sub, count($myFiles), dcHasSubAnswers($answers[$selected] ?? []));
     $canEdit   = dcCanEditSubmission($req, $selected, $sub);
-    $onBehalf  = !isset($mine[$selected]);
     $myAnswers = $answers[$selected] ?? [];
+    ob_start();
 ?>
-<div class="table-wrap" style="padding:16px;margin-bottom:14px">
+<div class="<?= $inWindow ? '' : 'table-wrap' ?>" style="<?= $inWindow ? '' : 'padding:16px;margin-bottom:14px' ?>">
+    <?php if (!$inWindow): ?>
     <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
-        <strong><?= $onBehalf ? 'File on behalf of a location' : 'Your submission' ?></strong>
+        <strong>Your submission</strong>
         <?= dcStateBadge($state) ?>
     </div>
+    <?php endif; ?>
 
     <?php if (count($submitLocs) > 1): ?>
     <form method="GET" style="margin-bottom:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -1972,15 +1988,67 @@ if ($selected > 0):
     <?php endforeach; ?>
     <?php endif; ?>
 </div>
-<?php endif; // submit card ?>
+<?php
+$cardHtml = ob_get_clean();
+if (!$inWindow) {
+    echo $cardHtml;
+} else {
+    // Opened by the button in the action bar, by "File for this" on a board
+    // row, or straight away when the URL already names a location — which is
+    // what those row links and the picker inside do, so the window survives
+    // the reload they cause.
+    $autoOpen = isset($_GET['loc']);
+?>
+<div class="dc-pv-overlay<?= $autoOpen ? ' open' : '' ?>" id="dcFileOverlay" role="dialog" aria-modal="true"
+     aria-labelledby="dcFileTitle">
+    <div class="dc-pv-box" style="max-width:min(880px,96vw)">
+        <div class="dc-pv-head">
+            <h3 id="dcFileTitle">File on behalf of <?= h($names[$selected] ?? ('#' . $selected)) ?></h3>
+            <div style="display:flex;align-items:center;gap:10px">
+                <?= dcStateBadge($state) ?>
+                <button type="button" class="dc-pv-close" aria-label="Close" onclick="dcFileClose()">&times;</button>
+            </div>
+        </div>
+        <div class="dc-pv-body"><?= $cardHtml ?></div>
+    </div>
+</div>
+<script>
+(function () {
+    var ov = document.getElementById('dcFileOverlay');
+    if (!ov) return;
+    window.dcFileOpen  = function () { ov.classList.add('open'); };
+    window.dcFileClose = function () { ov.classList.remove('open'); };
+    ov.addEventListener('click', function (e) { if (e.target === ov) dcFileClose(); });
+    document.addEventListener('keydown', function (e) {
+        // The photo preview sits on top of this one; let it close first.
+        if (e.key !== 'Escape' || !ov.classList.contains('open')) return;
+        var pv = document.getElementById('dcOverlay');
+        if (pv && pv.classList.contains('open')) return;
+        dcFileClose();
+    });
+})();
+</script>
+<?php
+}
+endif; // submit card
+?>
 
 <?php if ($manage):
     $awaiting = $sentHere - $confirmed;         // sent, not yet accepted
 ?>
 <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">
-    <div style="font-size:12px" class="text-muted">
-        <?= $sentHere ?> of <?= count($targets) ?> submitted · <?= $confirmed ?> confirmed
-        <?= $awaiting > 0 ? ' · ' . $awaiting . ' waiting on you' : '' ?>
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <?php // Filtering happens in the browser: every row is already on the
+              // page, so there is nothing to fetch and no scroll position to
+              // lose between one status and the next.
+        $counts = ['all' => count($targets), 'confirmed' => $confirmed,
+                   'submitted' => $sentHere - $confirmed, 'nothing' => count($targets) - $sentHere];
+        foreach (['all' => 'All', 'nothing' => 'Not submitted',
+                  'submitted' => 'Waiting on you', 'confirmed' => 'Confirmed'] as $key => $label): ?>
+        <button type="button" class="btn btn-sm dc-fbtn<?= $key === 'all' ? ' btn-primary active' : ' btn-ghost' ?>"
+                data-dc-filter="<?= $key ?>"><?= h($label) ?> (<?= (int)$counts[$key] ?>)</button>
+        <?php endforeach; ?>
+        <span class="text-muted" style="font-size:12px;margin-left:4px" id="dcFilterNote"></span>
     </div>
     <?php if ($awaiting > 0 && $isOpen): ?>
     <form method="POST" onsubmit="return confirm('Confirm all <?= $awaiting ?> submitted location(s)? They will not be able to change anything afterwards.')">
@@ -2013,7 +2081,7 @@ if ($selected > 0):
         if ($who === '') $who = (string)($sub['updated_name'] ?? '') ?: (string)($sub['updated_by'] ?? '');
         $when  = (string)($sub['confirmed_at'] ?? '') ?: (string)($sub['updated_at'] ?? '');
     ?>
-        <tr>
+        <tr class="dc-row" data-dc-state="<?= h($state) ?>">
             <td><?= h($names[$lid] ?? ('#' . $lid)) ?></td>
             <td><?= dcStateBadge($state) ?></td>
             <td style="font-size:12px">
@@ -2089,5 +2157,32 @@ if ($selected > 0):
 </table>
 </div>
 <div class="table-count"><?= $sentHere ?> of <?= count($targets) ?> location(s) submitted · <?= $confirmed ?> confirmed</div>
+<script>
+(function () {
+    var btns = document.querySelectorAll('.dc-fbtn');
+    var rows = document.querySelectorAll('tr.dc-row');
+    var note = document.getElementById('dcFilterNote');
+    if (!btns.length || !rows.length) return;
+    btns.forEach(function (b) {
+        b.addEventListener('click', function () {
+            var want = b.getAttribute('data-dc-filter');
+            btns.forEach(function (o) {
+                o.classList.remove('active', 'btn-primary');
+                o.classList.add('btn-ghost');
+            });
+            b.classList.add('active', 'btn-primary');
+            b.classList.remove('btn-ghost');
+            var shown = 0;
+            rows.forEach(function (r) {
+                // "Waiting on you" is the submitted-but-not-confirmed set.
+                var hit = want === 'all' || r.getAttribute('data-dc-state') === want;
+                r.hidden = !hit;
+                if (hit) shown++;
+            });
+            note.textContent = want === 'all' ? '' : 'showing ' + shown + ' of ' + rows.length;
+        });
+    });
+})();
+</script>
 <?php endif;
 }
