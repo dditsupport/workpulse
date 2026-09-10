@@ -201,8 +201,20 @@ function dcRequest(int $id): ?array {
     return $st->fetch(PDO::FETCH_ASSOC) ?: null;
 }
 
+// The task's outlets, always in alphabetical order by outlet name. Row
+// order here drives the detail table, the outlet picker, the answers CSV
+// and the ZIP, so one ORDER BY keeps all four reading the same way —
+// location_id put them in whatever order the outlets happened to be
+// created. The join is a LEFT one so a target can never be dropped from
+// the task by a missing locations row; anything without a name to sort on
+// falls to the end by id instead of leading the list.
 function dcRequestLocationIds(int $id): array {
-    $st = getDb()->prepare('SELECT location_id FROM dc_request_locations WHERE request_id = ? ORDER BY location_id');
+    $st = getDb()->prepare(
+        'SELECT rl.location_id
+           FROM dc_request_locations rl
+      LEFT JOIN locations l ON l.location_id = rl.location_id
+          WHERE rl.request_id = ?
+       ORDER BY (l.location_name IS NULL), l.location_name, rl.location_id');
     $st->execute([$id]);
     return array_map('intval', $st->fetchAll(PDO::FETCH_COLUMN));
 }
