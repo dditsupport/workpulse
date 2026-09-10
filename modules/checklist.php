@@ -126,6 +126,48 @@ function chkCanValidateItem(int $checklistId, int $itemId, string $code): bool {
     return $items === null || in_array($itemId, $items, true);
 }
 
+// Set a task's per-task validators to exactly $codes, for the picker on the
+// task editor. Only item rows are touched: someone designated for the whole
+// checklist keeps that designation (the Validators card at the bottom of the
+// page is what narrows or removes it), and a code that already holds the
+// whole checklist is ignored here rather than duplicated onto the task.
+// Returns [added, removed].
+function chkSyncItemValidators(int $checklistId, int $itemId, array $codes): array {
+    if ($checklistId <= 0 || $itemId <= 0 || !chkHasItemValidators()) return [0, 0];
+    $db = getDb();
+    $want = [];
+    foreach ($codes as $c) {
+        $c = trim((string)$c);
+        if ($c !== '') $want[$c] = true;
+    }
+    // Only real employees, and never someone who already holds every task.
+    if ($want) {
+        $in = implode(',', array_fill(0, count($want), '?'));
+        $ex = $db->prepare("SELECT employee_code FROM employees WHERE employee_code IN ({$in})");
+        $ex->execute(array_keys($want));
+        $want = array_fill_keys($ex->fetchAll(PDO::FETCH_COLUMN), true);
+    }
+    $wh = $db->prepare("SELECT employee_code FROM chk_validators WHERE checklist_id = ? AND item_id = 0");
+    $wh->execute([$checklistId]);
+    foreach ($wh->fetchAll(PDO::FETCH_COLUMN) as $c) unset($want[(string)$c]);
+
+    $cur = $db->prepare("SELECT employee_code FROM chk_validators WHERE checklist_id = ? AND item_id = ?");
+    $cur->execute([$checklistId, $itemId]);
+    $have = array_fill_keys(array_map('strval', $cur->fetchAll(PDO::FETCH_COLUMN)), true);
+
+    $add = array_diff_key($want, $have);
+    $del = array_diff_key($have, $want);
+    if ($del) {
+        $ins = $db->prepare("DELETE FROM chk_validators WHERE checklist_id = ? AND item_id = ? AND employee_code = ?");
+        foreach (array_keys($del) as $c) $ins->execute([$checklistId, $itemId, $c]);
+    }
+    if ($add) {
+        $ins = $db->prepare("INSERT IGNORE INTO chk_validators (checklist_id, item_id, employee_code) VALUES (?,?,?)");
+        foreach (array_keys($add) as $c) $ins->execute([$checklistId, $itemId, $c]);
+    }
+    return [count($add), count($del)];
+}
+
 // Validators of a checklist grouped by the task they hold, for the manage
 // screen: [item_id => [['employee_code' => ..., 'full_name' => ...], ...]],
 // with the checklist-wide ones under key 0.
@@ -1760,6 +1802,7 @@ function doSaveTask(): void {
     $desc        = trim($_POST['description'] ?? '');
     $type        = $_POST['input_type'] ?? 'yes_no';
     $est         = max(0, (int)($_POST['est_minutes'] ?? 0));
+    $isNew       = $id <= 0;
     if (!in_array($type, ['yes_no', 'time', 'text', 'number'], true)) $type = 'yes_no';
     $back = chkManageBack($checklistId);
 
@@ -1796,8 +1839,22 @@ function doSaveTask(): void {
     } else {
         $st = $db->prepare("INSERT INTO chk_items (checklist_id, section_id, section_name, task_description, input_type, est_minutes, is_active) VALUES (?,?,?,?,?,?,1)");
         $st->execute([$checklistId, ($sectionId ?: null), $secName, $desc, $type, $est]);
+        $id = (int)$db->lastInsertId();
     }
-    flash('success', $id ? 'Task updated.' : 'Task added.');
+    // The task editor carries a validator picker; validators_present marks a
+    // post that came from it, so a form without the picker never wipes the
+    // task's designations.
+    $valNote = '';
+    if (!empty($_POST['validators_present'])) {
+        [$vAdd, $vDel] = chkSyncItemValidators($checklistId, $id, (array)($_POST['validators'] ?? []));
+        if ($vAdd || $vDel) $valNote = " Validators: {$vAdd} added, {$vDel} removed.";
+    }
+    flash('success', ($isNew ? 'Task added.' : 'Task updated.') . $valNote);
+    // Reopen the editor on the task just saved, so a run of validator edits
+    // does not mean hunting for the row and clicking Edit again.
+    if ($id > 0 && strpos($back, 'edit_task=') === false) {
+        $back .= (strpos($back, '?') === false ? '?' : '&') . 'edit_task=' . $id;
+    }
     header("Location: {$back}"); exit;
 }
 
@@ -3167,6 +3224,19 @@ function pageManageTasks(): void {
     }
     // item_id => designated validators, for the Tasks table column.
     $valByItem = $selId ? chkValidatorsByItem($selId) : [];
+    // Whole-checklist validators (item 0) validate every task, so the task
+    // editor shows them ticked and locked; the rest of the picker is the
+    // per-task designations, which it can change.
+    $wholeVal   = $valByItem[0] ?? [];
+    $wholeCodes = array_fill_keys(array_column($wholeVal, 'employee_code'), true);
+    $valCodesOf = [];
+    foreach ($valByItem as $vItemId => $vRows) {
+        if ((int)$vItemId === 0) continue;
+        $valCodesOf[(int)$vItemId] = array_values(array_column($vRows, 'employee_code'));
+    }
+    // Task whose editor should open on load — set after saving one, so a run
+    // of validator edits keeps the form in front of the manager.
+    $editTaskId = (int)($_GET['edit_task'] ?? 0);
     $employees  = getEmployeesLite();
     $totalEst   = 0; foreach ($tasks as $t) { if ($t['is_active']) $totalEst += (int)$t['est_minutes']; }
 ?>
@@ -3330,6 +3400,38 @@ function pageManageTasks(): void {
                 <label>Std time (min)</label>
                 <input type="number" name="est_minutes" id="taskEst" class="form-control" min="0" value="0">
             </div>
+            <?php if ($hasItemVal): ?>
+            <div class="form-group" style="grid-column:1/-1">
+                <label>Validators for this task</label>
+                <input type="hidden" name="validators_present" value="1">
+                <?php if ($wholeVal): ?>
+                <div class="text-muted" style="font-size:11.5px;margin-bottom:6px">
+                    Validating <strong>every</strong> task on this checklist:
+                    <?= h(implode(', ', array_map(fn($v) => ($v['full_name'] !== '' ? $v['full_name'] : $v['employee_code']), $wholeVal))) ?>.
+                    Remove them in the <strong>Validators</strong> card below to make validation task-specific.
+                </div>
+                <?php endif; ?>
+                <input type="text" id="taskValSearch" class="form-control" placeholder="Type to filter people" autocomplete="off">
+                <div id="taskValList" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;margin-top:6px;padding:4px 0">
+                    <?php foreach ($employees as $e): if ((int)$e['is_active'] !== 1) continue;
+                        $eCode = (string)$e['employee_code'];
+                        $isWhole = isset($wholeCodes[$eCode]); ?>
+                    <label class="task-val-opt" data-name="<?= h(mb_strtolower($e['full_name'] . ' ' . $eCode)) ?>"
+                           style="display:flex;gap:8px;align-items:center;padding:5px 12px;font-size:13px;cursor:pointer">
+                        <input type="checkbox" class="task-val-box" value="<?= h($eCode) ?>"
+                               <?= $isWhole ? 'checked disabled' : 'name="validators[]"' ?>>
+                        <span><?= h($e['full_name']) ?>
+                            <span class="text-muted" style="font-size:11px">(<?= h($eCode) ?><?= $isWhole ? ' · whole checklist' : '' ?>)</span>
+                        </span>
+                    </label>
+                    <?php endforeach; ?>
+                </div>
+                <div class="text-muted" style="margin-top:4px;font-size:11.5px">
+                    Ticked people see this task on <strong>Validate Checklist</strong> and sign it off. Saved with the task.
+                    <span id="taskValCount"></span>
+                </div>
+            </div>
+            <?php endif; ?>
         </div>
         <div class="form-actions">
             <button type="submit" id="taskSubmitBtn" class="btn btn-primary">Add Task</button>
@@ -3338,6 +3440,26 @@ function pageManageTasks(): void {
     </form>
 </div>
 <script>
+// Per-task validator designations, employee codes keyed by task id. The task
+// editor is filled by JS, so the picker's ticks come from here.
+var chkTaskValidators = <?= json_encode($hasItemVal ? $valCodesOf : [], JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT) ?>;
+// Tick exactly this task's validators; the locked (whole-checklist) boxes
+// stay as rendered.
+function taskValsSet(id) {
+    var codes = chkTaskValidators[id] || [];
+    var boxes = document.querySelectorAll('.task-val-box');
+    for (var i = 0; i < boxes.length; i++) {
+        if (boxes[i].disabled) continue;
+        boxes[i].checked = codes.indexOf(boxes[i].value) !== -1;
+    }
+    taskValsCount();
+}
+function taskValsCount() {
+    var out = document.getElementById('taskValCount');
+    if (!out) return;
+    var n = document.querySelectorAll('.task-val-box:checked:not(:disabled)').length;
+    out.textContent = n === 0 ? '· none picked for this task' : '· ' + n + ' picked for this task';
+}
 function editTask(id, sectionId, desc, type, est) {
     document.getElementById('taskId').value = id;
     document.getElementById('taskSection').value = sectionId || 0;
@@ -3347,6 +3469,7 @@ function editTask(id, sectionId, desc, type, est) {
     document.getElementById('taskFormTitle').textContent = 'Edit Task #' + id;
     document.getElementById('taskSubmitBtn').textContent = 'Update Task';
     document.getElementById('taskCancelBtn').style.display = 'inline-block';
+    taskValsSet(id);
     document.getElementById('taskForm').scrollIntoView({behavior:'smooth'});
 }
 function cancelEdit() {
@@ -3358,7 +3481,33 @@ function cancelEdit() {
     document.getElementById('taskFormTitle').textContent = 'Add New Task';
     document.getElementById('taskSubmitBtn').textContent = 'Add Task';
     document.getElementById('taskCancelBtn').style.display = 'none';
+    taskValsSet(0);
 }
+(function () {
+    var list = document.getElementById('taskValList');
+    if (!list) return;
+    var search = document.getElementById('taskValSearch');
+    if (search) search.addEventListener('input', function () {
+        var q = search.value.trim().toLowerCase();
+        var opts = list.querySelectorAll('.task-val-opt');
+        for (var i = 0; i < opts.length; i++) {
+            opts[i].hidden = q !== '' && (opts[i].getAttribute('data-name') || '').indexOf(q) === -1;
+        }
+    });
+    list.addEventListener('change', taskValsCount);
+    taskValsCount();
+})();
+// Saving a task returns with ?edit_task=<id> so its editor reopens instead of
+// the manager hunting for the row again. The Tasks table is rendered after
+// this script, so the button is only there once the document is parsed.
+(function () {
+    var reopen = <?= $editTaskId ?>;
+    if (reopen <= 0) return;
+    document.addEventListener('DOMContentLoaded', function () {
+        var btn = document.querySelector('[data-edit-task="' + reopen + '"]');
+        if (btn) btn.click();
+    });
+})();
 function editSec(id, name, start, end, nextDay, sort, freq) {
     document.getElementById('secId').value = id;
     document.getElementById('secName').value = name;
@@ -3434,7 +3583,7 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
                 </td>
                 <td><?= $t['is_active'] ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-grey">Inactive</span>' ?></td>
                 <td class="actions" style="display:flex;gap:4px;flex-wrap:wrap">
-                    <button type="button" class="btn btn-primary btn-sm" onclick="editTask(<?= $t['id'] ?>, <?= (int)$t['section_id'] ?>, <?= h(json_encode($t['task_description'])) ?>, '<?= h($t['input_type']) ?>', <?= (int)$t['est_minutes'] ?>)">Edit</button>
+                    <button type="button" class="btn btn-primary btn-sm" data-edit-task="<?= $t['id'] ?>" onclick="editTask(<?= $t['id'] ?>, <?= (int)$t['section_id'] ?>, <?= h(json_encode($t['task_description'])) ?>, '<?= h($t['input_type']) ?>', <?= (int)$t['est_minutes'] ?>)">Edit</button>
                     <form method="POST" class="inline-form">
                         <input type="hidden" name="action" value="toggle_task">
                         <input type="hidden" name="checklist_id" value="<?= $selId ?>">
@@ -3466,6 +3615,12 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
         ?>
         <div class="form-card">
             <h3 style="font-size:14px;margin-bottom:10px"><?= h($title) ?></h3>
+            <?php if ($taskPick): ?>
+            <div class="text-muted" style="font-size:11.5px;margin-bottom:10px">
+                Task-by-task designations are quickest from a task's <strong>Edit</strong> form above —
+                this card is for the whole picture, and for validators of every task.
+            </div>
+            <?php endif; ?>
             <?php if (empty($rows)): ?><div class="text-muted" style="font-size:12px;margin-bottom:8px"><?= h($empty) ?></div>
             <?php else: ?>
             <div class="table-wrap" style="margin-bottom:10px"><table class="table" style="font-size:13px"><tbody>
