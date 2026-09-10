@@ -10,14 +10,18 @@ body{font-family:'Segoe UI',sans-serif;font-size:14px;background:var(--bg);color
 /* Links never had a colour rule, so every plain <a> — a task title, an
    uploaded filename, a ticket number — fell back to the browser's #0000EE
    and its purple visited state. Both are close to unreadable on this dark
-   surface. Buttons and nav items set their own colour and are unaffected;
-   the underline is left to the browser, so this changes colour only.
+   surface. The underline is left to the browser, so this changes colour only.
    --link is a shade lighter than --accent on purpose: table rows sit on
    --surface, where the accent itself reaches only 4.33:1 against small
-   text. --link clears 5.6:1 there and 6.4:1 on the page background. */
+   text. --link clears 5.6:1 there and 6.4:1 on the page background.
+   The states are wrapped in :where() so the whole block stays at
+   element-level specificity. A bare a:visited/a:hover outranks a single
+   class, so any link carrying one — .nav-item, .btn-primary — lost its own
+   colour the moment it had been visited: sidebar entries turned blue at
+   random, and blue-on-blue buttons looked blurred. */
 a{color:var(--link)}
-a:visited{color:var(--link)}
-a:hover{color:var(--link-hover)}
+a:where(:visited){color:var(--link)}
+a:where(:hover){color:var(--link-hover)}
 /* Sidebar */
 .sidebar{width:var(--sidebar);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;height:100vh;overflow-y:auto}
 .sidebar-brand{padding:18px 16px;font-size:17px;font-weight:700;color:var(--accent);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px}
