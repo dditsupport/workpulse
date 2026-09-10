@@ -64,11 +64,87 @@ function chkIsAssignee(int $checklistId, string $code): bool {
     return (bool)$st->fetchColumn();
 }
 
+// Validator of *something* on this checklist — the whole list or a single
+// task. The coarse gate: it opens the validate page and the checklist's
+// attachments, while chkValidatorItems() below decides which tasks the
+// person may actually sign off on.
 function chkIsValidator(int $checklistId, string $code): bool {
     if ($code === '') return false;
     $st = getDb()->prepare("SELECT 1 FROM chk_validators WHERE checklist_id = ? AND employee_code = ? LIMIT 1");
     $st->execute([$checklistId, $code]);
     return (bool)$st->fetchColumn();
+}
+
+// Is chk_validators.item_id there? It designates a validator per task, so a
+// department checklist can send its banking rows to accounts and its GR rows
+// to purchase. Without the column every validator holds the whole checklist,
+// which is how the module behaved before.
+function chkHasItemValidators(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    try {
+        $r = getDb()->query('SELECT item_id FROM chk_validators LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
+
+// Which tasks of this checklist may the user validate?
+//   null  → every task (superadmin, or a designated checklist-wide validator,
+//           which is any row with item_id = 0)
+//   []    → none
+//   [ids] → only those chk_items ids
+// Cached per checklist + user for the request.
+function chkValidatorItems(int $checklistId, string $code): ?array {
+    static $cache = [];
+    if (isSuperadmin()) return null;
+    if ($code === '' || $checklistId <= 0) return [];
+    $key = $checklistId . '|' . $code;
+    if (array_key_exists($key, $cache)) return $cache[$key];
+    if (!chkHasItemValidators()) {
+        // Pre-migration: a row means the whole checklist.
+        return $cache[$key] = (chkIsValidator($checklistId, $code) ? null : []);
+    }
+    try {
+        $st = getDb()->prepare("SELECT item_id FROM chk_validators WHERE checklist_id = ? AND employee_code = ?");
+        $st->execute([$checklistId, $code]);
+        $ids = [];
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $iid) {
+            if ((int)$iid === 0) return $cache[$key] = null;
+            $ids[] = (int)$iid;
+        }
+        return $cache[$key] = $ids;
+    } catch (Exception $e) {
+        return $cache[$key] = [];
+    }
+}
+
+// May the user sign off on this one task?
+function chkCanValidateItem(int $checklistId, int $itemId, string $code): bool {
+    $items = chkValidatorItems($checklistId, $code);
+    return $items === null || in_array($itemId, $items, true);
+}
+
+// Validators of a checklist grouped by the task they hold, for the manage
+// screen: [item_id => [['employee_code' => ..., 'full_name' => ...], ...]],
+// with the checklist-wide ones under key 0.
+function chkValidatorsByItem(int $checklistId): array {
+    if ($checklistId <= 0) return [];
+    $itemCol = chkHasItemValidators() ? 'v.item_id' : '0';
+    try {
+        $st = getDb()->prepare("SELECT {$itemCol} AS item_id, v.employee_code, e.full_name
+                                FROM chk_validators v
+                                LEFT JOIN employees e ON e.employee_code = v.employee_code
+                                WHERE v.checklist_id = ? ORDER BY e.full_name");
+        $st->execute([$checklistId]);
+    } catch (Exception $e) { return []; }
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $out[(int)$r['item_id']][] = ['employee_code' => (string)$r['employee_code'],
+                                      'full_name'     => (string)($r['full_name'] ?? '')];
+    }
+    return $out;
 }
 
 // Admin over all checklists (manage every checklist + view-all reports).
@@ -103,9 +179,11 @@ function chkChecklistOfItem(int $itemId): int {
     return (int)($st->fetchColumn() ?: 0);
 }
 
-// May the current user validate this checklist? Only a designated validator
-// (chk_validators) — the txn_checklist_validate role merely reveals the page,
-// it does NOT grant validation rights. Superadmin is the global override.
+// May the current user validate anything on this checklist? Only a designated
+// validator (chk_validators) — the txn_checklist_validate role merely reveals
+// the page, it does NOT grant validation rights. Superadmin is the global
+// override. Which of its tasks they sign off on is chkCanValidateItem()'s
+// question, not this one's.
 function chkCanValidateChecklist(int $checklistId, string $code): bool {
     return isSuperadmin() || chkIsValidator($checklistId, $code);
 }
@@ -1627,8 +1705,52 @@ function doDelChkPerson(string $table, string $label): void {
 }
 function doSaveAssignee():  void { doSaveChkPerson('chk_assignees',  'assignee');  }
 function doDelAssignee():   void { doDelChkPerson('chk_assignees',   'assignee');  }
-function doSaveValidator(): void { doSaveChkPerson('chk_validators', 'validator'); }
 function doDelValidator():  void { doDelChkPerson('chk_validators',  'validator'); }
+
+// ── Manage: add a validator, for one task or the whole checklist ──
+// item_id = 0 designates the person for every task on the checklist (the
+// pre-per-task behaviour); a task id limits them to that row. Adding a
+// checklist-wide validator clears their per-task rows and vice versa, so the
+// two never disagree about the same person.
+function doSaveValidator(): void {
+    $checklistId = (int)($_POST['checklist_id'] ?? 0);
+    $code        = trim($_POST['employee_code'] ?? '');
+    $itemId      = (int)($_POST['item_id'] ?? 0);
+    $back        = chkManageBack($checklistId);
+    if ($checklistId <= 0 || $code === '') {
+        flash('error', 'Pick an employee to add as validator.');
+        header("Location: {$back}"); exit;
+    }
+    chkRequireManage($checklistId);
+    if (!chkHasItemValidators()) $itemId = 0;
+    // The task must belong to this checklist — never trust the POSTed id.
+    if ($itemId > 0 && chkChecklistOfItem($itemId) !== $checklistId) {
+        flash('error', 'That task is not on this checklist.');
+        header("Location: {$back}"); exit;
+    }
+    $db = getDb();
+    try {
+        if (!chkHasItemValidators()) {
+            $db->prepare("INSERT IGNORE INTO chk_validators (checklist_id, employee_code) VALUES (?,?)")
+               ->execute([$checklistId, $code]);
+        } else {
+            if ($itemId === 0) {
+                // Whole checklist supersedes whatever single tasks they held.
+                $db->prepare("DELETE FROM chk_validators WHERE checklist_id = ? AND employee_code = ? AND item_id <> 0")
+                   ->execute([$checklistId, $code]);
+            } else {
+                $db->prepare("DELETE FROM chk_validators WHERE checklist_id = ? AND employee_code = ? AND item_id = 0")
+                   ->execute([$checklistId, $code]);
+            }
+            $db->prepare("INSERT IGNORE INTO chk_validators (checklist_id, item_id, employee_code) VALUES (?,?,?)")
+               ->execute([$checklistId, $itemId, $code]);
+        }
+        flash('success', $itemId > 0 ? 'Validator added for that task.' : 'Validator added for the whole checklist.');
+    } catch (Exception $e) {
+        flash('error', 'Could not add validator.');
+    }
+    header("Location: {$back}"); exit;
+}
 
 // ── Manage tasks: save ────────────────────────────────────
 function doSaveTask(): void {
@@ -1661,8 +1783,16 @@ function doSaveTask(): void {
         if ($secName === false) { $sectionId = 0; $secName = null; }
     }
     if ($id > 0) {
+        // Moving a task to another checklist voids its per-task validator
+        // designations — they were made by the old checklist's managers and
+        // must not follow the task across.
+        $wasOn = chkChecklistOfItem($id);
         $st = $db->prepare("UPDATE chk_items SET checklist_id=?, section_id=?, section_name=?, task_description=?, input_type=?, est_minutes=? WHERE id=?");
         $st->execute([$checklistId, ($sectionId ?: null), $secName, $desc, $type, $est, $id]);
+        if ($wasOn !== $checklistId && chkHasItemValidators()) {
+            try { $db->prepare("DELETE FROM chk_validators WHERE item_id = ?")->execute([$id]); }
+            catch (Exception $e) { /* designation cleanup is best-effort */ }
+        }
     } else {
         $st = $db->prepare("INSERT INTO chk_items (checklist_id, section_id, section_name, task_description, input_type, est_minutes, is_active) VALUES (?,?,?,?,?,?,1)");
         $st->execute([$checklistId, ($sectionId ?: null), $secName, $desc, $type, $est]);
@@ -1693,6 +1823,12 @@ function doDelTask(): void {
         flash('error', 'Cannot delete: task has historical data. Deactivate instead.');
     } else {
         $db->prepare("DELETE FROM chk_items WHERE id = ?")->execute([$id]);
+        // Drop the per-task validator designations with it, so the Validators
+        // box does not keep rows pointing at a task that no longer exists.
+        if (chkHasItemValidators()) {
+            try { $db->prepare("DELETE FROM chk_validators WHERE item_id = ?")->execute([$id]); }
+            catch (Exception $e) { /* designation cleanup is best-effort */ }
+        }
         flash('success', 'Task deleted.');
     }
     header('Location: ' . chkManageBack($checklistId)); exit;
@@ -3013,7 +3149,24 @@ function pageManageTasks(): void {
         return $st->fetchAll(PDO::FETCH_ASSOC);
     };
     $assignees  = $isEmp ? $people('chk_assignees') : [];
-    $validators = $selId ? $people('chk_validators') : [];
+    // Validators carry the task they were designated for (item_id 0 = the
+    // whole checklist), so the box can name it and the Tasks table can show
+    // who signs off on each row.
+    $hasItemVal = chkHasItemValidators();
+    $validators = [];
+    if ($selId) {
+        $vSel = $hasItemVal ? 'p.item_id' : '0';
+        $vst  = $db->prepare("SELECT p.id, p.employee_code, e.full_name, {$vSel} AS item_id,
+                                     q.task_description, q.is_active AS task_active
+                              FROM chk_validators p
+                              LEFT JOIN employees e ON e.employee_code = p.employee_code
+                              LEFT JOIN chk_items q ON q.id = {$vSel} AND q.checklist_id = p.checklist_id
+                              WHERE p.checklist_id = ? ORDER BY item_id, e.full_name");
+        $vst->execute([$selId]);
+        $validators = $vst->fetchAll(PDO::FETCH_ASSOC);
+    }
+    // item_id => designated validators, for the Tasks table column.
+    $valByItem = $selId ? chkValidatorsByItem($selId) : [];
     $employees  = getEmployeesLite();
     $totalEst   = 0; foreach ($tasks as $t) { if ($t['is_active']) $totalEst += (int)$t['est_minutes']; }
 ?>
@@ -3253,13 +3406,14 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
                 <th>Description</th>
                 <th style="width:90px">Type</th>
                 <th style="width:70px">Min</th>
+                <th style="width:160px">Validator</th>
                 <th style="width:80px">Status</th>
                 <th style="width:180px">Actions</th>
             </tr>
         </thead>
         <tbody>
             <?php if (empty($tasks)): ?>
-            <tr><td colspan="7" class="empty-row">No tasks defined yet.</td></tr>
+            <tr><td colspan="8" class="empty-row">No tasks defined yet.</td></tr>
             <?php else: foreach ($tasks as $t): ?>
             <tr class="<?= $t['is_active'] ? '' : 'row-inactive' ?>">
                 <td><?= $t['id'] ?></td>
@@ -3267,6 +3421,17 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
                 <td><?= chkTaskHtml($t['task_description']) ?></td>
                 <td><span class="badge badge-blue"><?= h($t['input_type']) ?></span></td>
                 <td><?= (int)$t['est_minutes'] ?></td>
+                <td style="white-space:normal;font-size:12px">
+                    <?php $tv = $valByItem[(int)$t['id']] ?? []; $tvAll = $valByItem[0] ?? [];
+                          $nameOf = fn(array $v) => ($v['full_name'] !== '' ? $v['full_name'] : $v['employee_code']);
+                          if ($tv): ?>
+                        <?= h(implode(', ', array_map($nameOf, $tv))) ?>
+                    <?php elseif ($tvAll): ?>
+                        <span class="text-muted">Whole list: <?= h(implode(', ', array_map($nameOf, $tvAll))) ?></span>
+                    <?php else: ?>
+                        <span class="text-muted">—</span>
+                    <?php endif; ?>
+                </td>
                 <td><?= $t['is_active'] ? '<span class="badge badge-green">Active</span>' : '<span class="badge badge-grey">Inactive</span>' ?></td>
                 <td class="actions" style="display:flex;gap:4px;flex-wrap:wrap">
                     <button type="button" class="btn btn-primary btn-sm" onclick="editTask(<?= $t['id'] ?>, <?= (int)$t['section_id'] ?>, <?= h(json_encode($t['task_description'])) ?>, '<?= h($t['input_type']) ?>', <?= (int)$t['est_minutes'] ?>)">Edit</button>
@@ -3294,7 +3459,10 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
 <!-- Assignees (employee-mode) + Validators -->
 <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px">
     <?php
-    $personBox = function (string $title, string $addAction, string $delAction, array $rows, string $empty) use ($selId, $employees) {
+    // $taskPick: offer a task select (validators only) so a person can be
+    // designated for one task instead of the whole checklist.
+    $personBox = function (string $title, string $addAction, string $delAction, array $rows, string $empty, bool $taskPick = false) use ($selId, $employees, $tasks, $hasItemVal) {
+        $taskPick = $taskPick && $hasItemVal;
         ?>
         <div class="form-card">
             <h3 style="font-size:14px;margin-bottom:10px"><?= h($title) ?></h3>
@@ -3303,7 +3471,16 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
             <div class="table-wrap" style="margin-bottom:10px"><table class="table" style="font-size:13px"><tbody>
             <?php foreach ($rows as $r): ?>
                 <tr>
-                    <td><?= h($r['full_name'] ?? $r['employee_code']) ?> <span class="text-muted" style="font-size:11px">(<?= h($r['employee_code']) ?>)</span></td>
+                    <td><?= h($r['full_name'] ?? $r['employee_code']) ?> <span class="text-muted" style="font-size:11px">(<?= h($r['employee_code']) ?>)</span>
+                        <?php if ($taskPick): $vItem = (int)($r['item_id'] ?? 0); ?>
+                        <br><span class="text-muted" style="font-size:11px">
+                            <?php if ($vItem === 0): ?>Whole checklist
+                            <?php elseif (($r['task_description'] ?? null) === null): ?>Task #<?= $vItem ?> (deleted)
+                            <?php else: ?>#<?= $vItem ?> <?= h(chkTaskName($r['task_description'])) ?><?= (int)($r['task_active'] ?? 1) ? '' : ' (inactive)' ?>
+                            <?php endif; ?>
+                        </span>
+                        <?php endif; ?>
+                    </td>
                     <td style="width:60px;text-align:right">
                         <form method="POST" class="inline-form">
                             <input type="hidden" name="action" value="<?= h($delAction) ?>">
@@ -3319,7 +3496,7 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
             <form method="POST" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
                 <input type="hidden" name="action" value="<?= h($addAction) ?>">
                 <input type="hidden" name="checklist_id" value="<?= $selId ?>">
-                <div class="form-group" style="margin:0;flex:1"><label>Add employee</label>
+                <div class="form-group" style="margin:0;flex:1 1 160px"><label>Add employee</label>
                     <select name="employee_code" class="form-control" required>
                         <option value="">— Select —</option>
                         <?php foreach ($employees as $e): if ((int)$e['is_active'] !== 1) continue; ?>
@@ -3327,13 +3504,24 @@ function clMetaNew() { clMeta(0, '', 'location', 1, 0, 0, 'daily'); }
                         <?php endforeach; ?>
                     </select>
                 </div>
+                <?php if ($taskPick): ?>
+                <div class="form-group" style="margin:0;flex:1 1 200px"><label>For task</label>
+                    <select name="item_id" class="form-control">
+                        <option value="0">— Whole checklist (all tasks) —</option>
+                        <?php foreach ($tasks as $t): ?>
+                        <option value="<?= (int)$t['id'] ?>">#<?= (int)$t['id'] ?> · <?= h(chkTaskName($t['task_description'])) ?><?= (int)$t['is_active'] ? '' : ' (inactive)' ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <?php endif; ?>
                 <button type="submit" class="btn btn-primary">Add</button>
             </form>
         </div>
         <?php
     };
     if ($isEmp) $personBox('Designated fillers (assignees)', 'save_assignee', 'del_assignee', $assignees, 'No assignees — only admins can fill this checklist.');
-    $personBox('Validators', 'save_validator', 'del_validator', $validators, 'No validators designated yet.');
+    $personBox('Validators', 'save_validator', 'del_validator', $validators,
+               'No validators designated yet.', true);
     ?>
 </div>
 <?php endif; // $cl ?>

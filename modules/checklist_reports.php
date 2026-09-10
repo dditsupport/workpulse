@@ -1691,6 +1691,10 @@ function doDeleteChecklistMonth(): void {
 // Stored in chk_validations (one row per location/item/day). Gated by
 // txn_checklist_validate. Surfaced on the Monthly Report (cell borders)
 // and the Checklist Audit (validator name/time/remark).
+//
+// Validators are designated per task (chk_validators.item_id), so a
+// department checklist shows each validator only their own tasks; a
+// validator designated for the whole checklist (item_id 0) sees them all.
 function pageChecklistValidate(): void {
     $db = getDb();
     $me = myCode();
@@ -1723,6 +1727,9 @@ function pageChecklistValidate(): void {
     $viewClicked = !empty($_GET['view']) || (!$empMode && $locationId > 0);
     $locationName = '';
     $items = []; $responses = []; $vals = []; $atts = []; $staffRemarks = [];
+    // Tasks designated to this validator: null until resolved / for a
+    // whole-checklist validator, an array of chk_items ids otherwise.
+    $myItems = null;
     // The filler's own remark on each task, distinct from the validator's.
     $remarkCol = function_exists('chkHasRemarks') && chkHasRemarks();
     if ($viewClicked) {
@@ -1741,6 +1748,15 @@ function pageChecklistValidate(): void {
                             ORDER BY section_name, i.id ASC");
         $is->execute([$checklistId]);
         $items = $is->fetchAll(PDO::FETCH_ASSOC);
+
+        // Keep only the tasks this validator was designated for. null = the
+        // whole checklist (superadmin or a checklist-wide validator).
+        $myItems = chkValidatorItems($checklistId, $me);
+        if ($myItems !== null) {
+            $allowed = array_flip($myItems);
+            $items   = array_values(array_filter($items,
+                fn($it) => isset($allowed[(int)$it['id']])));
+        }
 
         // Each task's answer sits on its own cycle's anchor, so all three are
         // fetched and matched per task — see the note in pageChecklistAudit().
@@ -1812,10 +1828,15 @@ function pageChecklistValidate(): void {
 <?php if (!$viewClicked || (!$empMode && $locationId < 1)): ?>
 <div class="rpt-prompt"><?= $empMode ? 'Pick a date, then click <strong>Load</strong>.' : 'Pick a location and date, then click <strong>Load</strong> to validate that day\'s tasks.' ?></div>
 <?php elseif (!$items): ?>
-<div class="rpt-prompt">No active checklist tasks found.</div>
+<div class="rpt-prompt"><?= $myItems !== null
+    ? 'None of this checklist\'s active tasks are designated to you. Ask an admin to assign your tasks under <strong>Manage Checklists → Validators</strong>.'
+    : 'No active checklist tasks found.' ?></div>
 <?php else: ?>
 <div class="report-header-box">
     <strong><?= h($empMode ? '' : ($locationName ?: ('Location #' . $locationId))) ?></strong> — <?= date('D, d M Y', strtotime($logDate)) ?>
+    <?php if ($myItems !== null): ?>
+    <span class="text-muted" style="font-size:12px">· <?= count($items) ?> task(s) designated to you</span>
+    <?php endif; ?>
 </div>
 <form method="POST">
     <input type="hidden" name="action" value="save_checklist_validation">
@@ -1959,9 +1980,13 @@ function doSaveChecklistValidation(): void {
 
     $saved = 0;
     try {
+        $skipped = 0;
         foreach ($statuses as $itemId => $st) {
             $itemId = (int)$itemId;
             if ($itemId <= 0) continue;
+            // Validators are designated per task: a posted item that is not
+            // one of theirs is dropped, however the form was submitted.
+            if (!chkCanValidateItem($checklistId, $itemId, $code)) { $skipped++; continue; }
             $st  = (string)$st;
             $rem = trim((string)($remarks[$itemId] ?? ''));
             if ($st === 'done' || $st === 'not_done') {
@@ -1971,7 +1996,8 @@ function doSaveChecklistValidation(): void {
                 $del->execute([$locationId, $itemId, $logDate]);
             }
         }
-        flash('success', "Validation saved — {$saved} task(s) marked.");
+        flash('success', "Validation saved — {$saved} task(s) marked."
+            . ($skipped > 0 ? " {$skipped} task(s) skipped — not designated to you." : ''));
     } catch (Exception $e) {
         flash('error', $e->getMessage());
     }
