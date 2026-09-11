@@ -205,15 +205,19 @@ with no figure" are different statements; the `—` is reserved for the second.
 The month under review is boxed, and its whole column is tinted so last year's
 August sits under this year's.
 
-Each figure carries a ▲/▼ against **the same month a year earlier** — Apr 2026
-against Apr 2025, which is the cell directly above it. Not against the month
-before: seasons move these numbers more than anything an outlet does (Rakhi,
-Diwali, exam season), so April against March mostly measures the calendar, while
-April against last April measures the outlet. The arrow is coloured by whether
-that movement is good for *that* parameter — wastage falling is green, wastage
-rising is red — and hovering the figure names the month it was compared against
-and its value, including when that month is not itself on screen. The grid is
-read a year wider than it is drawn so the earliest row still gets its arrows.
+**A figure is green or red by how it stands against the same month a year
+earlier** — Apr 2026 against Apr 2025, which is the cell directly above it. Not
+against the month before: seasons move these numbers more than anything an
+outlet does (Rakhi, Diwali, exam season), so April against March mostly measures
+the calendar, while April against last April measures the outlet.
+
+Green is the good direction *for that parameter*, so sales rising is green and
+wastage rising is red. A figure is left plain where there is nothing to compare
+(the earliest year on file, a gap in the data, a month level with last year's)
+or nothing to judge — a target is a target, not an achievement, so parameters
+with no good direction never colour. Hovering names the month compared against
+and its value, including when that month is not itself on screen; the grid is
+read a year wider than it is drawn so the earliest row still gets its colour.
 
 A month that carries a justification shows a small speech-bubble icon
 **immediately to the left of the figure, on its own line**; clicking it opens
@@ -231,13 +235,14 @@ tooltip says which it is.
 not a remark and does not hide. The boxes Operations and the Store Manager type
 into are unaffected: those stay open in the cell under review.
 
-**Achievement is also coloured against that month's Target**: green once it
-matches or beats it, red while it is short. That is separate from the arrow
-beside it, so a month can read green and still carry a red ▼ — ahead of
-target, down on last month. A month with no target, or a target of zero, is
-left uncoloured, because every figure clears zero and saying so would be
-noise. The pairing lives in `perfBenchmarks()` in `modules/store_performance.php`;
-one line there gives another parameter the same treatment.
+**What a month was held to is on the hover, not in the colour**: Achievement
+against that month's own uploaded Target, every other parameter against its
+standing goal. Colour says one thing only — the year-on-year comparison — because
+a figure can be ahead of last year and still short of target, and two meanings
+in one colour is no meaning at all. A month with no target, or a target of zero,
+says nothing on the hover either: every figure clears zero. The pairing lives in
+`perfBenchmarks()` in `modules/store_performance.php`; one line there gives
+another parameter the same treatment.
 
 The Store Manager gets a justification box per parameter in the review month's
 column, with the flagged ones marked and required (see *Asking for a
@@ -264,8 +269,8 @@ better* makes the goal a ceiling (wastage at or under it is met), *higher is
 better* a floor, *neither* means the figure is reported but never judged, and a
 goal set against it is ignored.
 
-In the review grid the goal prints under the parameter name and turns each
-month's figure green or red against it. Achievement is the exception: it is
+In the review grid the goal prints under the parameter name, and each month's
+figure is judged against it on the hover. Achievement is the exception: it is
 judged against that month's own uploaded Target, which is a moving number, not
 a standing goal.
 
@@ -291,8 +296,9 @@ Edit `perf_parameters`. `param_code` is the sort key and the stable identity
 the CSV matches on and remarks hang off, so keep it once assigned — renaming
 `param_name` is free and orphans nothing. `value_type` picks the display
 format (`amount` uses Indian grouping, `percent` shows two decimals and a `%`),
-and `better` (`up` / `down` / `none`) decides which way the delta arrow is
-good news.
+and `better` (`up` / `down` / `none`) decides which way the year-on-year
+comparison is good news — and so whether a figure that moved that way prints
+green or red. `none` never colours.
 
 `value_type` options: `amount` (Indian grouping, whole rupees), `percent`
 (two decimals, zeros kept, plus `%` — `75.10%`, `100.00%`), `decimal` (two
