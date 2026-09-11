@@ -829,7 +829,17 @@ function exportAuditRegister(): void {
     $where  = ['a.audit_date >= ?', 'a.audit_date <= ?'];
     $params = [$fromDate, $toDate];
 
-    if (!empty($_GET['status']))      { $where[] = 'a.status = ?'; $params[] = $_GET['status']; }
+    // Same set-of-statuses filter the audit list uses, so Export CSV
+    // exports exactly the rows on screen. A scalar ?status=approved from an
+    // older link is a set of one.
+    $statusSel = array_values(array_intersect(
+        ['draft','submitted','manager_review','operation_review',
+         'approver_review','management_review','approved','sent_back'],
+        array_map('strval', (array)($_GET['status'] ?? []))));
+    if ($statusSel) {
+        $where[] = 'a.status IN (' . implode(',', array_fill(0, count($statusSel), '?')) . ')';
+        foreach ($statusSel as $st) $params[] = $st;
+    }
     if (!empty($_GET['template_id'])) { $where[] = 'a.template_id = ?'; $params[] = (int)$_GET['template_id']; }
 
     // Location scope

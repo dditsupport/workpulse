@@ -17,6 +17,17 @@ function pageAuditList(): void {
     $toDate   = trim($_GET['to_date']   ?? '');
     if ($fromDate === '') $fromDate = date('Y-m-01');
     if ($toDate   === '') $toDate   = date('Y-m-d');
+    // Status arrives as a set, because that is what the Audit Summary's
+    // count links carry: a count there is taken over several statuses at
+    // once, and a link that narrowed to one of them would list fewer
+    // audits than the number the user clicked. A bare ?status=approved
+    // from an old bookmark still works — it is a set of one.
+    $ALL_AUDIT_STATUSES = ['draft','submitted','manager_review','operation_review',
+                           'approver_review','management_review','approved','sent_back'];
+    $statusSel = array_values(array_intersect(
+        $ALL_AUDIT_STATUSES,
+        array_map('strval', (array)($_GET['status'] ?? []))));
+
     $rows = [];
     $pendingApprove = 0;
     $mySentBack = 0;
@@ -29,7 +40,12 @@ function pageAuditList(): void {
         $params = [];
         auditApplyScope($where, $params);
 
-        if (!empty($_GET['status']))      { $where[] = 'a.status = ?'; $params[] = $_GET['status']; }
+        // Nothing ticked means no status filter at all, which is what the
+        // page has always done with "All Status".
+        if ($statusSel) {
+            $where[] = 'a.status IN (' . implode(',', array_fill(0, count($statusSel), '?')) . ')';
+            foreach ($statusSel as $st) $params[] = $st;
+        }
         if (!empty($_GET['template_id'])) { $where[] = 'a.template_id = ?'; $params[] = (int)$_GET['template_id']; }
         if (!empty($_GET['location_id'])) { $where[] = 'a.location_id = ?'; $params[] = (int)$_GET['location_id']; }
         $where[] = 'a.audit_date >= ?'; $params[] = $fromDate;
@@ -145,12 +161,36 @@ function pageAuditList(): void {
     <form method="GET" class="filter-bar">
         <input type="hidden" name="page" value="audit_list">
         <input type="hidden" name="view" value="1">
-        <select name="status" class="form-control" style="max-width:180px">
-            <option value="">All Status</option>
-            <?php foreach (['draft','submitted','operation_review','approver_review','management_review','approved','sent_back'] as $s): ?>
-                <option value="<?= $s ?>" <?= ($_GET['status'] ?? '') === $s ? 'selected' : '' ?>><?= h(ucfirst(str_replace('_',' ', $s))) ?></option>
-            <?php endforeach; ?>
-        </select>
+        <?php
+        // Checkbox dropdown rather than a single select: a link from the
+        // Audit Summary carries the several statuses its count was taken
+        // over, and a one-of-many control could neither show that set nor
+        // let the user change it without silently dropping the rest.
+        $statusLabels = [
+            'draft'             => 'Draft',
+            'submitted'         => 'Pending SM Justify',
+            'operation_review'  => 'Pending Operation Review',
+            'approver_review'   => 'Pending Approval',
+            'management_review' => 'Pending Management Approval',
+            'approved'          => 'Approved',
+            'sent_back'         => 'Sent Back',
+        ];
+        ?>
+        <div class="ms-filter" data-label="Status" style="width:200px">
+            <button type="button" class="form-control ms-toggle"
+                    aria-haspopup="listbox" aria-expanded="false">Status</button>
+            <div class="ms-panel" role="listbox">
+                <label class="ms-row ms-all-row"><input type="checkbox" class="ms-all"> <span>All Status</span></label>
+                <div class="ms-divider"></div>
+                <?php foreach ($statusLabels as $val => $lbl): ?>
+                    <label class="ms-row">
+                        <input type="checkbox" name="status[]" value="<?= h($val) ?>"
+                               <?= in_array($val, $statusSel, true) ? 'checked' : '' ?>>
+                        <span><?= h($lbl) ?></span>
+                    </label>
+                <?php endforeach; ?>
+            </div>
+        </div>
         <select name="template_id" class="form-control" style="max-width:200px">
             <option value="">All Templates</option>
             <?php foreach ($templates as $t): ?>
@@ -176,8 +216,96 @@ function pageAuditList(): void {
         <input type="date" id="audit-from-date" name="from_date" class="form-control" style="max-width:150px" value="<?= h($fromDate) ?>">
         <input type="date" id="audit-to-date"   name="to_date"   class="form-control" style="max-width:150px" value="<?= h($toDate) ?>">
         <button class="btn btn-secondary">View</button>
-        <a class="btn btn-ghost" href="?page=export_audit_register&from_date=<?= h($fromDate) ?>&to_date=<?= h($toDate) ?>&status=<?= h($_GET['status'] ?? '') ?>&template_id=<?= (int)($_GET['template_id'] ?? 0) ?>&location_id=<?= (int)($_GET['location_id'] ?? 0) ?>">Export CSV</a>
+        <?php // status is a set now, so the query string is built rather than interpolated. ?>
+        <a class="btn btn-ghost" href="?<?= h(http_build_query([
+            'page'        => 'export_audit_register',
+            'from_date'   => $fromDate,
+            'to_date'     => $toDate,
+            'status'      => $statusSel,
+            'template_id' => (int)($_GET['template_id'] ?? 0),
+            'location_id' => (int)($_GET['location_id'] ?? 0),
+        ])) ?>">Export CSV</a>
     </form>
+    <style>
+    /* Multi-select dropdown — the same component the employee list uses for
+       Status and Active, so the two pages read the same. */
+    .ms-filter{position:relative;display:inline-block;vertical-align:top}
+    .ms-toggle{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;cursor:pointer;text-align:left;padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .ms-toggle::after{content:'\25BE';opacity:.55;font-size:11px;flex:0 0 auto;margin-left:6px}
+    .ms-filter.open .ms-toggle::after{transform:rotate(180deg)}
+    .ms-panel{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:100%;max-height:280px;overflow-y:auto;background:var(--surface,#1f1f23);color:var(--text,#eee);border:1px solid var(--border,#444);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.4);z-index:50;padding:6px 0;white-space:nowrap}
+    .ms-filter.open .ms-panel{display:block}
+    .ms-row{display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;font-size:13px;font-weight:400;margin:0}
+    .ms-row:hover{background:rgba(255,255,255,.06)}
+    .ms-row input{margin:0;cursor:pointer}
+    .ms-row span{flex:1;min-width:0}
+    .ms-all-row{font-weight:600}
+    .ms-divider{height:1px;background:var(--border,#444);margin:4px 0}
+    </style>
+    <script>
+    (function () {
+        document.querySelectorAll('.ms-filter').forEach(initMs);
+        // Click outside closes all open dropdowns.
+        document.addEventListener('click', function (e) {
+            document.querySelectorAll('.ms-filter.open').forEach(function (f) {
+                if (!f.contains(e.target)) {
+                    f.classList.remove('open');
+                    var t = f.querySelector('.ms-toggle');
+                    if (t) t.setAttribute('aria-expanded', 'false');
+                }
+            });
+        });
+        function initMs(f) {
+            var label  = f.dataset.label || 'Filter';
+            var toggle = f.querySelector('.ms-toggle');
+            var allBox = f.querySelector('.ms-all');
+            var boxes  = Array.prototype.slice.call(
+                f.querySelectorAll('input[type="checkbox"]:not(.ms-all)'));
+            if (!toggle || !boxes.length) return;
+            function refreshLabel() {
+                var checked = boxes.filter(function (b) { return b.checked; });
+                var n = checked.length, total = boxes.length;
+                // Nothing ticked is no filter here, so it reads "All", not "None".
+                if      (n === 0 || n === total) toggle.textContent = 'All ' + label;
+                else if (n === 1) toggle.textContent =
+                    (checked[0].parentNode.querySelector('span') || {}).textContent.trim();
+                else toggle.textContent = n + ' selected';
+            }
+            function refreshAll() {
+                if (!allBox) return;
+                allBox.checked = boxes.every(function (b) { return b.checked; });
+                allBox.indeterminate = !allBox.checked && boxes.some(function (b) { return b.checked; });
+            }
+            toggle.addEventListener('click', function (e) {
+                e.stopPropagation();
+                var willOpen = !f.classList.contains('open');
+                document.querySelectorAll('.ms-filter.open').forEach(function (o) {
+                    if (o !== f) {
+                        o.classList.remove('open');
+                        var ot = o.querySelector('.ms-toggle');
+                        if (ot) ot.setAttribute('aria-expanded', 'false');
+                    }
+                });
+                f.classList.toggle('open', willOpen);
+                toggle.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+            });
+            if (allBox) {
+                // "All Status" clears the set rather than ticking every box:
+                // no status filter is what the page has always meant by All.
+                allBox.addEventListener('change', function () {
+                    boxes.forEach(function (b) { b.checked = false; });
+                    allBox.checked = false; allBox.indeterminate = false;
+                    refreshLabel();
+                });
+            }
+            boxes.forEach(function (b) {
+                b.addEventListener('change', function () { refreshAll(); refreshLabel(); });
+            });
+            refreshAll();
+            refreshLabel();
+        }
+    })();
+    </script>
     <script>
     (function () {
         var fromEl = document.getElementById('audit-from-date');
@@ -1348,6 +1476,10 @@ function auditSummaryFilters(): array {
 // narrows to a single template (0 = all). Shared by the page renderer
 // and the CSV export.
 function auditSummaryQuery(string $fromDate, string $toDate, int $templateId = 0, array $statuses = []): array {
+    // An audit with no number was never saved — a shell someone opened and
+    // walked away from. The audit list has always hidden these, so counting
+    // them here made the summary disagree with the list its counts now link
+    // to, and overstated how many audits an outlet actually had.
     $sql = "SELECT a.location_id,
                    l.location_name,
                    AVG(a.total_score) AS avg_score,
@@ -1356,7 +1488,8 @@ function auditSummaryQuery(string $fromDate, string $toDate, int $templateId = 0
                    COUNT(*)           AS audit_count
             FROM audits a
             LEFT JOIN locations l ON l.location_id = a.location_id
-            WHERE a.audit_date BETWEEN ? AND ?";
+            WHERE a.audit_date BETWEEN ? AND ?
+            AND a.audit_number IS NOT NULL AND a.audit_number <> ''";
     $params = [$fromDate, $toDate];
     if ($statuses) {
         $placeholders = implode(',', array_fill(0, count($statuses), '?'));
@@ -1384,6 +1517,10 @@ function auditSummaryQuery(string $fromDate, string $toDate, int $templateId = 0
 // flat list of locations (with their FY-overall avg) for the leftmost column.
 // Month_num is the calendar month (1-12); the renderer reorders into Apr-Mar.
 function auditSummaryMonthlyQuery(int $fyStartYear, int $templateId, array $statuses): array {
+    // An audit with no number was never saved — a shell someone opened and
+    // walked away from. The audit list has always hidden these, so counting
+    // them here made the summary disagree with the list its counts now link
+    // to, and overstated how many audits an outlet actually had.
     $fromDate = sprintf('%04d-04-01', $fyStartYear);
     $toDate   = sprintf('%04d-03-31', $fyStartYear + 1);
 
@@ -1395,7 +1532,8 @@ function auditSummaryMonthlyQuery(int $fyStartYear, int $templateId, array $stat
                    COUNT(*)            AS audit_count
             FROM audits a
             LEFT JOIN locations l ON l.location_id = a.location_id
-            WHERE a.audit_date BETWEEN ? AND ?";
+            WHERE a.audit_date BETWEEN ? AND ?
+            AND a.audit_number IS NOT NULL AND a.audit_number <> ''";
     $params = [$fromDate, $toDate];
     if ($statuses) {
         $ph = implode(',', array_fill(0, count($statuses), '?'));
@@ -1514,6 +1652,23 @@ function pageAuditSummary(): void {
         }
     }
     $overallAvg = $totalAudits > 0 ? $weightedSum / $totalAudits : null;
+
+    // Every audit count on this page is a way into the audits behind it.
+    // The link carries the same window, template and status set the count
+    // was taken over, so the list it opens holds exactly those audits and
+    // not a wider set that happens to share the location.
+    $auditListUrl = function (?int $locId, string $from, string $to) use ($templateId, $status): string {
+        $qs = [
+            'page'      => 'audit_list',
+            'view'      => 1,
+            'from_date' => $from,
+            'to_date'   => $to,
+            'status'    => $status,
+        ];
+        if ($locId)          $qs['location_id'] = $locId;
+        if ($templateId > 0) $qs['template_id'] = $templateId;
+        return 'index.php?' . http_build_query($qs);
+    };
 
     // Colour band per the spec (different thresholds from the per-question
     // tints used elsewhere — keep these inline so they don't drift).
@@ -1733,9 +1888,16 @@ function pageAuditSummary(): void {
                             $cAvg = $c && $c['avg'] !== null ? round((float)$c['avg'], 2) : null;
                         ?>
                             <td class="num <?= $bandClass($cAvg) ?>" style="text-align:center;font-family:Consolas,monospace">
-                                <?php if ($c && $cAvg !== null): ?>
+                                <?php if ($c && $cAvg !== null):
+                                    // This cell's own month, not the whole year.
+                                    $cellFrom = sprintf('%04d-%02d-01', $y, $m);
+                                    $cellTo   = date('Y-m-t', strtotime($cellFrom));
+                                ?>
                                     <?= number_format($cAvg, 2) ?>
-                                    <div style="font-size:9px;font-weight:400;opacity:.75;margin-top:-2px"><?= (int)$c['count'] ?></div>
+                                    <div style="font-size:9px;font-weight:400;opacity:.75;margin-top:-2px">
+                                        <a class="aud-sum-count" href="<?= h($auditListUrl($lid, $cellFrom, $cellTo)) ?>"
+                                           title="List these audits"><?= (int)$c['count'] ?></a>
+                                    </div>
                                 <?php else: ?>
                                     <span style="color:var(--muted);font-weight:400">—</span>
                                 <?php endif; ?>
@@ -1745,7 +1907,8 @@ function pageAuditSummary(): void {
                             <?= $l['avg_score'] !== null ? number_format((float)$l['avg_score'], 2) : '—' ?>
                         </td>
                         <td class="num" style="text-align:right;font-family:Consolas,monospace;color:var(--muted)">
-                            <?= (int)$l['total_audits'] ?>
+                            <a class="aud-sum-count" href="<?= h($auditListUrl($lid, $fromDate, $toDate)) ?>"
+                               title="List this outlet's audits for the year"><?= (int)$l['total_audits'] ?></a>
                         </td>
                     </tr>
                 <?php endforeach; endif; ?>
@@ -1774,7 +1937,10 @@ function pageAuditSummary(): void {
                         <td class="num <?= $bandClass($overallAvg) ?>" style="text-align:right;font-family:Consolas,monospace">
                             <?= $overallAvg !== null ? number_format($overallAvg, 2) : '—' ?>
                         </td>
-                        <td class="num" style="text-align:right;font-family:Consolas,monospace"><?= (int)$totalAudits ?></td>
+                        <td class="num" style="text-align:right;font-family:Consolas,monospace">
+                            <a class="aud-sum-count" href="<?= h($auditListUrl(null, $fromDate, $toDate)) ?>"
+                               title="List every audit in this year"><?= (int)$totalAudits ?></a>
+                        </td>
                     </tr>
                 </tfoot>
                 <?php endif; ?>
@@ -1816,7 +1982,11 @@ function pageAuditSummary(): void {
                 ?>
                     <tr>
                         <td><?= h((string)($r['location_name'] ?? '—')) ?></td>
-                        <td class="num" style="text-align:right;font-family:Consolas,monospace"><?= (int)$r['audit_count'] ?></td>
+                        <td class="num" style="text-align:right;font-family:Consolas,monospace">
+                            <a class="aud-sum-count"
+                               href="<?= h($auditListUrl((int)$r['location_id'], $fromDate, $toDate)) ?>"
+                               title="List these audits"><?= (int)$r['audit_count'] ?></a>
+                        </td>
                         <td class="num <?= $bandClass($avg) ?>" style="text-align:right;font-family:Consolas,monospace">
                             <?= $avg !== null ? number_format($avg, 2) : '—' ?>
                         </td>
@@ -1833,7 +2003,10 @@ function pageAuditSummary(): void {
                 <tfoot>
                     <tr style="background:var(--border);font-weight:700">
                         <td>Overall (<?= count($rows) ?> location<?= count($rows) === 1 ? '' : 's' ?>)</td>
-                        <td class="num" style="text-align:right;font-family:Consolas,monospace"><?= (int)$totalAudits ?></td>
+                        <td class="num" style="text-align:right;font-family:Consolas,monospace">
+                            <a class="aud-sum-count" href="<?= h($auditListUrl(null, $fromDate, $toDate)) ?>"
+                               title="List every audit in this range"><?= (int)$totalAudits ?></a>
+                        </td>
                         <td class="num <?= $bandClass($overallAvg) ?>" style="text-align:right;font-family:Consolas,monospace">
                             <?= $overallAvg !== null ? number_format($overallAvg, 2) : '—' ?>
                         </td>
@@ -1850,6 +2023,11 @@ function pageAuditSummary(): void {
     /* Toggle Month vs Year control groups based on the form's mode class. */
     .aud-sum-mode-month .aud-sum-year-only  { display:none; }
     .aud-sum-mode-year  .aud-sum-month-only { display:none; }
+    /* A count is a way into the audits behind it. Underlined on hover rather
+       than always, so a column of counts still reads as figures. */
+    .aud-sum-count{color:inherit;text-decoration:none;border-bottom:1px dotted currentColor;
+        padding-bottom:1px;cursor:pointer}
+    .aud-sum-count:hover{color:var(--link,#4aa6ec);border-bottom-style:solid}
     </style>
     <script>
     // Mode toggle + Month/Year auto-fill for the from/to dates.
