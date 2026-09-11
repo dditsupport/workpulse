@@ -222,8 +222,11 @@ are load-bearing. The words were printed into the cell once, which let one long
 remark set the height of its whole row; behind a *labelled button under* the
 figure they still cost every such cell a second line, and a fixed-layout row is
 as tall as its tallest cell, so one remark grew the whole band. Inline, a row
-stays one line high however many remarks it carries. The icon turns amber while
-a requested justification is unanswered, and its tooltip says which it is.
+stays one line high however many remarks it carries. The icon is yellow, at
+full strength while a requested justification is unanswered and slightly held
+back once it is answered — the cell around an open request is already tinted and
+boxed amber, so the icon does not have to carry that distinction alone. Its
+tooltip says which it is.
 *Show remarks* hides the icons — except where a request is still open, which is
 not a remark and does not hide. The boxes Operations and the Store Manager type
 into are unaffected: those stay open in the cell under review.
