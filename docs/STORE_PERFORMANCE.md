@@ -3,8 +3,8 @@
 Replaces the "Target vs Achievement" pivot workbook. Operations uploads one
 CSV a month, each Store Manager writes a remark against every parameter, and
 Operations closes the month with a conclusion. The review screen shows the
-history side by side — months across, parameters down — with each month's
-remarks sitting under the number they explain.
+history side by side — months across, parameters down, grouped into financial
+years — with each month's remarks one click behind the number they explain.
 
 Lives under **Audit and Performance** in the sidebar, as a single entry —
 *Performance Review*. The upload page is reached from the button on it rather than from the
@@ -87,7 +87,9 @@ A figure that was questioned stays highlighted, so the record still shows
 
 The CSV export follows the same rule: the justifications block carries the
 answers for every month with a `*` on the ones that were requested, and a
-separate block lists what was asked for the review month only.
+separate block lists what was asked for the review month only. Both grids in
+the export are headed by a financial-year row above the month row, so the year
+break survives a paste back into the workbook.
 
 A Store Manager needs **no permission flag at all**: access is owning an
 outlet. The outlet on their employee record is the only one they can open, and
@@ -167,10 +169,28 @@ cells were multiplied, so a wrong choice shows up immediately.
 
 ## The review
 
-Columns run oldest to newest, ending on the month under review; pick 6, 12, 24
-or 36 months of history. Each figure carries a ▲/▼ against the month before
-it, coloured by whether that movement is good for *that* parameter — wastage
-falling is green, wastage rising is red.
+Columns run oldest to newest, ending on the month under review. History is
+read in **financial years — April to March**, the year the business already
+reports on, not a rolling count of months: pick *This FY*, *2 financial years*,
+*3 financial years* or *All years* (data starts Apr 2024). The header carries
+the year over the block of months it covers, each month repeats its year and
+its position in it (`FY 2026-27 · M5` — M1 is April), and a heavier rule marks
+every April, so a year reads as a block. Months after the review month stay out
+even when the rest of their year is on file: the year is read up to the month
+being reviewed, not past it.
+
+Each figure carries a ▲/▼ against the month before it, coloured by whether that
+movement is good for *that* parameter — wastage falling is green, wastage
+rising is red.
+
+A month that carries a justification shows a small **💬 Remark** button under
+the figure; clicking it opens the note over the page, and Escape or a click
+elsewhere closes it. It was inline before, which let one long remark set the
+height of its whole row and push a twelve-month year off the screen — collapsed,
+the grid stays a grid of figures. The button turns amber and reads **Asked**
+while a requested justification is still unanswered. *Show remarks* hides the
+buttons altogether. The boxes Operations and the Store Manager type into are
+unaffected: those stay open in the review month's column.
 
 **Achievement is also coloured against that month's Target**: green once it
 matches or beats it, red while it is short. That is separate from the arrow
