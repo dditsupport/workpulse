@@ -343,6 +343,33 @@ function perfFySpanLabel(int $span): string {
     return $span === 1 ? 'This FY' : $span . ' financial years';
 }
 
+// The reverse of perfFyMonthNo(): which calendar month sits at position
+// $pos of the financial year that opened on $fyStart. Apr 2026 + 11 is
+// Mar 2027, so the year rolls over inside the row.
+function perfFyMonthKey(string $fyStart, int $pos): string {
+    $y = (int)substr($fyStart, 0, 4);
+    $m = PERF_FY_START_MONTH + $pos - 1;
+    if ($m > 12) { $m -= 12; $y++; }
+    return sprintf('%04d-%02d-01', $y, $m);
+}
+
+// Column heading for position 1…12 — the month with no year on it, because
+// the year is the row.
+function perfFyPosLabel(int $pos): string {
+    static $names = ['Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec','Jan','Feb','Mar'];
+    return $names[$pos - 1] ?? '';
+}
+
+// The calendar month before this one. The month-on-month arrow follows the
+// calendar, not the row: April's previous month is the March sitting one
+// row up, in the financial year before it.
+function perfPrevMonth(string $ymd): string {
+    $y = (int)substr($ymd, 0, 4);
+    $m = (int)substr($ymd, 5, 2) - 1;
+    if ($m < 1) { $m = 12; $y--; }
+    return sprintf('%04d-%02d-01', $y, $m);
+}
+
 // ── Value parsing & display ─────────────────────────────
 // A cell is a number, a note, or nothing. Strips the decoration the
 // workbook carries (thousands separators, a rupee sign, a trailing %,
@@ -1930,7 +1957,15 @@ function pagePerfReview(): void {
     $months    = $ctx['months'];
     $allMonths = $ctx['all_months'];
     $fySpan    = $ctx['fy_span'];
-    $fyGroups  = perfMonthsByFy($months);
+    // One row per financial year, per parameter; twelve fixed columns
+    // Apr → Mar. $monthSet says which of those slots actually has a month
+    // behind it — the earliest year may start mid-way and the latest stops
+    // at the month under review.
+    $fyList    = array_keys(perfMonthsByFy($months));
+    sort($fyList);
+    $monthSet  = array_flip($months);
+    $reviewFy  = perfFyStart($month);
+    $reviewPos = perfFyMonthNo($month);
     $locName   = perfLocationName($locId);
     $params    = perfParameters();
 
@@ -1940,7 +1975,9 @@ function pagePerfReview(): void {
     $benchmarks  = perfBenchmarks();
     $goals       = perfGoals($locId);
 
-    $grid     = perfValueGrid($locId, $months);
+    // One month before the window as well: the arrow on the earliest April
+    // compares against the March above it, which is outside the window.
+    $grid     = perfValueGrid($locId, array_merge($months, [perfPrevMonth(min($months))]));
     $reviews  = perfReviewHeaders($locId, $months);
     $remarks  = perfRemarkGrid($reviews);
     $review   = $reviews[$month] ?? null;
@@ -2005,8 +2042,12 @@ function pagePerfReview(): void {
 .perf-grid th.perf-month{text-align:right;width:var(--perf-col)}
 .perf-grid td.perf-cell{text-align:right;font-family:Consolas,monospace;padding:8px 12px}
 .perf-grid .perf-num{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.perf-col-review,.perf-grid th.perf-col-review{background:rgba(26,143,227,.08)}
-.perf-grid th.perf-col-review{width:250px}
+.perf-col-review,.perf-grid th.perf-col-review{background:rgba(26,143,227,.06)}
+.perf-grid th.perf-col-review{width:var(--perf-review-col)}
+/* The one cell actually under review, as opposed to its column, which is
+   only the same month in the other years. */
+.perf-grid td.perf-cell-now{background:rgba(26,143,227,.14);
+    box-shadow:inset 0 0 0 1px rgba(26,143,227,.35)}
 .perf-delta{font-size:10px;margin-left:5px;font-family:inherit}
 .perf-up{color:var(--green)}.perf-down{color:var(--red)}
 /* Met / missed the month's own benchmark — Achievement against Target.
@@ -2015,20 +2056,24 @@ function pagePerfReview(): void {
 .perf-hit{color:var(--green);font-weight:700}
 .perf-miss{color:var(--red);font-weight:700}
 .perf-note{color:var(--yellow);font-family:inherit;font-style:italic;font-size:11.5px}
-/* Financial-year banding. A year is Apr → Mar, so the only structural line
-   in the grid is the one before April; everything between two of those
-   lines is one year and is headed as one. */
-.perf-grid th.perf-fy{text-align:center;font-size:10.5px;letter-spacing:.06em;
-    text-transform:uppercase;color:var(--muted);font-weight:700;padding:6px 8px;
-    border-bottom:1px solid var(--border);background:var(--surface)}
-.perf-grid th.perf-fy-current{color:var(--accent)}
-.perf-fy-span{display:block;font-size:9px;font-weight:400;letter-spacing:.04em;
-    text-transform:none;opacity:.6}
-.perf-grid th.perf-fy + th.perf-fy,
-.perf-grid th.perf-fy-open,
-.perf-grid td.perf-fy-open{border-left:2px solid var(--border)}
-.perf-month-fy{font-size:9px;font-weight:400;color:var(--muted);letter-spacing:.03em;
-    text-transform:none;margin-top:1px}
+/* The financial year is a column, not a header group: it sits beside the
+   parameter and pins with it, so a row is always readable as
+   "this parameter, this year" however far the months are scrolled. */
+.perf-grid .perf-fy-col,.perf-grid .perf-fy-cell{position:sticky;left:200px;z-index:2;
+    background:var(--surface);width:118px;text-align:left;white-space:nowrap;
+    border-right:1px solid var(--border);font-size:11px;color:var(--muted);
+    font-weight:600;letter-spacing:.02em}
+.perf-grid thead .perf-fy-col{z-index:3;text-transform:none}
+.perf-grid tbody tr:hover .perf-fy-cell{background:var(--surface)}
+.perf-grid .perf-fy-cell-review{color:var(--accent)}
+/* The line between one parameter's block of years and the next. */
+.perf-grid tr.perf-row-first > th,.perf-grid tr.perf-row-first > td{border-top:2px solid var(--border)}
+/* A slot with no month behind it — before the outlet's first upload, or
+   after the month under review. Left empty on purpose: "not reached yet"
+   and "a month we hold with no figure" are different statements, and the
+   dash is reserved for the second. */
+.perf-grid td.perf-cell-void{background:repeating-linear-gradient(135deg,
+    transparent,transparent 5px,rgba(255,255,255,.022) 5px,rgba(255,255,255,.022) 10px)}
 /* A remark is one click, not a paragraph wedged under a number: the cell
    keeps its height and the note opens over the page. */
 .perf-remark-btn{display:inline-flex;align-items:center;gap:3px;margin-top:5px;
@@ -2209,53 +2254,64 @@ function pagePerfReview(): void {
     <?php if ($justify): ?><input type="hidden" name="justify" value="1"><?php endif; ?>
 
     <div class="table-wrap">
-    <table class="table perf-grid" style="--perf-col:<?= $showRemarks ? '124px' : '112px' ?>">
+    <!-- Only the cell under review is typed into, so only its column needs
+         the width for a textarea; the other eleven stay numeric. -->
+    <table class="table perf-grid"
+           style="--perf-col:112px;--perf-review-col:<?= ($canRemark || $flagMode) ? '240px' : '112px' ?>">
         <thead>
-            <!-- Two header rows: the financial year each block of months
-                 belongs to, then the months themselves. A year is read Apr
-                 → Mar, so the break between Mar and Apr has to be visible
-                 in the header rather than inferred from the dates. -->
+            <!-- The grid is a pivot, not a timeline: twelve fixed columns
+                 running April → March, and one row per parameter per
+                 financial year. Reading across a row is reading one year;
+                 reading down a parameter's block is the same month a year
+                 apart, which is the comparison Operations actually makes and
+                 which a single run of months never put side by side. -->
             <tr>
-                <th class="perf-param" rowspan="2">Parameter</th>
-                <?php foreach ($fyGroups as $fyStart => $fyMonths): ?>
-                    <th class="perf-fy<?= in_array($month, $fyMonths, true) ? ' perf-fy-current' : '' ?>"
-                        colspan="<?= count($fyMonths) ?>">
-                        <?= h(perfFyLabel($fyStart)) ?>
-                        <span class="perf-fy-span">Apr–Mar</span>
+                <th class="perf-param">Parameter</th>
+                <th class="perf-fy-col">Financial year</th>
+                <?php for ($pos = 1; $pos <= 12; $pos++): ?>
+                    <th class="perf-month<?= $pos === $reviewPos ? ' perf-col-review' : '' ?>">
+                        <?= h(perfFyPosLabel($pos)) ?>
+                        <?php if ($pos === $reviewPos): ?><br><span style="font-size:10px;color:var(--accent)">under review</span><?php endif; ?>
                     </th>
-                <?php endforeach; ?>
-            </tr>
-            <tr>
-                <?php foreach ($months as $m):
-                    $isReview = $m === $month;
-                    $fyOpens  = perfFyMonthNo($m) === 1; ?>
-                    <th class="perf-month <?= $isReview ? 'perf-col-review' : '' ?><?= $fyOpens ? ' perf-fy-open' : '' ?>">
-                        <?= h(perfMonthLabel($m)) ?>
-                        <div class="perf-month-fy"><?= h(perfFyLabel($m)) ?> · M<?= perfFyMonthNo($m) ?></div>
-                        <?php if ($isReview): ?><span style="font-size:10px;color:var(--accent)">under review</span><?php endif; ?>
-                    </th>
-                <?php endforeach; ?>
+                <?php endfor; ?>
             </tr>
         </thead>
         <tbody>
         <?php if (!$params): ?>
-            <tr><td colspan="<?= count($months) + 1 ?>" class="empty-row">No parameters configured.</td></tr>
+            <tr><td colspan="14" class="empty-row">No parameters configured.</td></tr>
         <?php endif; ?>
         <?php foreach ($params as $p):
-            $code = (string)$p['param_code']; ?>
-            <tr>
-                <th class="perf-param">
-                    <span class="perf-code"><?= h($code) ?></span><?= h($p['param_name']) ?>
-                    <?php $goalLabel = perfGoalLabel($goals[$code] ?? null, $p); ?>
-                    <?php if ($goalLabel !== ''): ?>
-                        <div class="perf-goal" title="Goal for this outlet">goal <?= h($goalLabel) ?></div>
-                    <?php endif; ?>
-                </th>
-                <?php foreach ($months as $i => $m):
+            $code = (string)$p['param_code'];
+            foreach ($fyList as $fi => $fyStart): ?>
+            <tr<?= $fi === 0 ? ' class="perf-row-first"' : '' ?>>
+                <?php if ($fi === 0): ?>
+                    <!-- Spans the parameter's financial years: the name is the
+                         block, the years are the rows inside it. -->
+                    <th class="perf-param" rowspan="<?= count($fyList) ?>">
+                        <span class="perf-code"><?= h($code) ?></span><?= h($p['param_name']) ?>
+                        <?php $goalLabel = perfGoalLabel($goals[$code] ?? null, $p); ?>
+                        <?php if ($goalLabel !== ''): ?>
+                            <div class="perf-goal" title="Goal for this outlet">goal <?= h($goalLabel) ?></div>
+                        <?php endif; ?>
+                    </th>
+                <?php endif; ?>
+                <td class="perf-fy-cell<?= $fyStart === $reviewFy ? ' perf-fy-cell-review' : '' ?>">
+                    <?= h(perfFyLabel($fyStart)) ?>
+                </td>
+                <?php for ($pos = 1; $pos <= 12; $pos++):
+                    $m = perfFyMonthKey($fyStart, $pos);
+
+                    // Nothing uploaded against that slot — a year that started
+                    // mid-way, or the months after the one under review. Left
+                    // blank rather than dashed: "not reached yet" and "no
+                    // figure for a month we do hold" are different statements.
+                    if (!isset($monthSet[$m])): ?>
+                        <td class="perf-cell perf-cell-void<?= $pos === $reviewPos ? ' perf-col-review' : '' ?>"></td>
+                    <?php continue; endif;
+
                     $isReview = $m === $month;
-                    $fyOpens  = perfFyMonthNo($m) === 1;   // April: a new year starts here
                     $cell     = $grid[$code][$m] ?? null;
-                    $prevCell = $i > 0 ? ($grid[$code][$months[$i - 1]] ?? null) : null;
+                    $prevCell = $grid[$code][perfPrevMonth($m)] ?? null;
 
                     // Month-on-month movement, coloured by whether the
                     // movement is the good direction for this parameter.
@@ -2297,28 +2353,29 @@ function pagePerfReview(): void {
                         }
                     }
 
-                    $shown = perfDisplayValue($cell, $p);
+                    $shown  = perfDisplayValue($cell, $p);
                     $isNote = $cell && $cell['value_num'] === null && $cell['value_text'] !== null;
 
-                    // The row holds both halves of the exchange. Which half
-                    // a column may show is the whole rule: the month under
-                    // review shows the question and the answer, because the
-                    // manager has to know what is being asked. Every other
-                    // month shows the answer only — the value is highlighted
-                    // to say a justification was asked for, and the asking
-                    // itself is not re-litigated in the history.
-                    $row       = $remarks[$m][$code] ?? null;
-                    $isFlagged = $row && (int)($row['flagged'] ?? 0) === 1;
-                    $answer    = trim((string)($row['remark'] ?? ''));
-                    $question  = $isReview ? trim((string)($row['flag_note'] ?? '')) : '';
+                    // The cell holds both halves of the exchange. Which half
+                    // it may show is the whole rule: the month under review
+                    // shows the question and the answer, because the manager
+                    // has to know what is being asked. Every other month shows
+                    // the answer only — the value is highlighted to say a
+                    // justification was asked for, and the asking itself is
+                    // not re-litigated in the history.
+                    $row        = $remarks[$m][$code] ?? null;
+                    $isFlagged  = $row && (int)($row['flagged'] ?? 0) === 1;
+                    $answer     = trim((string)($row['remark'] ?? ''));
+                    $question   = $isReview ? trim((string)($row['flag_note'] ?? '')) : '';
                     $unanswered = $isFlagged && $answer === '';
+                    // The column carries no year, so the hover does.
+                    $cellTitle  = perfMonthLabel($m);
                 ?>
-                    <td class="perf-cell <?= $isReview ? 'perf-col-review' : '' ?><?= $isFlagged ? ' perf-cell-flagged' : '' ?><?= $fyOpens ? ' perf-fy-open' : '' ?>">
+                    <td class="perf-cell<?= $pos === $reviewPos ? ' perf-col-review' : '' ?><?= $isReview ? ' perf-cell-now' : '' ?><?= $isFlagged ? ' perf-cell-flagged' : '' ?>">
                         <div class="perf-num<?= $isFlagged ? ' perf-flagged' : '' ?>"
-                             title="<?= h($isFlagged
-                                 ? ('Justification ' . ($answer === '' ? 'requested' : 'given')
-                                    . ($hitTitle !== '' ? ' · ' . $hitTitle : ''))
-                                 : ($hitTitle !== '' ? $hitTitle : $shown)) ?>">
+                             title="<?= h($cellTitle
+                                 . ($isFlagged ? ' · Justification ' . ($answer === '' ? 'requested' : 'given') : '')
+                                 . ($hitTitle !== '' ? ' · ' . $hitTitle : '')) ?>">
                         <?php if ($shown === ''): ?>
                             <span class="text-muted">—</span>
                         <?php elseif ($isNote): ?>
@@ -2360,10 +2417,9 @@ function pagePerfReview(): void {
                         <?php else:
                             // Read-only: the words sit behind a small button
                             // rather than under the number. One long remark used
-                            // to set the height of its whole row and push a
-                            // twelve-month year off the screen; collapsed, the
-                            // grid stays a grid of figures and the note is one
-                            // click away.
+                            // to set the height of its whole row and push the
+                            // year off the screen; collapsed, the grid stays a
+                            // grid of figures and the note is one click away.
                             $by      = trim((string)($row['full_name'] ?? ''));
                             $askedBy = trim((string)($row['flagged_name'] ?? ''));
                             $hasAsk  = $isReview && $question !== '';
@@ -2411,9 +2467,9 @@ function pagePerfReview(): void {
                             <?php endif; ?>
                         <?php endif; ?>
                     </td>
-                <?php endforeach; ?>
+                <?php endfor; ?>
             </tr>
-        <?php endforeach; ?>
+        <?php endforeach; endforeach; ?>
         </tbody>
     </table>
     </div>
@@ -2577,6 +2633,13 @@ function exportPerfReview(): void {
     $reviews = perfReviewHeaders($locId, $months);
     $remarks = perfRemarkGrid($reviews);
 
+    // Same shape as the screen: a row per parameter per financial year,
+    // twelve fixed columns Apr → Mar, so a year lines up under the year
+    // above it in the workbook too.
+    $fyList   = array_keys(perfMonthsByFy($months));
+    sort($fyList);
+    $monthSet = array_flip($months);
+
     $slug = preg_replace('/[^a-zA-Z0-9]+/', '_', $locName) ?: 'outlet';
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="performance_' . $slug . '_' . perfMonthInput($month) . '.csv"');
@@ -2589,21 +2652,19 @@ function exportPerfReview(): void {
     fputcsv($out, ['Status', (string)($reviews[$month]['status'] ?? 'pending')], escape: '');
     fputcsv($out, [], escape: '');
 
-    // Two header rows, same as the screen: the financial year each month
-    // belongs to, then the month. Whoever pastes this back into the
-    // workbook gets the year break with it.
-    $fyHead = ['Financial year'];
-    $head   = ['Parameter'];
-    foreach ($months as $m) {
-        $fyHead[] = perfFyLabel($m);
-        $head[]   = perfMonthLabel($m);
-    }
-    fputcsv($out, $fyHead, escape: '');
+    $head = ['Parameter', 'Financial year'];
+    for ($pos = 1; $pos <= 12; $pos++) $head[] = perfFyPosLabel($pos);
     fputcsv($out, $head, escape: '');
     foreach ($params as $p) {
-        $row = [perfParamLabel($p)];
-        foreach ($months as $m) $row[] = perfRawValue($grid[(string)$p['param_code']][$m] ?? null, $p);
-        fputcsv($out, $row, escape: '');
+        foreach ($fyList as $fyStart) {
+            $row = [perfParamLabel($p), perfFyLabel($fyStart)];
+            for ($pos = 1; $pos <= 12; $pos++) {
+                $m = perfFyMonthKey($fyStart, $pos);
+                $row[] = isset($monthSet[$m])
+                    ? perfRawValue($grid[(string)$p['param_code']][$m] ?? null, $p) : '';
+            }
+            fputcsv($out, $row, escape: '');
+        }
     }
 
     // The store's own words, every month in the window. The question that
@@ -2611,17 +2672,19 @@ function exportPerfReview(): void {
     // screen follows; a * marks a month where one was asked.
     fputcsv($out, [], escape: '');
     fputcsv($out, ['Store Manager justifications', '(* = Operations asked for this one)'], escape: '');
-    fputcsv($out, $fyHead, escape: '');
     fputcsv($out, $head, escape: '');
     foreach ($params as $p) {
-        $row = [perfParamLabel($p)];
-        foreach ($months as $m) {
-            $r    = $remarks[$m][(string)$p['param_code']] ?? null;
-            $text = trim((string)($r['remark'] ?? ''));
-            $mark = $r && (int)($r['flagged'] ?? 0) === 1 ? '* ' : '';
-            $row[] = $text === '' && $mark === '' ? '' : $mark . $text;
+        foreach ($fyList as $fyStart) {
+            $row = [perfParamLabel($p), perfFyLabel($fyStart)];
+            for ($pos = 1; $pos <= 12; $pos++) {
+                $m = perfFyMonthKey($fyStart, $pos);
+                $r    = $remarks[$m][(string)$p['param_code']] ?? null;
+                $text = trim((string)($r['remark'] ?? ''));
+                $mark = $r && (int)($r['flagged'] ?? 0) === 1 ? '* ' : '';
+                $row[] = $text === '' && $mark === '' ? '' : $mark . $text;
+            }
+            fputcsv($out, $row, escape: '');
         }
-        fputcsv($out, $row, escape: '');
     }
 
     // What Operations asked for, review month only.
