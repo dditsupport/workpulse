@@ -2063,8 +2063,9 @@ function pagePerfReview(): void {
 .perf-grid{font-size:12.5px;border-collapse:separate;border-spacing:0;
     table-layout:fixed;width:auto;min-width:100%}
 .perf-grid th,.perf-grid td{vertical-align:top}
+.perf-grid{--perf-param-col:200px;--perf-fy-col:86px}
 .perf-grid .perf-param{position:sticky;left:0;z-index:2;background:var(--surface);
-    text-align:left;white-space:normal;width:200px;
+    text-align:left;white-space:normal;width:var(--perf-param-col);
     border-right:1px solid var(--border);font-weight:600;font-size:12px;text-transform:none;color:var(--text)}
 .perf-grid thead .perf-param{z-index:3}
 .perf-grid tbody tr:hover .perf-param{background:var(--surface)}
@@ -2092,8 +2093,10 @@ function pagePerfReview(): void {
 /* The financial year is a column, not a header group: it sits beside the
    parameter and pins with it, so a row is always readable as
    "this parameter, this year" however far the months are scrolled. */
-.perf-grid .perf-fy-col,.perf-grid .perf-fy-cell{position:sticky;left:200px;z-index:2;
-    background:var(--surface);width:118px;text-align:left;white-space:nowrap;
+.perf-grid .perf-fy-col,.perf-grid .perf-fy-cell{position:sticky;
+    left:var(--perf-param-col);z-index:2;
+    background:var(--surface);width:var(--perf-fy-col);text-align:left;white-space:nowrap;
+    padding-left:10px;padding-right:8px;
     border-right:1px solid var(--border);font-size:11px;color:var(--muted);
     font-weight:600;letter-spacing:.02em}
 .perf-grid thead .perf-fy-col{z-index:3;text-transform:none}
