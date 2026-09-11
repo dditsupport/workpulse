@@ -195,6 +195,14 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 .att-chip:hover{border-color:var(--accent);color:var(--accent)}
 .att-annotate{display:inline-flex;align-items:center;gap:4px;background:rgba(26,143,227,.12);border:1px solid rgba(26,143,227,.45);border-radius:4px;padding:3px 7px;font-size:11px;color:#9ed1f6;text-decoration:none;white-space:nowrap}
 .att-annotate:hover{background:rgba(26,143,227,.22);color:#cbe7ff;border-color:var(--accent)}
+/* Store Manager verification photos — the store's proof that a finding was
+   fixed. Tinted in the same blue as .sm-remark-banner, the justification
+   they belong to, so no reviewer reads one as auditor evidence. Declared
+   before the pin-state rules below so an open pin still overrides the
+   tint: an un-answered pin is the more urgent signal. */
+.att-chip.is-sm-proof{background:rgba(26,143,227,.12);border-color:rgba(26,143,227,.45);color:#9ed1f6}
+.att-chip.is-sm-proof:hover{background:rgba(26,143,227,.22);color:#cbe7ff;border-color:var(--accent)}
+.att-stage-tag{display:inline-flex;align-items:center;justify-content:center;padding:0 4px;border-radius:3px;background:rgba(26,143,227,.32);color:#cbe7ff;font-size:9.5px;font-weight:700;letter-spacing:.4px;line-height:14px}
 /* Annotated-attachment highlight states */
 .att-chip.has-open-pins{background:rgba(220,64,64,.16);border-color:rgba(220,64,64,.55);color:#ff9a9a}
 .att-chip.has-open-pins:hover{background:rgba(220,64,64,.26);color:#ffc4c4;border-color:var(--red)}
@@ -207,6 +215,12 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 .att-pin-badge{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:16px;padding:0 4px;border-radius:9px;font-size:10px;font-weight:700;line-height:1;margin-left:2px}
 .att-pin-badge-open{background:var(--red);color:#fff;box-shadow:0 0 0 1.5px rgba(255,255,255,.15)}
 .att-pin-badge-done{background:var(--green);color:#0e1f17}
+/* Upload box under a justification: a labelled drop target rather than a
+   bare file input, so the SM sees what the photo is for. */
+.sm-proof-upload{display:block;margin-top:6px;padding:6px 8px;border:1px dashed var(--border);border-radius:6px;cursor:pointer}
+.sm-proof-upload:hover{border-color:var(--accent)}
+.sm-proof-upload span{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}
+.sm-proof-upload input[type=file]{font-size:11px}
 
 .btn-ghost-x{background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:12px;padding:0 4px}
 .btn-ghost-x:hover{color:var(--red)}

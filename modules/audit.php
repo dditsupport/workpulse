@@ -16,6 +16,9 @@
 define('AUDIT_UPLOAD_DIR', __DIR__ . '/../uploads/audit/');
 define('AUDIT_MAX_FILE_SIZE', 5 * 1024 * 1024);
 define('AUDIT_ALLOWED_EXT', ['jpg','jpeg','png','gif','webp','pdf']);
+// Which side of the audit an attachment came from — see
+// audit_response_attachments.uploaded_stage.
+define('AUDIT_ATTACHMENT_STAGES', ['auditor', 'store_manager']);
 define('AUDIT_ALLOWED_MIME', [
     'jpg'  => ['image/jpeg'],
     'jpeg' => ['image/jpeg'],
@@ -495,9 +498,18 @@ function auditGetTree(int $auditId, int $templateId): array {
     if ($resp) {
         $respIds = array_column($resp, 'id');
         $ph = implode(',', array_fill(0, count($respIds), '?'));
+        // uploaded_stage separates the auditor's evidence from the Store
+        // Manager's verified-work photos. Pre-migration databases don't
+        // have the column, so we synthesise 'auditor' — which is what
+        // every file predating the column is.
+        $stageCol = auditHasAttachmentStageCol() ? 'aa.uploaded_stage' : "'auditor' AS uploaded_stage";
         $st = $db->prepare(
-            "SELECT id, response_id, filename, stored_name, mime_type, file_size, uploaded_by, uploaded_at
-             FROM audit_response_attachments WHERE response_id IN ({$ph}) ORDER BY uploaded_at"
+            "SELECT aa.id, aa.response_id, aa.filename, aa.stored_name, aa.mime_type,
+                    aa.file_size, aa.uploaded_by, aa.uploaded_at, {$stageCol},
+                    e.full_name AS uploader_name
+             FROM audit_response_attachments aa
+             LEFT JOIN employees e ON e.employee_code = aa.uploaded_by
+             WHERE aa.response_id IN ({$ph}) ORDER BY aa.uploaded_at"
         );
         $st->execute($respIds);
         $allAtts = $st->fetchAll(PDO::FETCH_ASSOC);
@@ -632,17 +644,30 @@ function auditAttachmentPath(int $auditId, ?array $auditRow, string $storedName)
 }
 
 // ── File upload helper ─────────────────────────────────
-function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCode): void {
+// $stage says which side of the audit conversation the file belongs to:
+// 'auditor' for the finding, 'store_manager' for the photo of the
+// verified work the SM attaches to their justification. On databases that
+// haven't run 2026-09-11_audit_sm_verification_photos.sql the column
+// doesn't exist yet, so the stage is simply not written — the upload
+// still succeeds and reads back as auditor evidence.
+function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCode, string $stage = 'auditor'): void {
     if (empty($_FILES['attachments']['name'][0])) return;
     $auditRow = auditGetById($auditId);
     if (!$auditRow) return; // can't bucket without template + date
     $dir = auditAttachmentDir($auditRow);
     if (!is_dir($dir)) @mkdir($dir, 0755, true);
     $db = getDb();
-    $st = $db->prepare(
-        'INSERT INTO audit_response_attachments
-          (response_id, filename, stored_name, mime_type, file_size, uploaded_by)
-         VALUES (?, ?, ?, ?, ?, ?)');
+    $hasStage = auditHasAttachmentStageCol();
+    if (!in_array($stage, AUDIT_ATTACHMENT_STAGES, true)) $stage = 'auditor';
+    $st = $hasStage
+        ? $db->prepare(
+            'INSERT INTO audit_response_attachments
+              (response_id, filename, stored_name, mime_type, file_size, uploaded_by, uploaded_stage)
+             VALUES (?, ?, ?, ?, ?, ?, ?)')
+        : $db->prepare(
+            'INSERT INTO audit_response_attachments
+              (response_id, filename, stored_name, mime_type, file_size, uploaded_by)
+             VALUES (?, ?, ?, ?, ?, ?)');
     $files = $_FILES['attachments'];
     for ($i = 0; $i < count($files['name']); $i++) {
         if ($files['error'][$i] !== UPLOAD_ERR_OK) continue;
@@ -656,7 +681,9 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
         if (!in_array($mime, $ok, true)) continue;
         $storedName = uniqid('aud_', true) . '.' . $ext;
         if (move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
-            $st->execute([$responseId, $origName, $storedName, $mime, (int)$files['size'][$i], $uploaderCode]);
+            $args = [$responseId, $origName, $storedName, $mime, (int)$files['size'][$i], $uploaderCode];
+            if ($hasStage) $args[] = $stage;
+            $st->execute($args);
         }
     }
 }
@@ -736,6 +763,22 @@ function auditHasCwSnapshotCols(): bool {
     if ($cached !== null) return $cached;
     try {
         getDb()->query('SELECT actual_weightage FROM audit_category_weights LIMIT 0')->fetch();
+        $cached = true;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
+// Did 2026-09-11_audit_sm_verification_photos.sql run? Gates
+// audit_response_attachments.uploaded_stage — without it every file reads
+// as auditor evidence and the SM's upload box still works, it just can't
+// label what it saved.
+function auditHasAttachmentStageCol(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        getDb()->query('SELECT uploaded_stage FROM audit_response_attachments LIMIT 0')->fetch();
         $cached = true;
     } catch (Exception $e) {
         $cached = false;
