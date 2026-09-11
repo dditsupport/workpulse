@@ -370,7 +370,7 @@ function perfFyPosLabel(int $pos): string {
 }
 
 // The same month one year earlier — Apr 2026 → Apr 2025. This is what the
-// arrow measures: a month is judged against its own month last year, not
+// colour measures: a month is judged against its own month last year, not
 // against the month before it. Seasons move these numbers more than
 // anything the outlet does (Rakhi, Diwali, exam season), so April against
 // March says little and April against last April says everything. In the
@@ -2005,9 +2005,9 @@ function pagePerfReview(): void {
     $benchmarks  = perfBenchmarks();
     $goals       = perfGoals($locId);
 
-    // The year before each shown month as well: the arrow compares against
-    // it, and for the earliest financial year on show that month sits
-    // outside the window entirely.
+    // The year before each shown month as well: the figure is coloured
+    // against it, and for the earliest financial year on show that month
+    // sits outside the window entirely.
     $grid     = perfValueGrid($locId, array_values(array_unique(
         array_merge($months, array_map('perfPrevYearMonth', $months)))));
     $reviews  = perfReviewHeaders($locId, $months);
@@ -2096,13 +2096,14 @@ function pagePerfReview(): void {
    only the same month in the other years. */
 .perf-grid td.perf-cell-now{background:rgba(26,143,227,.14);
     box-shadow:inset 0 0 0 1px rgba(26,143,227,.35)}
-.perf-delta{font-size:10px;margin-left:5px;font-family:inherit}
-.perf-up{color:var(--green)}.perf-down{color:var(--red)}
-/* Met / missed the month's own benchmark — Achievement against Target.
-   Independent of the delta arrow beside it, which is month-on-month: a
-   figure can be down on last month and still ahead of target. */
-.perf-hit{color:var(--green);font-weight:700}
-.perf-miss{color:var(--red);font-weight:700}
+
+/* How the figure stands against the same month a year ago, in the direction
+   that is good for its own parameter: sales up is green, wastage up is red.
+   This is the only thing colouring a figure — what it was held to that month
+   (its target, its standing goal) is on the hover instead, because two
+   meanings in one colour is no meaning at all. */
+.perf-yoy-better{color:var(--green);font-weight:700}
+.perf-yoy-worse{color:var(--red);font-weight:700}
 .perf-note{color:var(--yellow);font-family:inherit;font-style:italic;font-size:11.5px}
 /* The financial year is a column, not a header group: it sits beside the
    parameter and pins with it, so a row is always readable as
@@ -2406,22 +2407,31 @@ function pagePerfReview(): void {
                     $lastYear  = perfPrevYearMonth($m);
                     $prevCell = $grid[$code][$lastYear] ?? null;
 
-                    // Movement against the same month a year ago, coloured
-                    // by whether that movement is the good direction for
-                    // this parameter. Year-on-year rather than against the
-                    // month before, because the month before is a different
-                    // season and comparing the two mostly measures the
-                    // calendar.
-                    $delta = ''; $deltaTitle = '';
+                    // The figure is coloured by how it stands against the
+                    // same month a year ago: green where it moved the good
+                    // way for this parameter, red where it moved the wrong
+                    // way. The colour carries this on its own — an arrow
+                    // beside it said the same thing twice.
+                    //
+                    // Year-on-year rather than against the month before,
+                    // because the month before is a different season and
+                    // comparing the two mostly measures the calendar.
+                    //
+                    // No colour where there is nothing to compare (the
+                    // first year on file, a gap in the data) or nothing to
+                    // judge: a target is a target, not an achievement, so
+                    // 'none' parameters stay plain.
+                    $yoyClass = ''; $deltaTitle = '';
                     if ($cell && $prevCell && $cell['value_num'] !== null && $prevCell['value_num'] !== null
                         && $p['better'] !== 'none') {
-                        $d = (float)$cell['value_num'] - (float)$prevCell['value_num'];
-                        if (abs($d) > 0.0001) {
-                            $good  = $p['better'] === 'up' ? $d > 0 : $d < 0;
-                            $delta = '<span class="perf-delta ' . ($good ? 'perf-up' : 'perf-down') . '">'
-                                   . ($d > 0 ? '&#9650;' : '&#9660;') . '</span>';
-                            $deltaTitle = ($d > 0 ? 'Up on ' : 'Down on ') . perfMonthLabel($lastYear)
-                                        . ' (' . perfDisplayValue($prevCell, $p) . ')';
+                        $d    = (float)$cell['value_num'] - (float)$prevCell['value_num'];
+                        $was  = perfDisplayValue($prevCell, $p) . ' in ' . perfMonthLabel($lastYear);
+                        if (abs($d) < 0.0001) {
+                            $deltaTitle = 'Level with ' . perfMonthLabel($lastYear);
+                        } else {
+                            $good       = $p['better'] === 'up' ? $d > 0 : $d < 0;
+                            $yoyClass   = $good ? 'perf-yoy-better' : 'perf-yoy-worse';
+                            $deltaTitle = ($d > 0 ? 'Up on ' : 'Down on ') . $was;
                         }
                     }
                     // Did this month's figure reach the month's own
@@ -2429,13 +2439,15 @@ function pagePerfReview(): void {
                     // beats Target, red while it is short. A zero or
                     // missing target is no benchmark at all — everything
                     // clears zero, so colouring it would say nothing.
-                    $hitClass = ''; $hitTitle = '';
+                    // Target and goal no longer colour the figure — the
+                    // year-on-year comparison has that — but they are still
+                    // what the month is held to, so they stay on the hover.
+                    $hitTitle = '';
                     $benchCode = $benchmarks[$code] ?? null;
                     if ($benchCode !== null && $cell && $cell['value_num'] !== null) {
                         $bench = $grid[$benchCode][$m] ?? null;
                         if ($bench && $bench['value_num'] !== null && (float)$bench['value_num'] > 0) {
                             $met       = (float)$cell['value_num'] >= (float)$bench['value_num'];
-                            $hitClass  = $met ? 'perf-hit' : 'perf-miss';
                             $benchName = $paramByCode[$benchCode]['param_name'] ?? $benchCode;
                             $hitTitle  = ($met ? 'Met ' : 'Below ') . strtolower((string)$benchName)
                                        . ' (' . perfDisplayValue($bench, $paramByCode[$benchCode] ?? $p) . ')';
@@ -2447,7 +2459,6 @@ function pagePerfReview(): void {
                         $goal = $goals[$code] ?? null;
                         $met  = perfMeetsGoal((float)$cell['value_num'], $goal, (string)$p['better']);
                         if ($met !== null) {
-                            $hitClass = $met ? 'perf-hit' : 'perf-miss';
                             $hitTitle = ($met ? 'Met goal ' : 'Missed goal ') . perfGoalLabel($goal, $p);
                         }
                     }
@@ -2530,7 +2541,7 @@ function pagePerfReview(): void {
                         <?php elseif ($isNote): ?>
                             <span class="perf-note"><?= h($shown) ?></span>
                         <?php else: ?>
-                            <span class="<?= $hitClass ?>"><?= h($shown) ?></span><?= $delta ?>
+                            <span class="<?= $yoyClass ?>"><?= h($shown) ?></span>
                         <?php endif; ?>
                         </div>
 
