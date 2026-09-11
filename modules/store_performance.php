@@ -2046,6 +2046,22 @@ function pagePerfReview(): void {
         } catch (Exception $e) { $pickable = []; }
     }
 
+    // Column widths, in one place because two things read them: the
+    // <colgroup> below, which is where a width is unambiguous under
+    // table-layout:fixed, and the financial-year column's sticky offset,
+    // which has to land exactly on the parameter column's right edge.
+    // Declared on .perf-param instead, the width lost to the cell's own
+    // content: the column collapsed to the width of the word "Parameter"
+    // while the year column stayed pinned at 200px, and the gap between
+    // them was the difference.
+    //
+    // Only the cell under review is typed into, so only its column needs
+    // room for a textarea; the other eleven stay numeric.
+    $colParam  = 200;
+    $colFy     = 86;
+    $colMonth  = $showRemarks ? 124 : 112;
+    $colReview = ($canRemark || $flagMode) ? 240 : $colMonth;
+
     $qs = fn(array $over = []) => 'index.php?' . http_build_query(array_merge([
         'page' => 'perf_review', 'loc' => $locId,
         'month' => perfMonthInput($month),
@@ -2063,9 +2079,8 @@ function pagePerfReview(): void {
 .perf-grid{font-size:12.5px;border-collapse:separate;border-spacing:0;
     table-layout:fixed;width:auto;min-width:100%}
 .perf-grid th,.perf-grid td{vertical-align:top}
-.perf-grid{--perf-param-col:200px;--perf-fy-col:86px}
 .perf-grid .perf-param{position:sticky;left:0;z-index:2;background:var(--surface);
-    text-align:left;white-space:normal;width:var(--perf-param-col);
+    text-align:left;white-space:normal;
     border-right:1px solid var(--border);font-weight:600;font-size:12px;text-transform:none;color:var(--text)}
 .perf-grid thead .perf-param{z-index:3}
 .perf-grid tbody tr:hover .perf-param{background:var(--surface)}
@@ -2073,11 +2088,10 @@ function pagePerfReview(): void {
 /* What this outlet is held to, next to the name it belongs to — a green
    or red figure in the row means nothing without it. */
 .perf-goal{font-weight:400;font-size:10px;color:var(--muted);margin-top:2px;letter-spacing:.02em}
-.perf-grid th.perf-month{text-align:right;width:var(--perf-col)}
+.perf-grid th.perf-month{text-align:right}
 .perf-grid td.perf-cell{text-align:right;font-family:Consolas,monospace;padding:8px 12px}
 .perf-grid .perf-num{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .perf-col-review,.perf-grid th.perf-col-review{background:rgba(26,143,227,.06)}
-.perf-grid th.perf-col-review{width:var(--perf-review-col)}
 /* The one cell actually under review, as opposed to its column, which is
    only the same month in the other years. */
 .perf-grid td.perf-cell-now{background:rgba(26,143,227,.14);
@@ -2093,9 +2107,14 @@ function pagePerfReview(): void {
 /* The financial year is a column, not a header group: it sits beside the
    parameter and pins with it, so a row is always readable as
    "this parameter, this year" however far the months are scrolled. */
+/* Pinned immediately right of the parameter column. The fallback is the
+   width that column is asked to be; --perf-fy-left is what it measured out
+   to, set from script, because a table with min-width:100% on a screen
+   wider than the grid shares the spare width among the columns and the
+   parameter column is then wider than it was declared. */
 .perf-grid .perf-fy-col,.perf-grid .perf-fy-cell{position:sticky;
-    left:var(--perf-param-col);z-index:2;
-    background:var(--surface);width:var(--perf-fy-col);text-align:left;white-space:nowrap;
+    left:var(--perf-fy-left, <?= $colParam ?>px);z-index:2;
+    background:var(--surface);text-align:left;white-space:nowrap;
     padding-left:10px;padding-right:8px;
     border-right:1px solid var(--border);font-size:11px;color:var(--muted);
     font-weight:600;letter-spacing:.02em}
@@ -2323,10 +2342,14 @@ function pagePerfReview(): void {
     <?php if ($justify): ?><input type="hidden" name="justify" value="1"><?php endif; ?>
 
     <div class="table-wrap">
-    <!-- Only the cell under review is typed into, so only its column needs
-         the width for a textarea; the other eleven stay numeric. -->
-    <table class="table perf-grid"
-           style="--perf-col:<?= $showRemarks ? '124px' : '112px' ?>;--perf-review-col:<?= ($canRemark || $flagMode) ? '240px' : ($showRemarks ? '124px' : '112px') ?>">
+    <table class="table perf-grid">
+        <colgroup>
+            <col style="width:<?= $colParam ?>px">
+            <col style="width:<?= $colFy ?>px">
+            <?php for ($pos = 1; $pos <= 12; $pos++): ?>
+                <col style="width:<?= $pos === $reviewPos ? $colReview : $colMonth ?>px">
+            <?php endfor; ?>
+        </colgroup>
         <thead>
             <!-- The grid is a pivot, not a timeline: twelve fixed columns
                  running April → March, and one row per parameter per
@@ -2633,6 +2656,27 @@ function pagePerfReview(): void {
 </div>
 
 <script>
+// Pin the financial-year column to the parameter column's measured right
+// edge. The colgroup asks for a width, but a table carrying min-width:100%
+// on a screen wider than the grid shares the spare width among its columns,
+// so what the parameter column actually occupies is not always what it was
+// asked for — and a sticky offset that disagrees with it by even a few
+// pixels shows as a gap or an overlap between the two frozen columns.
+(function () {
+    var grid = document.querySelector('.perf-grid');
+    if (!grid) return;
+    var head = grid.querySelector('thead th.perf-param');
+    if (!head) return;
+
+    function pin() {
+        grid.style.setProperty('--perf-fy-left', head.getBoundingClientRect().width + 'px');
+    }
+    pin();
+    window.addEventListener('resize', pin);
+    // Fonts land after first paint and change what the column measures to.
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(pin);
+})();
+
 // Multi-select dropdown, the employee list's component with two changes it
 // needs here: a disabled box (the year under review) is never toggled by
 // "All years", and closing the panel submits the filter bar, because the
