@@ -1240,9 +1240,22 @@ function chkTimeEntryMinutes(int $checklistId, string $empCode, string $logDate)
     }
 }
 
+// The longest duration a task may carry, in minutes. Read off the dropdown's
+// own ladder rather than written out again: the box is what the person picks
+// from, so any ceiling below its top slot silently rewrites a legal choice —
+// picking 12h used to save 8h. Falls back to the ladder's current top if the
+// time-tracking module is not loaded.
+function chkMaxTaskMinutes(): int {
+    if (function_exists('durationSlots')) {
+        $slots = durationSlots();
+        if ($slots) return (int)max($slots);
+    }
+    return 12 * 60;
+}
+
 // Normalise the posted task_time[ITEM_ID] map to itemId => minutes. Blank
 // boxes are dropped; a 0 is kept (it clears that task's time); anything
-// else is clamped to a sane 0–8h per task.
+// else is clamped to the dropdown's range.
 function chkNormalizeTaskTimes($raw): array {
     if (!is_array($raw)) return [];
     $out = [];
@@ -1256,7 +1269,7 @@ function chkNormalizeTaskTimes($raw): array {
         // dropped the way a malformed value is.
         if ($val === '')      { $out[$itemId] = 0; continue; }
         if (!is_numeric($val)) continue;
-        $out[$itemId] = max(0, min(8 * 60, (int)$val));
+        $out[$itemId] = max(0, min(chkMaxTaskMinutes(), (int)$val));
     }
     return $out;
 }
