@@ -2113,11 +2113,13 @@ function pagePerfReview(): void {
    row is as tall as its tallest cell, so a single remark grew the whole
    band. */
 .perf-remark-btn{display:inline;padding:0 3px 0 0;border:0;background:transparent;
-    color:var(--muted);line-height:1;cursor:pointer;vertical-align:baseline}
-.perf-remark-btn:hover{color:var(--accent)}
-.perf-remark-btn[aria-expanded="true"]{color:var(--accent)}
-.perf-remark-btn-open{color:#ffce6b}
-.perf-remark-ico{vertical-align:-1px;opacity:.9}
+    color:#ffce6b;opacity:.8;line-height:1;cursor:pointer;vertical-align:baseline}
+.perf-remark-btn:hover,.perf-remark-btn[aria-expanded="true"]{opacity:1;color:#ffd98a}
+/* An unanswered request at full strength. The cell it sits in is already
+   tinted and boxed amber, so the icon is not carrying that distinction on
+   its own and weight is enough — it does not need a colour of its own. */
+.perf-remark-btn-open{opacity:1}
+.perf-remark-ico{vertical-align:-1px}
 /* The panel itself is appended to <body> and positioned from the button:
    .table-wrap scrolls, so anything absolutely positioned inside a cell
    would be clipped by it. */
