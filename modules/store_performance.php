@@ -40,12 +40,20 @@
 
 define('PERF_CSV_MAX_BYTES', 8 * 1024 * 1024);   // 8 MB — 28 months x 48 outlets is ~1 MB
 // History is read in financial years, not in rolling months: Operations
-// compares Aug against last Aug and reads a year Apr → Mar, so the window
-// is "how many financial years back", never "how many months back".
-// 0 means every year on file (data starts Apr 2024).
+// compares Aug against last Aug and reads a year Apr → Mar. The years on
+// show are picked by name from the ones this outlet actually has, so the
+// list is never a guess about how far back the data goes.
+// The mark that says "there are words behind this figure". Inline SVG so it
+// inherits the cell's colour and scales with the text rather than sitting on
+// its own line the way a labelled button did.
+const PERF_REMARK_ICON =
+    '<svg class="perf-remark-ico" viewBox="0 0 16 16" width="10" height="10" '
+  . 'aria-hidden="true" focusable="false"><path fill="currentColor" '
+  . 'd="M3 1.5h10A2.5 2.5 0 0 1 15.5 4v5A2.5 2.5 0 0 1 13 11.5H7.4l-3.2 2.9'
+  . 'A.6.6 0 0 1 3.2 14v-2.5A2.5 2.5 0 0 1 .5 9V4A2.5 2.5 0 0 1 3 1.5Z"/></svg>';
+
 const PERF_FY_START_MONTH  = 4;                   // April opens the year
-const PERF_DEFAULT_FY_SPAN = 2;                   // this FY and the one before it
-const PERF_FY_CHOICES      = [1, 2, 3, 0];
+const PERF_DEFAULT_FY_SPAN = 2;                   // first load: this year and the one before
 
 // ── Schema probe ────────────────────────────────────────
 // Every entry point checks this so an un-migrated database shows a
@@ -338,9 +346,10 @@ function perfMonthsByFy(array $months): array {
     return $out;
 }
 
-function perfFySpanLabel(int $span): string {
-    if ($span <= 0) return 'All years';
-    return $span === 1 ? 'This FY' : $span . ' financial years';
+// "FY 2026-27" from the year it opened in, for the years the picker lists
+// (which are start years, not dates).
+function perfFyYearLabel(int $startYear): string {
+    return sprintf('FY %04d-%02d', $startYear, ($startYear + 1) % 100);
 }
 
 // The reverse of perfFyMonthNo(): which calendar month sits at position
@@ -360,14 +369,15 @@ function perfFyPosLabel(int $pos): string {
     return $names[$pos - 1] ?? '';
 }
 
-// The calendar month before this one. The month-on-month arrow follows the
-// calendar, not the row: April's previous month is the March sitting one
-// row up, in the financial year before it.
-function perfPrevMonth(string $ymd): string {
-    $y = (int)substr($ymd, 0, 4);
-    $m = (int)substr($ymd, 5, 2) - 1;
-    if ($m < 1) { $m = 12; $y--; }
-    return sprintf('%04d-%02d-01', $y, $m);
+// The same month one year earlier — Apr 2026 → Apr 2025. This is what the
+// arrow measures: a month is judged against its own month last year, not
+// against the month before it. Seasons move these numbers more than
+// anything the outlet does (Rakhi, Diwali, exam season), so April against
+// March says little and April against last April says everything. In the
+// pivot it is also the cell directly above, which is what makes reading
+// down a parameter's block worth doing.
+function perfPrevYearMonth(string $ymd): string {
+    return sprintf('%04d-%s', (int)substr($ymd, 0, 4) - 1, substr($ymd, 5));
 }
 
 // ── Value parsing & display ─────────────────────────────
@@ -1891,34 +1901,52 @@ function perfReviewContext(): ?array {
         $month = $allMonths[0] ?? date('Y-m-01');
     }
 
-    // How far back to read, counted in financial years: 1 is the review
-    // month's own Apr → Mar, 2 adds the year before it, 0 is everything on
-    // file. isset() rather than ?? because 0 is a real choice here.
-    $span = isset($_GET['fy']) ? (int)$_GET['fy'] : PERF_DEFAULT_FY_SPAN;
-    if (!in_array($span, PERF_FY_CHOICES, true)) $span = PERF_DEFAULT_FY_SPAN;
-
-    // The window is the review month and the months before it, oldest
-    // first — reading left to right is reading forward in time, the way
-    // the workbook's pivot already reads. Months after the review month
-    // stay out even when the rest of their financial year is on file: the
-    // year is read up to the month being reviewed, not past it.
+    // Months after the review month stay out even when the rest of their
+    // financial year is on file: a year is read up to the month being
+    // reviewed, not past it.
     $upTo = array_values(array_filter($allMonths, fn($m) => $m <= $month));
     sort($upTo);
-    if ($span > 0) {
-        $from = sprintf('%04d-%02d-01',
-            perfFyStartYear($month) - ($span - 1), PERF_FY_START_MONTH);
-        $months = array_values(array_filter($upTo, fn($m) => $m >= $from));
+
+    // The years on offer are the ones this outlet has a readable month in,
+    // newest first. Derived from $upTo rather than every month on file, so
+    // the picker never lists a year that would come back empty.
+    $available = [];
+    foreach ($upTo as $m) $available[perfFyStartYear($m)] = true;
+    $available = array_keys($available);
+    rsort($available);
+
+    // fysel marks a submitted selection, the way ?filter=1 does on the
+    // employee list: without it this is a first load, not "every box was
+    // unticked", and the default is the review month's year plus the one
+    // before it — a figure next to the same month last year straight away.
+    $reviewFyYear = perfFyStartYear($month);
+    if (isset($_GET['fysel'])) {
+        $years = array_values(array_intersect(
+            array_map('intval', (array)($_GET['fy'] ?? [])), $available));
     } else {
-        $months = $upTo;
+        $years = array_values(array_filter(
+            $available,
+            fn($y) => $y === $reviewFyYear || $y === $reviewFyYear - (PERF_DEFAULT_FY_SPAN - 1)
+        ));
     }
+    // The month under review has to have a row to sit in — its
+    // justification boxes are in that row — so its year is never absent,
+    // whatever came back in the query string. Its checkbox is disabled on
+    // the form to say so; this is what actually enforces it.
+    if (!in_array($reviewFyYear, $years, true)) $years[] = $reviewFyYear;
+    sort($years);
+
+    $months = array_values(array_filter(
+        $upTo, fn($m) => in_array(perfFyStartYear($m), $years, true)));
     if (!in_array($month, $months, true)) $months[] = $month;
 
     return [
-        'location_id' => $locId,
-        'month'       => $month,
-        'months'      => $months,
-        'all_months'  => $allMonths,
-        'fy_span'     => $span,
+        'location_id'  => $locId,
+        'month'        => $month,
+        'months'       => $months,
+        'all_months'   => $allMonths,
+        'fy_years'     => $years,
+        'fy_available' => $available,
     ];
 }
 
@@ -1956,7 +1984,9 @@ function pagePerfReview(): void {
     $month     = $ctx['month'];
     $months    = $ctx['months'];
     $allMonths = $ctx['all_months'];
-    $fySpan    = $ctx['fy_span'];
+    $fyYears   = $ctx['fy_years'];
+    $fyAvail   = $ctx['fy_available'];
+    $reviewFyY = perfFyStartYear($month);
     // One row per financial year, per parameter; twelve fixed columns
     // Apr → Mar. $monthSet says which of those slots actually has a month
     // behind it — the earliest year may start mid-way and the latest stops
@@ -1975,9 +2005,11 @@ function pagePerfReview(): void {
     $benchmarks  = perfBenchmarks();
     $goals       = perfGoals($locId);
 
-    // One month before the window as well: the arrow on the earliest April
-    // compares against the March above it, which is outside the window.
-    $grid     = perfValueGrid($locId, array_merge($months, [perfPrevMonth(min($months))]));
+    // The year before each shown month as well: the arrow compares against
+    // it, and for the earliest financial year on show that month sits
+    // outside the window entirely.
+    $grid     = perfValueGrid($locId, array_values(array_unique(
+        array_merge($months, array_map('perfPrevYearMonth', $months)))));
     $reviews  = perfReviewHeaders($locId, $months);
     $remarks  = perfRemarkGrid($reviews);
     $review   = $reviews[$month] ?? null;
@@ -2016,7 +2048,8 @@ function pagePerfReview(): void {
 
     $qs = fn(array $over = []) => 'index.php?' . http_build_query(array_merge([
         'page' => 'perf_review', 'loc' => $locId,
-        'month' => perfMonthInput($month), 'fy' => $fySpan,
+        'month' => perfMonthInput($month),
+        'fysel' => '1', 'fy' => $fyYears,
         'remarks' => $showRemarks ? '1' : '0',
     ] + ($justify ? ['justify' => '1'] : []), $over));
 ?>
@@ -2074,17 +2107,17 @@ function pagePerfReview(): void {
    dash is reserved for the second. */
 .perf-grid td.perf-cell-void{background:repeating-linear-gradient(135deg,
     transparent,transparent 5px,rgba(255,255,255,.022) 5px,rgba(255,255,255,.022) 10px)}
-/* A remark is one click, not a paragraph wedged under a number: the cell
-   keeps its height and the note opens over the page. */
-.perf-remark-btn{display:inline-flex;align-items:center;gap:3px;margin-top:5px;
-    padding:1px 6px;border:1px solid var(--border);border-radius:10px;
-    background:transparent;color:var(--muted);font-family:inherit;font-size:10px;
-    line-height:1.6;cursor:pointer}
-.perf-remark-btn:hover{color:var(--text);border-color:var(--accent)}
-.perf-remark-btn[aria-expanded="true"]{color:var(--accent);border-color:var(--accent)}
-.perf-remark-btn-open{color:#ffce6b;border-color:rgba(245,158,11,.55);
-    background:rgba(245,158,11,.10)}
-.perf-remark-ico{font-size:9px;opacity:.85}
+/* A remark is one click, not a paragraph wedged under a number — and the
+   mark rides on the figure's own line, ahead of it. A labelled button below
+   the figure gave every cell that had one a second line, and a fixed-layout
+   row is as tall as its tallest cell, so a single remark grew the whole
+   band. */
+.perf-remark-btn{display:inline;padding:0 3px 0 0;border:0;background:transparent;
+    color:var(--muted);line-height:1;cursor:pointer;vertical-align:baseline}
+.perf-remark-btn:hover{color:var(--accent)}
+.perf-remark-btn[aria-expanded="true"]{color:var(--accent)}
+.perf-remark-btn-open{color:#ffce6b}
+.perf-remark-ico{vertical-align:-1px;opacity:.9}
 /* The panel itself is appended to <body> and positioned from the button:
    .table-wrap scrolls, so anything absolutely positioned inside a cell
    would be clipped by it. */
@@ -2122,6 +2155,23 @@ function pagePerfReview(): void {
 .perf-grid textarea.form-control{display:block;width:100%;margin-top:6px;
     font-size:11.5px;padding:5px 7px;min-height:56px;
     white-space:normal;font-family:inherit;resize:vertical}
+/* Multi-select dropdown — same component as the employee list's Status /
+   Active filters, so the two pages read the same. */
+.ms-filter{position:relative;display:inline-block;vertical-align:top}
+.ms-toggle{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;cursor:pointer;text-align:left;padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ms-toggle::after{content:'\25BE';opacity:.55;font-size:11px;flex:0 0 auto;margin-left:6px}
+.ms-filter.open .ms-toggle::after{transform:rotate(180deg)}
+.ms-panel{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:100%;max-height:280px;overflow-y:auto;background:var(--surface,#1f1f23);color:var(--text,#eee);border:1px solid var(--border,#444);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.4);z-index:50;padding:6px 0;white-space:nowrap}
+.ms-filter.open .ms-panel{display:block}
+.ms-row{display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;font-size:13px;font-weight:400;margin:0}
+.ms-row:hover{background:rgba(255,255,255,.06)}
+.ms-row input{margin:0;cursor:pointer}
+.ms-row input:disabled{cursor:default;opacity:.7}
+.ms-row span{flex:1;min-width:0}
+.ms-all-row{font-weight:600}
+.ms-divider{height:1px;background:var(--border,#444);margin:4px 0}
+/* Why the year under review cannot be unticked. */
+.perf-fy-opt-now{font-size:10px;color:var(--accent);margin-left:6px;letter-spacing:.02em}
 .perf-meta{display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:14px;
     background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:11px 16px;font-size:12.5px}
 .perf-meta b{font-weight:600}
@@ -2178,14 +2228,28 @@ function pagePerfReview(): void {
         <?php endforeach; ?>
     </select>
 
+    <!-- The years this outlet actually has, ticked by name. The one under
+         review is disabled rather than absent: its row carries the
+         justification boxes, so it cannot be turned off. -->
+    <input type="hidden" name="fysel" value="1">
     <label class="text-muted">History</label>
-    <select name="fy" class="form-control" style="width:150px" onchange="this.form.submit()">
-        <?php foreach (PERF_FY_CHOICES as $f): ?>
-            <option value="<?= $f ?>" <?= $f === $fySpan ? 'selected' : '' ?>>
-                <?= h(perfFySpanLabel($f)) ?>
-            </option>
-        <?php endforeach; ?>
-    </select>
+    <div class="ms-filter" data-label="FY" style="width:185px">
+        <button type="button" class="form-control ms-toggle"
+                aria-haspopup="listbox" aria-expanded="false">Financial year</button>
+        <div class="ms-panel" role="listbox">
+            <label class="ms-row ms-all-row"><input type="checkbox" class="ms-all"> <span>All years</span></label>
+            <div class="ms-divider"></div>
+            <?php foreach ($fyAvail as $y): $isReviewFy = $y === $reviewFyY; ?>
+                <label class="ms-row"<?= $isReviewFy ? ' title="The month under review always shows."' : '' ?>>
+                    <input type="checkbox" name="fy[]" value="<?= $y ?>"
+                           <?= in_array($y, $fyYears, true) ? 'checked' : '' ?>
+                           <?= $isReviewFy ? 'disabled' : '' ?>>
+                    <span><?= h(perfFyYearLabel($y)) ?><?php if ($isReviewFy): ?>
+                        <span class="perf-fy-opt-now">under review</span><?php endif; ?></span>
+                </label>
+            <?php endforeach; ?>
+        </div>
+    </div>
 
     <!-- Hidden 0 first so an unchecked box still submits a value; PHP keeps
          the last occurrence, so ticked wins and unticked means hide. -->
@@ -2257,7 +2321,7 @@ function pagePerfReview(): void {
     <!-- Only the cell under review is typed into, so only its column needs
          the width for a textarea; the other eleven stay numeric. -->
     <table class="table perf-grid"
-           style="--perf-col:112px;--perf-review-col:<?= ($canRemark || $flagMode) ? '240px' : '112px' ?>">
+           style="--perf-col:<?= $showRemarks ? '124px' : '112px' ?>;--perf-review-col:<?= ($canRemark || $flagMode) ? '240px' : ($showRemarks ? '124px' : '112px') ?>">
         <thead>
             <!-- The grid is a pivot, not a timeline: twelve fixed columns
                  running April → March, and one row per parameter per
@@ -2311,11 +2375,16 @@ function pagePerfReview(): void {
 
                     $isReview = $m === $month;
                     $cell     = $grid[$code][$m] ?? null;
-                    $prevCell = $grid[$code][perfPrevMonth($m)] ?? null;
+                    $lastYear  = perfPrevYearMonth($m);
+                    $prevCell = $grid[$code][$lastYear] ?? null;
 
-                    // Month-on-month movement, coloured by whether the
-                    // movement is the good direction for this parameter.
-                    $delta = '';
+                    // Movement against the same month a year ago, coloured
+                    // by whether that movement is the good direction for
+                    // this parameter. Year-on-year rather than against the
+                    // month before, because the month before is a different
+                    // season and comparing the two mostly measures the
+                    // calendar.
+                    $delta = ''; $deltaTitle = '';
                     if ($cell && $prevCell && $cell['value_num'] !== null && $prevCell['value_num'] !== null
                         && $p['better'] !== 'none') {
                         $d = (float)$cell['value_num'] - (float)$prevCell['value_num'];
@@ -2323,6 +2392,8 @@ function pagePerfReview(): void {
                             $good  = $p['better'] === 'up' ? $d > 0 : $d < 0;
                             $delta = '<span class="perf-delta ' . ($good ? 'perf-up' : 'perf-down') . '">'
                                    . ($d > 0 ? '&#9650;' : '&#9660;') . '</span>';
+                            $deltaTitle = ($d > 0 ? 'Up on ' : 'Down on ') . perfMonthLabel($lastYear)
+                                        . ' (' . perfDisplayValue($prevCell, $p) . ')';
                         }
                     }
                     // Did this month's figure reach the month's own
@@ -2370,12 +2441,62 @@ function pagePerfReview(): void {
                     $unanswered = $isFlagged && $answer === '';
                     // The column carries no year, so the hover does.
                     $cellTitle  = perfMonthLabel($m);
+
+                    // Read-only cells carry the justification behind an icon
+                    // sitting just left of the figure. It was a labelled
+                    // button on its own line, which added a second line to
+                    // every cell that had one — and a fixed-layout row is as
+                    // tall as its tallest cell, so one remark grew the whole
+                    // band. Inline, the row stays one line high.
+                    // The cell under review is the exception in the two
+                    // editing modes: there the boxes are open, so there is
+                    // nothing to hide behind an icon.
+                    $remarkBtn = $remarkPop = '';
+                    if (!($isReview && ($flagMode || $canRemark))) {
+                        $by      = trim((string)($row['full_name'] ?? ''));
+                        $askedBy = trim((string)($row['flagged_name'] ?? ''));
+                        $hasAsk  = $isReview && $question !== '';
+                        // An open request is not a remark: it survives the
+                        // Show remarks toggle, the way it did when it was
+                        // printed into the cell.
+                        if ($hasAsk || $unanswered || ($showRemarks && $answer !== '')) {
+                            $label = $answer !== '' ? 'Remark'
+                                   : (($unanswered || $hasAsk) ? 'Asked' : 'Note');
+                            $remarkBtn =
+                                '<button type="button" class="perf-remark-btn'
+                                // Amber while a request is unanswered, muted
+                                // once the store has written something back.
+                                . ($unanswered ? ' perf-remark-btn-open' : '') . '"'
+                                . ' aria-expanded="false"'
+                                . ' title="' . h($label . ' · ' . perfMonthLabel($m)) . '"'
+                                . ' aria-label="' . h($label . ' · ' . perfMonthLabel($m)) . '">'
+                                . PERF_REMARK_ICON . '</button>';
+
+                            $pop = '<div class="perf-pop-head">' . h((string)$p['param_name'])
+                                 . '<span>' . h(perfMonthLabel($m)) . ' · ' . h(perfFyLabel($m))
+                                 . '</span></div>';
+                            if ($hasAsk) {
+                                $pop .= '<div class="perf-pop-ask"><b>Asked:</b> ' . nl2br(h($question))
+                                      . ($askedBy !== ''
+                                          ? '<div class="perf-remark-by">— ' . h($askedBy) . '</div>' : '')
+                                      . '</div>';
+                            }
+                            $pop .= $answer !== ''
+                                ? '<div class="perf-pop-body">' . nl2br(h($answer))
+                                  . ($by !== '' ? '<div class="perf-remark-by">— ' . h($by) . '</div>' : '')
+                                  . '</div>'
+                                : '<div class="perf-pop-body text-muted">Awaiting justification</div>';
+                            $remarkPop = '<div class="perf-pop-src" hidden>' . $pop . '</div>';
+                        }
+                    }
                 ?>
                     <td class="perf-cell<?= $pos === $reviewPos ? ' perf-col-review' : '' ?><?= $isReview ? ' perf-cell-now' : '' ?><?= $isFlagged ? ' perf-cell-flagged' : '' ?>">
                         <div class="perf-num<?= $isFlagged ? ' perf-flagged' : '' ?>"
                              title="<?= h($cellTitle
+                                 . ($deltaTitle !== '' ? ' · ' . $deltaTitle : '')
                                  . ($isFlagged ? ' · Justification ' . ($answer === '' ? 'requested' : 'given') : '')
                                  . ($hitTitle !== '' ? ' · ' . $hitTitle : '')) ?>">
+                        <?= $remarkBtn ?>
                         <?php if ($shown === ''): ?>
                             <span class="text-muted">—</span>
                         <?php elseif ($isNote): ?>
@@ -2414,57 +2535,8 @@ function pagePerfReview(): void {
                                       name="remark[<?= h($code) ?>]" rows="2" maxlength="4000"
                                       placeholder="<?= $isFlagged ? 'Justification (required)…' : 'Justification (optional)…' ?>"><?= h($answer) ?></textarea>
 
-                        <?php else:
-                            // Read-only: the words sit behind a small button
-                            // rather than under the number. One long remark used
-                            // to set the height of its whole row and push the
-                            // year off the screen; collapsed, the grid stays a
-                            // grid of figures and the note is one click away.
-                            $by      = trim((string)($row['full_name'] ?? ''));
-                            $askedBy = trim((string)($row['flagged_name'] ?? ''));
-                            $hasAsk  = $isReview && $question !== '';
-                            // An open request is not a remark: it survives the
-                            // Show remarks toggle, the way it did when it was
-                            // printed into the cell.
-                            $hasNote = $hasAsk || $unanswered
-                                    || ($showRemarks && $answer !== '');
-                            if ($hasNote):
-                                // Amber while a request is unanswered, plain once
-                                // the store has written something back.
-                                $btnCls = $unanswered ? ' perf-remark-btn-open' : '';
-                                $label  = $answer !== '' ? 'Remark'
-                                        : (($unanswered || $hasAsk) ? 'Asked' : 'Note');
-                            ?>
-                            <button type="button" class="perf-remark-btn<?= $btnCls ?>"
-                                    aria-expanded="false"
-                                    title="<?= h($label . ' · ' . perfMonthLabel($m)) ?>">
-                                <span class="perf-remark-ico">&#128172;</span><?= h($label) ?>
-                            </button>
-                            <div class="perf-pop-src" hidden>
-                                <div class="perf-pop-head">
-                                    <?= h($p['param_name']) ?>
-                                    <span><?= h(perfMonthLabel($m)) ?> · <?= h(perfFyLabel($m)) ?></span>
-                                </div>
-                                <?php if ($hasAsk): ?>
-                                    <div class="perf-pop-ask">
-                                        <b>Asked:</b> <?= nl2br(h($question)) ?>
-                                        <?php if ($askedBy !== ''): ?>
-                                            <div class="perf-remark-by">— <?= h($askedBy) ?></div>
-                                        <?php endif; ?>
-                                    </div>
-                                <?php endif; ?>
-                                <?php if ($answer !== ''): ?>
-                                    <div class="perf-pop-body">
-                                        <?= nl2br(h($answer)) ?>
-                                        <?php if ($by !== ''): ?>
-                                            <div class="perf-remark-by">— <?= h($by) ?></div>
-                                        <?php endif; ?>
-                                    </div>
-                                <?php else: ?>
-                                    <div class="perf-pop-body text-muted">Awaiting justification</div>
-                                <?php endif; ?>
-                            </div>
-                            <?php endif; ?>
+                        <?php else: ?>
+                            <?= $remarkPop ?>
                         <?php endif; ?>
                     </td>
                 <?php endfor; ?>
@@ -2556,6 +2628,84 @@ function pagePerfReview(): void {
 </div>
 
 <script>
+// Multi-select dropdown, the employee list's component with two changes it
+// needs here: a disabled box (the year under review) is never toggled by
+// "All years", and closing the panel submits the filter bar, because the
+// rest of that bar submits on change and an Apply button only for this one
+// control would be odd.
+(function () {
+    document.querySelectorAll('.ms-filter').forEach(initMs);
+    document.addEventListener('click', function (e) {
+        document.querySelectorAll('.ms-filter.open').forEach(function (f) {
+            if (!f.contains(e.target)) closeMs(f);
+        });
+    });
+
+    function closeMs(f) {
+        f.classList.remove('open');
+        var t = f.querySelector('.ms-toggle');
+        if (t) t.setAttribute('aria-expanded', 'false');
+        if (f._changed && f._changed()) f.closest('form').submit();
+    }
+
+    function initMs(f) {
+        var label  = f.dataset.label || 'Filter';
+        var toggle = f.querySelector('.ms-toggle');
+        var allBox = f.querySelector('.ms-all');
+        var boxes  = Array.prototype.slice.call(
+            f.querySelectorAll('input[type="checkbox"]:not(.ms-all)'));
+        if (!toggle || !boxes.length) return;
+
+        function state() { return boxes.map(function (b) { return b.checked ? '1' : '0'; }).join(''); }
+        var opened = state();
+        f._changed = function () { return state() !== opened; };
+
+        function refreshLabel() {
+            var checked = boxes.filter(function (b) { return b.checked; });
+            var n = checked.length, total = boxes.length;
+            if      (n === 0)     toggle.textContent = label + ': none';
+            else if (n === total) toggle.textContent = 'All years';
+            else if (n === 1)     toggle.textContent =
+                (checked[0].parentNode.querySelector('span') || {}).textContent.trim();
+            else                  toggle.textContent = n + ' financial years';
+        }
+        function refreshAll() {
+            if (!allBox) return;
+            allBox.checked = boxes.every(function (b) { return b.checked; });
+            allBox.indeterminate = !allBox.checked && boxes.some(function (b) { return b.checked; });
+        }
+
+        toggle.addEventListener('click', function (e) {
+            e.stopPropagation();
+            var willOpen = !f.classList.contains('open');
+            document.querySelectorAll('.ms-filter.open').forEach(function (o) {
+                if (o !== f) closeMs(o);
+            });
+            if (willOpen) {
+                opened = state();
+                f.classList.add('open');
+                toggle.setAttribute('aria-expanded', 'true');
+            } else {
+                closeMs(f);
+            }
+        });
+
+        if (allBox) {
+            allBox.addEventListener('change', function () {
+                // The year under review stays ticked whatever this says.
+                boxes.forEach(function (b) { if (!b.disabled) b.checked = allBox.checked; });
+                refreshAll();
+                refreshLabel();
+            });
+        }
+        boxes.forEach(function (b) {
+            b.addEventListener('change', function () { refreshAll(); refreshLabel(); });
+        });
+        refreshAll();
+        refreshLabel();
+    }
+})();
+
 // One panel, reused. Each remark button carries its own text in a hidden
 // sibling; clicking copies that into the panel and parks it under the
 // button. Fixed positioning because the grid wrapper scrolls in both
@@ -2597,8 +2747,12 @@ function pagePerfReview(): void {
         var was = openBtn;
         close();
         if (!btn || btn === was) return;             // same button again = toggle shut
-        var src = btn.nextElementSibling;
-        if (!src || !src.classList.contains('perf-pop-src')) return;
+        // The button sits inside .perf-num now, the source after it — look
+        // the cell up rather than relying on where they sit relative to
+        // each other.
+        var cell = btn.closest('td');
+        var src  = cell && cell.querySelector('.perf-pop-src');
+        if (!src) return;
         panel().innerHTML = src.innerHTML;
         openBtn = btn;
         btn.setAttribute('aria-expanded', 'true');

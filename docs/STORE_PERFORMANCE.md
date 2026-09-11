@@ -187,29 +187,46 @@ side. The parameter name spans its years, and the financial year is its own
 column — both pin to the left, so a row stays readable as "this parameter, this
 year" however far the months are scrolled.
 
-How many years appear is the **History** picker: *This FY*, *2 financial years*,
-*3 financial years* or *All years* (data starts Apr 2024). Months after the one
-under review stay out even when the rest of their year is on file — the year is
-read up to the month being reviewed, not past it — and those slots are left
-blank and shaded, because "not reached yet" and "a month we hold with no figure"
-are different statements; the `—` is reserved for the second. The month under
-review is boxed, and its whole column is tinted so last year's August sits under
-this year's.
+Which years appear is the **History** picker — the same checkbox dropdown the
+employee list uses for Status and Active. It lists the financial years *this
+outlet actually has*, by name, and you tick the ones you want: they need not be
+consecutive, so FY 2024-25 against FY 2026-27 with the middle year left out is
+one click. The year under review is ticked and disabled — its row carries the
+justification boxes, so it cannot be turned off, and the server puts it back if
+a request arrives without it. Closing the dropdown applies the selection, the
+way the rest of that filter bar submits on change.
 
-Each figure carries a ▲/▼ against **the month before it in the calendar**, not
-the cell to its left: April's arrow compares against the March in the row above,
-so the year boundary does not break the run. That is coloured by whether the
-movement is good for *that* parameter — wastage falling is green, wastage rising
-is red.
+The list only offers years with a month at or before the one under review, so
+ticking a year never comes back empty. Within a year the same rule applies:
+months after the one under review stay out even when the rest of their year is
+on file — a year is read up to the month being reviewed, not past it. Those
+slots are left blank and shaded, because "not reached yet" and "a month we hold
+with no figure" are different statements; the `—` is reserved for the second.
+The month under review is boxed, and its whole column is tinted so last year's
+August sits under this year's.
 
-A month that carries a justification shows a small **💬 Remark** button under
-the figure; clicking it opens the note over the page, and Escape or a click
-elsewhere closes it. It was inline before, which let one long remark set the
-height of its whole row and push a twelve-month year off the screen — collapsed,
-the grid stays a grid of figures. The button turns amber and reads **Asked**
-while a requested justification is still unanswered. *Show remarks* hides the
-buttons altogether. The boxes Operations and the Store Manager type into are
-unaffected: those stay open in the cell under review.
+Each figure carries a ▲/▼ against **the same month a year earlier** — Apr 2026
+against Apr 2025, which is the cell directly above it. Not against the month
+before: seasons move these numbers more than anything an outlet does (Rakhi,
+Diwali, exam season), so April against March mostly measures the calendar, while
+April against last April measures the outlet. The arrow is coloured by whether
+that movement is good for *that* parameter — wastage falling is green, wastage
+rising is red — and hovering the figure names the month it was compared against
+and its value, including when that month is not itself on screen. The grid is
+read a year wider than it is drawn so the earliest row still gets its arrows.
+
+A month that carries a justification shows a small speech-bubble icon
+**immediately to the left of the figure, on its own line**; clicking it opens
+the note over the page, and Escape or a click elsewhere closes it. Both details
+are load-bearing. The words were printed into the cell once, which let one long
+remark set the height of its whole row; behind a *labelled button under* the
+figure they still cost every such cell a second line, and a fixed-layout row is
+as tall as its tallest cell, so one remark grew the whole band. Inline, a row
+stays one line high however many remarks it carries. The icon turns amber while
+a requested justification is unanswered, and its tooltip says which it is.
+*Show remarks* hides the icons — except where a request is still open, which is
+not a remark and does not hide. The boxes Operations and the Store Manager type
+into are unaffected: those stay open in the cell under review.
 
 **Achievement is also coloured against that month's Target**: green once it
 matches or beats it, red while it is short. That is separate from the arrow
