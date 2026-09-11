@@ -241,9 +241,15 @@ function doSaveTimeEntry(): void {
         flash('error', 'Enter a valid work date.');
         header("Location: $back"); exit;
     }
-    // Duration is chosen directly in 15-minute slots (15m … 8h).
-    if ($minutes <= 0 || $minutes > 8 * 60 || $minutes % 15 !== 0) {
-        flash('error', 'Choose a duration between 15 minutes and 8 hours.');
+    // Duration comes from the dropdown, so the guard only has to hold the
+    // range it offers. Not slot membership and not divisibility: the ladder
+    // has 5m and 10m on it, and an entry saved under an older ladder keeps
+    // its own option in the box (see durationSelect) — either test would
+    // reject a value the person never typed.
+    $slots      = durationSlots();
+    $maxMinutes = $slots ? (int)max($slots) : 12 * 60;
+    if ($minutes <= 0 || $minutes > $maxMinutes) {
+        flash('error', 'Choose a duration between 5 minutes and ' . fmtMinutes($maxMinutes) . '.');
         header("Location: $back"); exit;
     }
 
