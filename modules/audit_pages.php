@@ -382,9 +382,17 @@ function pageAuditList(): void {
                         <?php
                         $canEdit    = auditCanEditRow($a);
                         $canSmRev   = auditCanManagerReview($a) && auditHasManagerReviewCols();
-                        $canOps     = auditCanOperationReview() && $a['status'] === 'operation_review';
-                        $canApprove = auditCanApprove()         && $a['status'] === 'approver_review';
-                        $canMgmt    = auditCanManagementReview() && $a['status'] === 'management_review';
+                        // Each reviewer sees their own desk, and any desk
+                        // beneath it that the audit is still waiting at —
+                        // acting there settles the ones passed over, so the
+                        // button says so.
+                        $canOps     = auditCanReviewAtStage($a, 'operation_review');
+                        $canApprove = auditCanReviewAtStage($a, 'approver_review');
+                        $canMgmt    = auditCanReviewAtStage($a, 'management_review');
+                        $skipTag    = function (string $stage) use ($a) {
+                            $names = array_map('auditStageLabel', auditStagesSkipped((string)$a['status'], $stage));
+                            return $names ? ' (skip ' . implode(', ', $names) . ')' : '';
+                        };
                         ?>
                         <?php if ($canEdit): ?>
                             <?php
@@ -399,9 +407,9 @@ function pageAuditList(): void {
                         <?php elseif ($canOps): ?>
                             <a class="btn btn-sm btn-primary" href="?page=audit_operation_review&id=<?= (int)$a['id'] ?>">Operation Review</a>
                         <?php elseif ($canApprove): ?>
-                            <a class="btn btn-sm btn-success" href="?page=audit_approve&id=<?= (int)$a['id'] ?>">Approve</a>
+                            <a class="btn btn-sm btn-success" href="?page=audit_approve&id=<?= (int)$a['id'] ?>">Approve<?= h($skipTag('approver_review')) ?></a>
                         <?php elseif ($canMgmt): ?>
-                            <a class="btn btn-sm btn-success" href="?page=audit_management_review&id=<?= (int)$a['id'] ?>">Management Review</a>
+                            <a class="btn btn-sm btn-success" href="?page=audit_management_review&id=<?= (int)$a['id'] ?>">Management Review<?= h($skipTag('management_review')) ?></a>
                         <?php else: ?>
                             <a class="btn btn-sm btn-secondary" href="?page=audit_view&id=<?= (int)$a['id'] ?>">View</a>
                         <?php endif; ?>
@@ -1181,13 +1189,16 @@ function pageAuditApprove(): void {
     $id = (int)($_GET['id'] ?? 0);
     $a  = $id > 0 ? auditGetById($id) : null;
     if (!$a) { echo '<p>Audit not found.</p>'; return; }
-    if ($a['status'] !== 'approver_review') {
+    if (!auditCanReviewAtStage($a, 'approver_review')) {
         header('Location: ?page=audit_view&id=' . $id);
         exit;
     }
+    $from    = (string)$a['status'];
+    $skipping = auditStagesSkipped($from, 'approver_review');
     $tree = auditGetTree($id, (int)$a['template_id']);
     renderAuditHeader($a);
     renderOpenPinsBanner($a);
+    renderSkipAheadBanner($skipping, 'Approving here');
     ?>
     <form method="POST" id="auditApproveForm">
         <input type="hidden" name="action" value="approve_audit">
@@ -1200,11 +1211,15 @@ function pageAuditApprove(): void {
                     border-radius:8px 8px 0 0;
                     box-shadow:0 -6px 18px rgba(0,0,0,.45);
                     display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-            <button class="btn btn-success" type="submit" name="decision" value="approve">Approve &amp; Forward to Management</button>
-            <button class="btn btn-danger"  type="submit" name="decision" value="send_back_ops"
-                    title="Send back to the Operation Team for re-review">
-                Send Back to Operation Team
+            <button class="btn btn-success" type="submit" name="decision" value="approve">
+                <?= $skipping ? 'Approve &amp; Forward to Management (skip ' . h(implode(', ', array_map('auditStageLabel', $skipping))) . ')' : 'Approve &amp; Forward to Management' ?>
             </button>
+            <?php if (!$skipping): ?>
+                <button class="btn btn-danger"  type="submit" name="decision" value="send_back_ops"
+                        title="Send back to the Operation Team for re-review">
+                    Send Back to Operation Team
+                </button>
+            <?php endif; ?>
             <a class="btn btn-ghost" href="?page=audit_list" style="margin-left:auto">Back</a>
         </div>
     </form>
@@ -1272,13 +1287,16 @@ function pageAuditManagementReview(): void {
     $id = (int)($_GET['id'] ?? 0);
     $a  = $id > 0 ? auditGetById($id) : null;
     if (!$a) { echo '<p>Audit not found.</p>'; return; }
-    if ($a['status'] !== 'management_review') {
+    if (!auditCanReviewAtStage($a, 'management_review')) {
         flash('error', 'Audit not in Management queue.');
         header('Location: ?page=audit_view&id=' . $id); return;
     }
+    $from     = (string)$a['status'];
+    $skipping = auditStagesSkipped($from, 'management_review');
     $tree = auditGetTree($id, (int)$a['template_id']);
     renderAuditHeader($a);
     renderOpenPinsBanner($a);
+    renderSkipAheadBanner($skipping, 'Final-approving here');
     ?>
     <form method="POST" id="auditMgmtReviewForm">
         <input type="hidden" name="action" value="management_approve_audit">
@@ -1291,14 +1309,37 @@ function pageAuditManagementReview(): void {
                     border-radius:8px 8px 0 0;
                     box-shadow:0 -6px 18px rgba(0,0,0,.45);
                     display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-            <button class="btn btn-success" type="submit" name="decision" value="approve">Final Approve</button>
-            <button class="btn btn-danger"  type="submit" name="decision" value="send_back_approver"
-                    title="Send back to the Approver for re-review">
-                Send Back to Approver
+            <button class="btn btn-success" type="submit" name="decision" value="approve">
+                <?= $skipping ? 'Final Approve (skip ' . h(implode(', ', array_map('auditStageLabel', $skipping))) . ')' : 'Final Approve' ?>
             </button>
+            <?php if ($from !== 'approver_review'): ?>
+                <button class="btn btn-danger"  type="submit" name="decision" value="send_back_approver"
+                        title="<?= $from === 'management_review' ? 'Send back to the Approver for re-review' : 'Let the Approver review it instead of approving now' ?>">
+                    <?= $from === 'management_review' ? 'Send Back to Approver' : 'Pass to Approver Instead' ?>
+                </button>
+            <?php endif; ?>
             <a class="btn btn-ghost" href="?page=audit_list" style="margin-left:auto">Back</a>
         </div>
     </form>
+    <?php
+}
+
+// ── Skip-ahead banner ───────────────────────────────────
+// Shown when a reviewer opens an audit that is still sitting at a desk
+// beneath theirs. Acting here settles those desks too, so say which ones
+// before they click rather than after.
+function renderSkipAheadBanner(array $skipping, string $verb): void {
+    if (!$skipping) return;
+    $names = array_map('auditStageLabel', $skipping);
+    ?>
+    <div class="alert alert-warning"
+         style="margin-bottom:14px;background:rgba(255,180,40,.10);color:#ffce6b;
+                border:1px solid rgba(255,180,40,.32);padding:12px 14px;border-radius:6px">
+        <strong>This audit is still with the <?= h(implode(' and ', $names)) ?>.</strong>
+        <?= h($verb) ?> settles <?= count($names) === 1 ? 'that step' : 'those steps' ?> too —
+        <?= h(implode(' and ', $names)) ?> will not review it, and the audit is marked as having
+        skipped <?= count($names) === 1 ? 'it' : 'them' ?>.
+    </div>
     <?php
 }
 
@@ -2268,6 +2309,15 @@ function renderAuditHeader(array $a): void {
         return '<div class="stat-sub" style="font-size:11px;color:var(--muted);margin-top:2px">'
             . h($label) . ': ' . h($val) . '</div>';
     };
+    // A desk a higher level settled on its behalf carries that person's
+    // name and time in its columns, so say plainly that it was skipped
+    // rather than leaving the cell reading like a review that happened.
+    $skipped  = auditSkippedStages($a);
+    $skipNote = function (string $stage) use ($skipped) {
+        if (!in_array($stage, $skipped, true)) return '';
+        return '<div class="stat-sub" style="font-size:11px;color:#ffce6b;margin-top:2px">'
+            . 'Skipped — settled at a higher level</div>';
+    };
     ?>
     <div class="form-card" style="max-width:none;margin-bottom:18px">
         <div class="form-grid" style="grid-template-columns:repeat(4,1fr)">
@@ -2294,11 +2344,13 @@ function renderAuditHeader(array $a): void {
                 <div class="stat-lbl">Operation Team</div>
                 <div><?= $opName !== null ? h($opName) : '—' ?></div>
                 <?= $stageDate($a['operation_reviewed_at'] ?? null, 'Reviewed') ?>
+                <?= $skipNote('operation_review') ?>
             </div>
             <div>
                 <div class="stat-lbl">Approver</div>
                 <div><?= h($a['approver_name'] ?? '—') ?></div>
                 <?= $stageDate($a['approved_at'] ?? null, 'Approved') ?>
+                <?= $skipNote('approver_review') ?>
             </div>
 
             <div>
