@@ -958,12 +958,19 @@ function doSaveChecklist(): void {
                 $set['time_minutes'] = $times[$itemId] > 0 ? (int)$times[$itemId] : null;
             }
         }
+        // The remark the box carried belongs to the day, like the minutes;
+        // what lands on the response row is the cycle's roll-up of its days,
+        // resolved inside the transaction below. Without per-day remarks the
+        // box IS the cycle's remark, as before.
+        $dayRemark = null;
         if (chkHasRemarks() && array_key_exists($itemId, $remarks)) {
+            $dayRemark = (string)$remarks[$itemId];
             $set['remarks'] = $remarks[$itemId] !== '' ? $remarks[$itemId] : null;
         }
         if (!$set) continue;
         if (!checklistSectionEditable($sec, $day, $cl)) { $skippedClosed++; continue; }
-        $plan[$itemId] = ['log' => chkItemLogDate($sec, $cl, $day), 'set' => $set, 'day_mins' => $dayMins];
+        $plan[$itemId] = ['log' => chkItemLogDate($sec, $cl, $day), 'set' => $set,
+                          'day_mins' => $dayMins, 'day_remark' => $dayRemark];
     }
 
     // Which days' timesheet entries this submit can have changed. With per-day
@@ -1019,11 +1026,18 @@ function doSaveChecklist(): void {
             // then put the cycle total they add up to on the response — which
             // is what time_minutes has always meant to the reports, and is the
             // same number as the box on a daily task, where a cycle is a day.
-            if ($perDay && $p['day_mins'] !== null) {
-                $cycleMins = chkWriteTaskDayMinutes($checklistId, $locationId, $itemId, $empCode,
-                                                    $p['log'], $workDay, (int)$p['day_mins']);
-                $set['time_minutes']   = $cycleMins > 0 ? $cycleMins : null;
-                $set['response_value'] = $cycleMins > 0 ? 'Yes' : null;
+            if ($perDay && ($p['day_mins'] !== null || ($p['day_remark'] !== null && chkHasTaskDayRemarks()))) {
+                $cycle = chkWriteTaskDay($checklistId, $locationId, $itemId, $empCode,
+                                         $p['log'], $workDay, $p['day_mins'], $p['day_remark']);
+                if ($p['day_mins'] !== null) {
+                    $set['time_minutes']   = $cycle['minutes'] > 0 ? $cycle['minutes'] : null;
+                    $set['response_value'] = $cycle['minutes'] > 0 ? 'Yes' : null;
+                }
+                // The response row carries the cycle, so clearing today's
+                // remark must not wipe what another day of it still says.
+                if ($p['day_remark'] !== null && chkHasTaskDayRemarks()) {
+                    $set['remarks'] = $cycle['remark'];
+                }
             }
             // Stamp the day the work was recorded whenever minutes are written,
             // so the timesheet dates it by when it happened rather than by the
@@ -1120,9 +1134,9 @@ function doSaveChecklist(): void {
     if ($remarks && empty($_SESSION['flash'])) {
         flash('success', 'Checklist updated.');
     }
-    // A remark only reaches My Time through the cycle's time entry, and that
-    // entry only exists once there are minutes to log. Say so rather than
-    // letting the remark quietly go nowhere.
+    // A remark only reaches My Time through the time entry of the day it was
+    // written on, and that entry only exists once there are minutes to log.
+    // Say so rather than letting the remark quietly go nowhere.
     if ($remarksSaved > 0 && $logged <= 0) {
         $prev = $_SESSION['flash'] ?? null;
         $prevMsg = ($prev && ($prev['type'] ?? '') === 'success') ? rtrim((string)$prev['msg']) . ' ' : '';
@@ -1372,6 +1386,67 @@ function chkTaskDayMinutes(int $checklistId, int $locationId, string $empCode, s
     }
 }
 
+// Is chk_task_time.remarks there? The note beside a task's minutes belongs to
+// the day they were worked, not to the cycle the answer sits under — see
+// migrations/2026-09-14_task_day_remarks.sql. Without the column the remark
+// stays a property of the whole cycle, which is how the module behaved before.
+function chkHasTaskDayRemarks(): bool {
+    static $has = null;
+    if ($has !== null) return $has;
+    if (!chkHasTaskTimeDay()) return $has = false;
+    try {
+        $r = getDb()->query('SELECT remarks FROM chk_task_time LIMIT 0');
+        return $has = ($r !== false);
+    } catch (Exception $e) {
+        return $has = false;
+    }
+}
+
+// What this employee noted against each task of one checklist on one day:
+// [item_id => remark]. Empty when per-day remarks are not available yet.
+function chkTaskDayRemarks(int $checklistId, int $locationId, string $empCode, string $day): array {
+    if (!chkHasTaskDayRemarks() || $empCode === '') return [];
+    try {
+        $st = getDb()->prepare(
+            "SELECT item_id, remarks FROM chk_task_time
+             WHERE checklist_id = ? AND location_id = ? AND employee_code = ? AND worked_on = ?
+               AND remarks IS NOT NULL AND remarks <> ''");
+        $st->execute([$checklistId, $locationId, $empCode, $day]);
+        $out = [];
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) $out[(int)$r['item_id']] = (string)$r['remarks'];
+        return $out;
+    } catch (Exception $e) {
+        return [];
+    }
+}
+
+// The cycle's remark for one task, rolled up from its days for the reports
+// that read chk_daily_responses.remarks. One day's remark reads exactly as it
+// always did; several are joined, each under the date it was written, and the
+// whole thing is capped at the column's 500 characters.
+function chkCycleRemark(int $checklistId, int $locationId, int $itemId, string $empCode, string $logDate): ?string {
+    if (!chkHasTaskDayRemarks()) return null;
+    try {
+        $st = getDb()->prepare(
+            "SELECT worked_on, remarks FROM chk_task_time
+             WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND employee_code = ? AND log_date = ?
+               AND remarks IS NOT NULL AND remarks <> ''
+             ORDER BY worked_on ASC");
+        $st->execute([$checklistId, $locationId, $itemId, $empCode, $logDate]);
+        $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) {
+        return null;
+    }
+    if (!$rows) return null;
+    if (count($rows) === 1) return mb_substr((string)$rows[0]['remarks'], 0, 500);
+    $parts = [];
+    foreach ($rows as $r) {
+        $ts = strtotime((string)$r['worked_on']);
+        $parts[] = ($ts ? date('d M', $ts) . ': ' : '') . (string)$r['remarks'];
+    }
+    return mb_substr(implode(' · ', $parts), 0, 500);
+}
+
 // Everything this employee logged against each task across one cycle:
 // [item_id => minutes]. This is what the response row's time_minutes holds,
 // read from the per-day rows so the fill page can show "of which today".
@@ -1393,33 +1468,66 @@ function chkTaskCycleMinutes(int $checklistId, int $locationId, string $empCode,
     }
 }
 
-// Write one task's minutes for one day: upsert, or delete the day's row when
-// the box was blanked. Returns the task's new cycle total, which is what goes
-// back onto chk_daily_responses.time_minutes.
-function chkWriteTaskDayMinutes(int $checklistId, int $locationId, int $itemId, string $empCode,
-                                string $logDate, string $day, int $minutes): int {
-    if (!chkHasTaskTimeDay()) return $minutes;
-    $db = getDb();
-    if ($minutes > 0) {
-        $db->prepare(
-            'INSERT INTO chk_task_time
-                (checklist_id, location_id, item_id, employee_code, log_date, worked_on, minutes)
-             VALUES (?,?,?,?,?,?,?)
-             ON DUPLICATE KEY UPDATE minutes = VALUES(minutes), log_date = VALUES(log_date)'
-        )->execute([$checklistId, $locationId, $itemId, $empCode, $logDate, $day, $minutes]);
+// Write one task's day: the minutes the box carried and the remark beside
+// them, both belonging to the calendar day worked rather than to the cycle.
+// Either may be null, meaning "this submit did not carry it" — what is
+// already on the day survives untouched. A blank value (0 minutes, empty
+// remark) clears that half, and a day left with neither is deleted, since a
+// row saying nothing about nothing is not a record of anything.
+//
+// Returns ['minutes' => cycle total, 'remark' => cycle roll-up], which is what
+// goes back onto chk_daily_responses so the reports keep reading the columns
+// they always have.
+function chkWriteTaskDay(int $checklistId, int $locationId, int $itemId, string $empCode,
+                         string $logDate, string $day, ?int $minutes, ?string $remark): array {
+    if (!chkHasTaskTimeDay()) return ['minutes' => (int)$minutes, 'remark' => $remark];
+    $db      = getDb();
+    $hasRem  = chkHasTaskDayRemarks();
+    if (!$hasRem) $remark = null;
+    $key     = [$checklistId, $locationId, $itemId, $empCode, $day];
+
+    // What the day already holds, so a submit that carried only one half
+    // leaves the other where it was.
+    $curMins = 0; $curRem = null;
+    try {
+        $cur = $db->prepare('SELECT minutes' . ($hasRem ? ', remarks' : '') . ' FROM chk_task_time
+                             WHERE checklist_id = ? AND location_id = ? AND item_id = ?
+                               AND employee_code = ? AND worked_on = ?');
+        $cur->execute($key);
+        if ($row = $cur->fetch(PDO::FETCH_ASSOC)) {
+            $curMins = (int)$row['minutes'];
+            $curRem  = $hasRem ? (($row['remarks'] ?? '') !== '' ? (string)$row['remarks'] : null) : null;
+        }
+    } catch (Exception $e) { /* nothing on the day yet */ }
+
+    $newMins = $minutes !== null ? max(0, $minutes) : $curMins;
+    $newRem  = $remark  !== null ? (trim($remark) !== '' ? mb_substr(trim($remark), 0, 500) : null) : $curRem;
+
+    if ($newMins > 0 || $newRem !== null) {
+        $cols = 'checklist_id, location_id, item_id, employee_code, log_date, worked_on, minutes'
+              . ($hasRem ? ', remarks' : '');
+        $vals = '?,?,?,?,?,?,?' . ($hasRem ? ',?' : '');
+        $upd  = 'minutes = VALUES(minutes), log_date = VALUES(log_date)'
+              . ($hasRem ? ', remarks = VALUES(remarks)' : '');
+        $args = [$checklistId, $locationId, $itemId, $empCode, $logDate, $day, $newMins];
+        if ($hasRem) $args[] = $newRem;
+        $db->prepare("INSERT INTO chk_task_time ({$cols}) VALUES ({$vals}) ON DUPLICATE KEY UPDATE {$upd}")
+           ->execute($args);
     } else {
-        // Blanking the box clears this day only. The other days of the cycle
-        // are other rows and are none of this submit's business.
+        // Blanking clears this day only. The other days of the cycle are other
+        // rows and are none of this submit's business.
         $db->prepare(
             'DELETE FROM chk_task_time
              WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND employee_code = ? AND worked_on = ?'
-        )->execute([$checklistId, $locationId, $itemId, $empCode, $day]);
+        )->execute($key);
     }
+
     $st = $db->prepare(
         'SELECT COALESCE(SUM(minutes),0) FROM chk_task_time
          WHERE checklist_id = ? AND location_id = ? AND item_id = ? AND employee_code = ? AND log_date = ?');
     $st->execute([$checklistId, $locationId, $itemId, $empCode, $logDate]);
-    return (int)$st->fetchColumn();
+    return ['minutes' => (int)$st->fetchColumn(),
+            'remark'  => chkCycleRemark($checklistId, $locationId, $itemId, $empCode, $logDate)];
 }
 
 // Recomputes an employee's timesheet entries for one checklist on one day:
@@ -1437,7 +1545,9 @@ function chkWriteTaskDayMinutes(int $checklistId, int $locationId, int $itemId, 
 // come from chk_task_time, which holds one row per task per day, so a monthly
 // task worked on two days contributes to both — where the single worked_on
 // stamp it replaces could only ever name one, and moved when the other was
-// filled. The remark is still the cycle's, joined from the response row.
+// filled. The note is that day's own remark once chk_task_time carries one;
+// before that column it is the cycle's, joined from the response row, which
+// is why every day of a month used to read the same note.
 function chkSyncTimeEntry(int $checklistId, string $empCode, string $day): int {
     if ($empCode === '') return 0;
     $db  = getDb();
@@ -1458,8 +1568,11 @@ function chkSyncTimeEntry(int $checklistId, string $empCode, string $day): int {
         $remarkSel = chkHasRemarks() ? 'r.remarks' : 'NULL AS remarks';
         $rows = [];
         if (chkHasTaskTimeDay()) {
+            // The day's own remark, with no fall back to the cycle's: a note
+            // written on another day is not what this day was spent on.
+            $ttRemark = chkHasTaskDayRemarks() ? 'tt.remarks' : $remarkSel;
             $st = $db->prepare(
-                "SELECT tt.item_id, tt.minutes AS mins, {$remarkSel}
+                "SELECT tt.item_id, tt.minutes AS mins, {$ttRemark}
                  FROM chk_task_time tt
                  LEFT JOIN chk_daily_responses r
                         ON r.checklist_id = tt.checklist_id AND r.location_id = tt.location_id
@@ -2305,6 +2418,14 @@ function pageChecklistFill(int $checklistId): void {
         // other days still says so.
         $dayMine   = chkTaskDayMinutes($checklistId, $locationId, $me, $displayDate);
         $cycleMine = chkTaskCycleMinutes($checklistId, $locationId, $me, array_values($anchors));
+        // The remark box holds the same day, for the same reason: a monthly
+        // task's response row is shared by every day of the month, so reading
+        // the remark from it put 2 Sep's note in the box on the 14th — and the
+        // next submit then spread it over that day's My Time entry too.
+        $perDayRem = chkHasTaskDayRemarks();
+        $dayRemark = $perDayRem
+            ? chkTaskDayRemarks($checklistId, $locationId, $me, $displayDate)
+            : [];
         foreach ($tasks as &$t) {
             $k = (int)$t['id'] . '|' . ($anchors[$t['item_freq']] ?? $displayDate);
             $t['log_date']       = $anchors[$t['item_freq']] ?? $displayDate;
@@ -2312,7 +2433,7 @@ function pageChecklistFill(int $checklistId): void {
             $t['submitted_by']   = $latest[$k]['full_name'] ?? null;
             $t['my_minutes']     = $perDayUi ? ($dayMine[(int)$t['id']] ?? null) : ($mine[$k]['time_minutes'] ?? null);
             $t['cycle_minutes']  = $perDayUi ? (int)($cycleMine[(int)$t['id']] ?? 0) : (int)($mine[$k]['time_minutes'] ?? 0);
-            $t['my_remarks']     = $mine[$k]['remarks'] ?? null;
+            $t['my_remarks']     = $perDayRem ? ($dayRemark[(int)$t['id']] ?? null) : ($mine[$k]['remarks'] ?? null);
         }
         unset($t);
     }
