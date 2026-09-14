@@ -3424,7 +3424,10 @@ function pageManageTasks(): void {
                     Remove them in the <strong>Validators</strong> card below to make validation task-specific.
                 </div>
                 <?php endif; ?>
-                <input type="text" id="taskValSearch" class="form-control" placeholder="Type to filter people" autocomplete="off">
+                <input type="text" id="taskValSearch" class="form-control" placeholder="Type a name or employee code to filter" autocomplete="off">
+                <!-- The rows carry an inline display:flex, which outranks the browser's
+                     own [hidden] rule, so the filter needs its own !important hide. -->
+                <style>.task-val-opt[hidden]{display:none!important}</style>
                 <div id="taskValList" style="max-height:190px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;margin-top:6px;padding:4px 0">
                     <?php foreach ($employees as $e): if ((int)$e['is_active'] !== 1) continue;
                         $eCode = (string)$e['employee_code'];
@@ -3438,6 +3441,9 @@ function pageManageTasks(): void {
                         </span>
                     </label>
                     <?php endforeach; ?>
+                    <div id="taskValEmpty" class="text-muted" style="padding:8px 12px;font-size:12.5px" hidden>
+                        No active employee matches that.
+                    </div>
                 </div>
                 <div class="text-muted" style="margin-top:4px;font-size:11.5px">
                     Ticked people see this task on <strong>Validate Checklist</strong> and sign it off. Saved with the task.
@@ -3500,12 +3506,23 @@ function cancelEdit() {
     var list = document.getElementById('taskValList');
     if (!list) return;
     var search = document.getElementById('taskValSearch');
+    var empty = document.getElementById('taskValEmpty');
+    // Every word typed must appear somewhere in the name or the code, so
+    // "dipak sav" and "sav dipak" both land on the same person.
     if (search) search.addEventListener('input', function () {
-        var q = search.value.trim().toLowerCase();
-        var opts = list.querySelectorAll('.task-val-opt');
+        var terms = search.value.toLowerCase().split(/\s+/).filter(function (t) { return t !== ''; });
+        var opts  = list.querySelectorAll('.task-val-opt');
+        var shown = 0;
         for (var i = 0; i < opts.length; i++) {
-            opts[i].hidden = q !== '' && (opts[i].getAttribute('data-name') || '').indexOf(q) === -1;
+            var name = opts[i].getAttribute('data-name') || '';
+            var hit  = true;
+            for (var t = 0; t < terms.length; t++) {
+                if (name.indexOf(terms[t]) === -1) { hit = false; break; }
+            }
+            opts[i].hidden = !hit;
+            if (hit) shown++;
         }
+        if (empty) empty.hidden = shown !== 0;
     });
     list.addEventListener('change', taskValsCount);
     taskValsCount();
