@@ -938,21 +938,30 @@ function exportOddPunches(): void {
 }
 
 // ── Daily odd-punch alert ────────────────────────────────
-// Recipients for the digest. Falls back to the punch-request notification
-// addresses so the alert reaches HR/Operations on installs that never set
-// the dedicated key.
+// Two mails go out each morning, from one pass over the data:
+//   * one CONSOLIDATED digest to HR + Operations, every location in it;
+//   * one mail PER LOCATION to that store's own contact_email, carrying
+//     only its own people.
+// Grouping is by the location the EMPLOYEE has claimed (employees.location_id),
+// not by the machine the punch landed on -- someone covering a shift at
+// another store is still their own manager's to chase.
+
+// HR + Operations, the consolidated recipients. These are the addresses that
+// already receive punch-request notifications, which is exactly the audience
+// for a missing punch.
 function attOddPunchNotifyEmails(): array {
-    $raw = trim((string)getSetting('OddPunchNotifyEmails', ''));
-    if ($raw === '') {
-        $raw = implode(',', array_filter([
-            trim((string)getSetting('PunchRequestNotifyHR', '')),
-            trim((string)getSetting('PunchRequestNotifyOps', '')),
-        ]));
-    }
+    return attParseEmails(implode(',', [
+        (string)getSetting('PunchRequestNotifyHR', ''),
+        (string)getSetting('PunchRequestNotifyOps', ''),
+    ]));
+}
+
+// Tolerates a comma/semicolon/whitespace list or a JSON array of {"email":…}
+// objects -- the two shapes the settings boxes hold across this app.
+function attParseEmails(string $raw): array {
+    $raw = trim($raw);
     if ($raw === '') return [];
     $rows = json_decode($raw, true);
-    // Tolerate the plain comma-separated list people actually type into the
-    // settings box, same as the inward-barcode digest does.
     if (!is_array($rows)) $rows = preg_split('/[,;\s]+/', $raw, -1, PREG_SPLIT_NO_EMPTY);
     $out = [];
     foreach ($rows as $r) {
@@ -968,37 +977,99 @@ function attOddPunchTargetDay(): string {
     return date('Y-m-d', strtotime(attOpenShiftDay() . ' -1 day'));
 }
 
-function attBuildOddPunchEmail(array $summary, string $shiftDate): string {
-    $base = rtrim((string)getSetting('AppBaseUrl', ''), '/');
-    $th   = "style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'";
-    $td   = "style='padding:5px 8px;border-bottom:1px solid #eee'";
-
-    $body = "<table cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;font:13px/1.5 Arial,sans-serif'>"
-          . "<thead><tr style='background:#fafafa'>"
-          . "<th {$th}>Employee</th><th {$th}>Department</th><th {$th}>Location</th>"
-          . "<th {$th}>Punches</th>"
-          . "<th style='padding:6px 8px;text-align:right;border-bottom:1px solid #ddd'>Count</th>"
-          . "<th {$th}>Missing</th>"
-          . '</tr></thead><tbody>';
-
-    $days = 0;
+// Regroup an odd-punch summary under the employee's claimed location.
+// Location id 0 collects everyone who has never claimed one; they ride the
+// consolidated mail only, since there is no store to send theirs to.
+// Returns [locId => ['name' => …, 'days' => n, 'employees' => [code => emp]]],
+// stores first by name with the unassigned bucket last.
+function attOddPunchByLocation(array $summary): array {
+    $out = [];
     foreach ($summary as $code => $emp) {
-        foreach ($emp['days'] as $d) {
-            $days++;
+        $firstDay = reset($emp['days']);
+        $row      = $firstDay['punches'][0] ?? [];
+        $locId    = (int)($row['emp_location_id'] ?? 0);
+        $locName  = trim((string)($row['emp_location_name'] ?? ''));
+        if (!isset($out[$locId])) {
+            $out[$locId] = [
+                'name'      => $locId > 0 && $locName !== '' ? $locName : 'Unassigned location',
+                'days'      => 0,
+                'employees' => [],
+            ];
+        }
+        $out[$locId]['employees'][$code] = $emp;
+        $out[$locId]['days'] += count($emp['days']);
+    }
+    uksort($out, function ($a, $b) use ($out) {
+        if ($a === 0 || $b === 0) return $a === 0 ? 1 : -1;   // unassigned last
+        return strcasecmp($out[$a]['name'], $out[$b]['name']);
+    });
+    return $out;
+}
+
+// locations.contact_email keyed by location id -- the established "mail this
+// store" address, same one the location-claim OTP and the price-variation
+// decisions use. A store with no address simply gets no mail of its own; its
+// rows are still in the consolidated digest.
+function attLocationEmails(): array {
+    $out = [];
+    foreach (getLocations() as $l) {
+        $emails = attParseEmails((string)($l['contact_email'] ?? ''));
+        if ($emails) $out[(int)$l['location_id']] = $emails;
+    }
+    return $out;
+}
+
+// One table of odd-punch days. "Punched At" is the machine's location, which
+// is worth showing even in a store's own mail: it is how you spot someone
+// punching at a store they are not assigned to.
+function attOddPunchTable(array $employees): string {
+    $th = "style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'";
+    $td = "style='padding:5px 8px;border-bottom:1px solid #eee'";
+
+    $h = "<table cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;font:13px/1.5 Arial,sans-serif'>"
+       . "<thead><tr style='background:#fafafa'>"
+       . "<th {$th}>Employee</th><th {$th}>Department</th><th {$th}>Date</th>"
+       . "<th {$th}>Punched At</th><th {$th}>Punches</th>"
+       . "<th style='padding:6px 8px;text-align:right;border-bottom:1px solid #ddd'>Count</th>"
+       . "<th {$th}>Missing</th>"
+       . '</tr></thead><tbody>';
+
+    foreach ($employees as $code => $emp) {
+        foreach ($emp['days'] as $day => $d) {
             $punches = $d['punches'];
-            $loc     = (string)($punches[0]['location_name'] ?? '');
+            $at      = trim((string)($punches[0]['location_name'] ?? ''));
             $missing = end($punches)['punch_type'] === 'IN' ? 'OUT' : 'IN';
-            $body .= '<tr>'
-                  . "<td {$td}>" . h($emp['name']) . ' <span style=\'color:#888\'>(' . h((string)$code) . ')</span></td>'
-                  . "<td {$td}>" . h($emp['dept'] !== '' ? $emp['dept'] : '—') . '</td>'
-                  . "<td {$td}>" . h($loc !== '' ? $loc : '—') . '</td>'
-                  . "<td {$td}>" . h(attPunchTrace($punches)) . '</td>'
-                  . "<td style='padding:5px 8px;border-bottom:1px solid #eee;text-align:right;color:#c0392b;font-weight:700'>" . count($punches) . '</td>'
-                  . "<td {$td}><strong>" . $missing . '</strong></td>'
-                  . '</tr>';
+            $h .= '<tr>'
+               . "<td {$td}>" . h($emp['name']) . " <span style='color:#888'>(" . h((string)$code) . ')</span></td>'
+               . "<td {$td}>" . h($emp['dept'] !== '' ? $emp['dept'] : '—') . '</td>'
+               . "<td {$td}>" . h(date('d/m/Y', strtotime($day))) . '</td>'
+               . "<td {$td}>" . h($at !== '' ? $at : '—') . '</td>'
+               . "<td {$td}>" . h(attPunchTrace($punches)) . '</td>'
+               . "<td style='padding:5px 8px;border-bottom:1px solid #eee;text-align:right;color:#c0392b;font-weight:700'>" . count($punches) . '</td>'
+               . "<td {$td}><strong>" . $missing . '</strong></td>'
+               . '</tr>';
         }
     }
-    $body .= '</tbody></table>';
+    return $h . '</tbody></table>';
+}
+
+// $grouped is attOddPunchByLocation() output, already narrowed to whatever
+// this recipient should see -- one location for a store's mail, all of them
+// for the consolidated digest. Section headings are dropped when there is
+// only one, so a store's mail is not headed by its own name twice.
+function attBuildOddPunchEmail(array $grouped, string $shiftDate, string $heading): string {
+    $base  = rtrim((string)getSetting('AppBaseUrl', ''), '/');
+    $days  = array_sum(array_column($grouped, 'days'));
+    $multi = count($grouped) > 1;
+
+    $body = '';
+    foreach ($grouped as $loc) {
+        if ($multi) {
+            $body .= "<h3 style='font:600 15px/1.4 Arial,sans-serif;color:#c0392b;margin:22px 0 8px'>"
+                   . h($loc['name']) . ' (' . $loc['days'] . ")</h3>";
+        }
+        $body .= attOddPunchTable($loc['employees']);
+    }
 
     $link = '';
     if ($base !== '') {
@@ -1011,19 +1082,19 @@ function attBuildOddPunchEmail(array $summary, string $shiftDate): string {
     }
 
     return "<div style='font:14px/1.6 Arial,sans-serif;color:#222'>"
-         . "<h2 style='font:600 18px/1.4 Arial,sans-serif;margin:0 0 6px'>Odd punches — shift of "
-         . h(date('d M Y', strtotime($shiftDate))) . '</h2>'
+         . "<h2 style='font:600 18px/1.4 Arial,sans-serif;margin:0 0 6px'>" . h($heading) . '</h2>'
          . "<p style='margin:0 0 14px;color:#555'>The shift closed at "
          . h(sprintf('%02d:59:59', shiftCutoffHour() - 1))
          . '. A complete in&rarr;out trace always has an even number of punches (2, 4, 6, 8&hellip;); '
-         . 'the ' . $days . ' day' . ($days === 1 ? '' : 's') . ' below ended on an odd count, so a punch is missing.</p>'
+         . 'the ' . $days . ' day' . ($days === 1 ? '' : 's') . ' below ended on an odd count, so a punch is missing. '
+         . 'Raise a Missing Punch request in Work Pulse and HR can approve the one that was not made.</p>'
          . $body
          . $link
          . "<p style='margin:22px 0 0;color:#888;font-size:12px'>Work Pulse &middot; HRMS &rsaquo; Odd Punch Report</p>"
          . '</div>';
 }
 
-// Digest for one closed shift day. Silent when every trace is even — an
+// Digest for one closed shift day. Silent when every trace is even -- an
 // empty "nothing to report" mail every morning trains people to ignore it.
 // Returns the number of odd-punch days reported.
 function attSendOddPunchDigest(string $shiftDate = ''): int {
@@ -1032,43 +1103,38 @@ function attSendOddPunchDigest(string $shiftDate = ''): int {
     $summary = attOddPunchDays('', $shiftDate, $shiftDate, 0);
     if (!$summary) return 0;
 
-    $days = 0;
-    foreach ($summary as $emp) $days += count($emp['days']);
+    $grouped = attOddPunchByLocation($summary);
+    $days    = array_sum(array_column($grouped, 'days'));
+    $nice    = date('d M Y', strtotime($shiftDate));
 
+    // Each recipient's subject counts only what that recipient can see, so a
+    // store with one bad day reads "1 incomplete in/out trace", not "traces".
+    $subject = fn(int $n, string $where): string =>
+        'Odd punches — ' . ($where !== '' ? $where . ' — ' : '') . $n
+        . ' incomplete in/out trace' . ($n === 1 ? '' : 's') . ' — ' . $nice;
+
+    // 1. Consolidated digest — HR + Operations, every location.
     $emails = attOddPunchNotifyEmails();
-    if (!$emails) {
+    if ($emails) {
+        $body = attBuildOddPunchEmail($grouped, $shiftDate, 'Odd punches — shift of ' . $nice);
+        foreach ($emails as $e) sendSmtpEmailQuiet($e, $subject($days, ''), $body);
+    } else {
         error_log('[attendance] ' . $days . ' odd-punch day(s) on ' . $shiftDate
-                . ' but OddPunchNotifyEmails is empty');
-        return 0;
+                . ' but PunchRequestNotifyHR/Ops are both empty');
     }
 
-    $subject = 'Odd punches — ' . $days . ' incomplete in/out trace' . ($days === 1 ? '' : 's')
-             . ' — ' . date('d M Y', strtotime($shiftDate));
-    $body    = attBuildOddPunchEmail($summary, $shiftDate);
-    foreach ($emails as $e) sendSmtpEmailQuiet($e, $subject, $body);
+    // 2. One mail per location, to that store's own contact_email. The
+    //    unassigned bucket (id 0) has no store to write to and stays in the
+    //    consolidated digest only.
+    $byLoc = attLocationEmails();
+    foreach ($grouped as $locId => $loc) {
+        if ($locId === 0 || empty($byLoc[$locId])) continue;
+        $body = attBuildOddPunchEmail([$locId => $loc], $shiftDate,
+                                      'Odd punches — ' . $loc['name'] . ' — shift of ' . $nice);
+        foreach ($byLoc[$locId] as $e) sendSmtpEmailQuiet($e, $subject($loc['days'], $loc['name']), $body);
+    }
 
     return $days;
-}
-
-// Once-per-shift-day fallback for installs without a server cron — same shape
-// as inwExpiryLazyRun(). The marker holds the shift day already reported, not
-// today's date, so an early-morning request cannot send yesterday's digest a
-// second time. Nothing runs until the shift has closed and 07:00 has passed.
-function attOddPunchLazyRun(): void {
-    if ((int)date('G') < shiftCutoffHour() + 1) return;
-
-    $dir    = __DIR__ . '/../uploads';
-    $marker = $dir . '/odd_punch_lastrun.txt';
-    $target = attOddPunchTargetDay();
-    $last   = @file_get_contents($marker);
-    if ($last !== false && trim($last) === $target) return;
-    if (!is_dir($dir)) @mkdir($dir, 0775, true);
-    if (@file_put_contents($marker, $target, LOCK_EX) === false) return; // can't claim → skip quietly
-    try {
-        attSendOddPunchDigest($target);
-    } catch (Exception $e) {
-        error_log('[attendance] odd-punch lazy run failed: ' . $e->getMessage());
-    }
 }
 
 // ── Page: Failed Punches (superadmin) ───────────────────

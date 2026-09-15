@@ -10,16 +10,13 @@
 -- previous shift's list every morning at 07:00, once the shift has closed
 -- at (ShiftCutoffHour - 1):59:59.
 --
--- This migration only adds the settings row the alert reads. Leave it blank
--- and the alert falls back to PunchRequestNotifyHR / PunchRequestNotifyOps,
--- so the digest still reaches HR and Operations on day one.
+-- Two mails go out each morning: a consolidated digest to
+-- PunchRequestNotifyHR + PunchRequestNotifyOps, and one mail per location to
+-- that store's own locations.contact_email, carrying only its own people.
+-- Both addresses already exist, so this migration adds no settings of its own.
 --
 -- Additive and safe to run more than once.
 -- =========================================================
-
-INSERT IGNORE INTO `system_settings` (`setting_key`, `setting_value`, `description`) VALUES
-  ('OddPunchNotifyEmails', '',
-   'Comma-separated recipients for the daily 07:00 odd-punch alert. Blank falls back to PunchRequestNotifyHR / PunchRequestNotifyOps.');
 
 -- Every attendance report now groups punches on the cutoff the punch devices
 -- themselves use -- shiftCutoffHour() reads this key -- instead of the

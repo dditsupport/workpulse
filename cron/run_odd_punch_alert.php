@@ -15,8 +15,12 @@
 // System 'auto_close' placeholders (the synthesised 05:59:59 OUT) are excluded
 // — counting them would pad an odd day back to even and hide the miss.
 //
-// Recipients come from the 'OddPunchNotifyEmails' system setting, falling back
-// to 'PunchRequestNotifyHR' / 'PunchRequestNotifyOps'.
+// Two mails go out per run:
+//   * a CONSOLIDATED digest to 'PunchRequestNotifyHR' + 'PunchRequestNotifyOps';
+//   * one mail PER LOCATION to that store's locations.contact_email, carrying
+//     only the people who have claimed that location (employees.location_id).
+// Employees who never claimed a location ride the consolidated digest only.
+// Nothing is sent on a morning where every trace is even.
 //
 // Optional ?date=YYYY-MM-DD re-runs the digest for an earlier shift day.
 // =========================================================

@@ -261,14 +261,21 @@ function getAttendance(string $empCode = '', string $fromDate = '', string $toDa
     $to   = date('Y-m-d', strtotime($toDate . ' +1 day'))
           . ' ' . sprintf('%02d:59:59', $cut - 1);
     try {
+        // a.location_id / l.location_name = the machine the punch was made on.
+        // emp_location_* = the location the EMPLOYEE has claimed, which is what
+        // the odd-punch alert groups by -- the two differ when someone covers a
+        // shift at another store.
         $sql = 'SELECT a.*,
                        COALESCE(e.full_name, a.employee_code) AS full_name,
                        d.department_name AS department,
-                       l.location_name
+                       l.location_name,
+                       e.location_id      AS emp_location_id,
+                       el.location_name   AS emp_location_name
                 FROM attendance_logs a
                 LEFT JOIN employees e ON a.employee_code=e.employee_code
                 LEFT JOIN departments d ON e.department_id=d.id
                 LEFT JOIN locations l ON a.location_id=l.location_id
+                LEFT JOIN locations el ON e.location_id=el.location_id
                 WHERE a.punch_time >= ? AND a.punch_time <= ?';
         $p = [$from, $to];
         if ($empCode !== '')  { $sql .= ' AND a.employee_code=?'; $p[] = $empCode; }
