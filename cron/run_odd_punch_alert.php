@@ -1,0 +1,45 @@
+<?php
+// =========================================================
+// Cron entrypoint — daily odd-punch alert, 07:00.
+// Standalone (no login/session). Wire to a daily cPanel cron at 7 AM:
+//   0 7 * * *  curl -s "https://wp.aromen.biz/cron/run_odd_punch_alert.php?token=XXX"
+// where XXX matches the 'CronToken' system setting (set it in Settings).
+// A lazy fallback in index.php also covers this if cron isn't configured.
+//
+// The retail shift closes at (ShiftCutoffHour - 1):59:59 — 05:59:59 on the
+// standard 6 o'clock cutoff — so by 07:00 the previous shift day is final and
+// its punches can be audited. A complete in→out trace always has an EVEN
+// number of punches (2, 4, 6, 8…); an odd count means someone forgot to punch
+// and the day cannot be traced. Those are the days this email lists.
+//
+// System 'auto_close' placeholders (the synthesised 05:59:59 OUT) are excluded
+// — counting them would pad an odd day back to even and hide the miss.
+//
+// Recipients come from the 'OddPunchNotifyEmails' system setting, falling back
+// to 'PunchRequestNotifyHR' / 'PunchRequestNotifyOps'.
+//
+// Optional ?date=YYYY-MM-DD re-runs the digest for an earlier shift day.
+// =========================================================
+date_default_timezone_set('Asia/Kolkata');
+
+require_once __DIR__ . '/../config.php';             // getDb(), getSetting()
+require_once __DIR__ . '/../modules/auth.php';       // gates used by the module
+require_once __DIR__ . '/../modules/helpers.php';    // getAttendance(), sendSmtpEmailQuiet()
+require_once __DIR__ . '/../modules/attendance.php'; // attSendOddPunchDigest()
+
+header('Content-Type: text/plain; charset=utf-8');
+
+$token    = (string)($_GET['token'] ?? ($argv[1] ?? ''));
+$expected = function_exists('getSetting') ? (string)getSetting('CronToken', '') : '';
+
+if ($expected === '' || !hash_equals($expected, $token)) {
+    http_response_code(403);
+    echo "Forbidden — missing or invalid token.\n";
+    exit;
+}
+
+$date = (string)($_GET['date'] ?? ($argv[2] ?? ''));
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) $date = attOddPunchTargetDay();
+
+$days = attSendOddPunchDigest($date);
+echo 'OK shift=' . $date . ' odd_days=' . $days . ' at ' . date('Y-m-d H:i:s') . "\n";

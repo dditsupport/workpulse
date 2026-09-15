@@ -84,7 +84,7 @@ function pageSettings(): void {
         // Policy: consent OTP SMS (MSG91 v5 policy flow + legacy template/DLT) + verify cap.
         'Policy' => ['sms_policy_otp_flow_id','sms_policy_otp_template','sms_policy_otp_dlt_id','OtpMaxVerifyAttempts'],
         'Price Variation' => ['PriceSlotsActive','PriceVariationNotifyEmails','InwardBarcodeNotifyEmails'],
-        'Punch Requests' => ['PunchRequestNotifyHR','PunchRequestNotifyOps'],
+        'Punch Requests' => ['PunchRequestNotifyHR','PunchRequestNotifyOps','OddPunchNotifyEmails'],
         'Location'       => ['LocationClaimRequiresPunch'],
         'General'        => ['AppTimezone'],
     ];

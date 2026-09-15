@@ -6,6 +6,16 @@
 // pageDashboard() now lives in modules/dashboard.php (adds the
 // "Pending For You" widget + retains the stat cards).
 
+// The device API synthesises an OUT at (cutoff-1):59:59 -- 05:59:59 on a
+// 6 o'clock cutoff -- whenever someone goes home without punching out, so
+// that the next day's punch still validates. It is a placeholder, not a
+// punch: left in, it invents working hours, feeds the ERP a wrong OUT and
+// makes a forgotten punch look like a complete in→out trace. Every report
+// and every alert strips it; only the raw attendance_logs CSV keeps it.
+function attStripAutoClose(array $rows): array {
+    return array_values(array_filter($rows, fn($r) => ($r['punch_method'] ?? '') !== 'auto_close'));
+}
+
 // ── Page: Attendance Report (admin/superadmin/hr/operations view) ─
 function pageAttendance(): void {
     $empCode      = trim($_GET['emp']       ?? '');
@@ -44,10 +54,7 @@ function pageAttendance(): void {
     $rows = $summary = [];
     $totalDays = $totalEmps = 0;
     if ($doLoad) {
-        $rows    = getAttendance($empCode, $fromDate, $toDate, $locationId);
-        // Hide system auto-close placeholders from the on-screen report (the
-        // 05:59:59 OUTs corrupt hours/ERP). Raw CSV exports keep them.
-        $rows    = array_values(array_filter($rows, fn($r) => ($r['punch_method'] ?? '') !== 'auto_close'));
+        $rows    = attStripAutoClose(getAttendance($empCode, $fromDate, $toDate, $locationId));
         $summary = buildDaySummary($rows);
         $totalEmps = count($summary);
         foreach ($summary as $emp) $totalDays += count($emp['days']);
@@ -84,11 +91,93 @@ function pageAttendance(): void {
         Show Location
     </label>
     <button class="btn btn-primary">View</button>
+    <a href="?page=odd_punches&filter=1&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm">Odd Punches</a>
     <?php if ($doLoad): ?>
     <a href="?page=export_attendance&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm" target="_blank">Export CSV</a>
     <a href="?page=export_attendance_report&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm" target="_blank">Export Report</a>
     <?php endif; ?>
 </form>
+<?php attFilterScript($emps); ?>
+
+<?php if (!$doLoad): ?>
+<div class="rpt-prompt">Select filters and click <strong>View</strong> to load attendance data.</div>
+<?php else: ?>
+
+<div class="stats-grid-sm" style="margin-bottom:16px">
+    <div class="stat-card stat-green"><div class="stat-val"><?= $totalEmps ?></div><div class="stat-lbl">Employees</div></div>
+    <div class="stat-card stat-blue"><div class="stat-val"><?= $totalDays ?></div><div class="stat-lbl">Day Entries</div></div>
+    <div class="stat-card"><div class="stat-val"><?= count($rows) ?></div><div class="stat-lbl">Total Punches</div></div>
+</div>
+
+<?php if (empty($summary)): ?>
+<div class="table-wrap"><p class="empty-row">No attendance recorded for the selected period.</p></div>
+<?php else: ?>
+
+<div class="report-header-box">
+    <strong>Dangee Dums Ltd</strong><br>
+    Date wise Punch Report<?= $withLocation ? ' (With Punch Machine Location)' : '' ?>
+    &nbsp;From Date — <?= date('d/m/Y', strtotime($fromDate)) ?>
+    &nbsp;To Date <?= date('d/m/Y', strtotime($toDate)) ?>
+</div>
+
+<div class="table-wrap" data-stack>
+<table class="table rpt-table">
+    <thead>
+        <tr>
+            <th class="rpt-sr">Sr No</th>
+            <th class="rpt-id">Employee ID</th>
+            <th class="rpt-name">Employee Name</th>
+            <th class="rpt-date">Date</th>
+            <th>Punches <?php if ($withLocation): ?><span class="rpt-loc-hdr">(with location)</span><?php endif; ?></th>
+            <th class="rpt-hrs">Productive<br>Working Hours</th>
+            <th class="rpt-hrs">Total<br>Working Hours</th>
+        </tr>
+    </thead>
+    <tbody>
+    <?php $sr = 1; $empIdx = 0; foreach ($summary as $code => $emp): $empIdx++; ?>
+        <?php $dayKeys = array_keys($emp['days']); $firstDay = true; ?>
+        <?php foreach ($dayKeys as $day): ?>
+            <?php $d = $emp['days'][$day]; $punches = $d['punches']; ?>
+            <?php $hrs = fmtHours($d['first']['punch_time'] ?? null, $d['last']['punch_time'] ?? null); ?>
+            <tr class="<?= ($firstDay && $empIdx > 1) ? 'rpt-emp-start' : '' ?>">
+                <?php if ($firstDay): ?>
+                <td class="rpt-sr" rowspan="<?= count($dayKeys) ?>"><?= $sr++ ?></td>
+                <td class="rpt-id" rowspan="<?= count($dayKeys) ?>"><code><?= h($code) ?></code></td>
+                <td class="rpt-name" rowspan="<?= count($dayKeys) ?>">
+                    <?= h($emp['name']) ?>
+                    <?php if ($emp['dept']): ?><br><small class="text-muted"><?= h($emp['dept']) ?></small><?php endif; ?>
+                </td>
+                <?php $firstDay = false; endif; ?>
+                <td class="rpt-date" data-label="Date"><?= date('d/m/Y', strtotime($day)) ?></td>
+                <td class="rpt-punches-cell" data-label="Punches">
+                    <?php foreach ($punches as $p): $isAuto = (($p['punch_method'] ?? '') === 'auto_close'); ?>
+                    <span class="punch-chip punch-chip-<?= mb_strtolower($p['punch_type']) ?>"<?= $isAuto ? ' style="border:1px dashed var(--yellow)" title="Auto-close placeholder — system-generated, not a real punch (creates wrong ERP timing)"' : '' ?>>
+                        <span class="punch-chip-type"><?= $p['punch_type'] ?><?= $isAuto ? ' · AUTO' : '' ?></span>
+                        <span class="punch-chip-time"><?= date('H:i:s', strtotime($p['punch_time'])) ?></span>
+                        <?php if ($withLocation && !empty($p['location_name'])): ?>
+                        <span class="punch-chip-loc"><?= h($p['location_name']) ?></span>
+                        <?php endif; ?>
+                    </span>
+                    <?php endforeach; ?>
+                </td>
+                <td class="rpt-hrs" data-label="Productive Hours"><?= $hrs ?></td>
+                <td class="rpt-hrs" data-label="Total Hours"><?= $hrs ?></td>
+            </tr>
+        <?php endforeach; ?>
+    <?php endforeach; ?>
+    </tbody>
+</table>
+</div>
+<?php endif; ?>
+<?php endif; ?>
+<?php
+}
+
+// The filter strip's behaviour: to_date locked inside from_date's month, plus
+// the type-to-search employee dropdown. Shared by the Attendance Report and
+// the Odd Punch Report, which carry the same filters and the same element ids.
+function attFilterScript(array $emps): void {
+?>
 <script>
 (function () {
     var f = document.getElementById('attFromDate');
@@ -179,78 +268,6 @@ function pageAttendance(): void {
     }
 })();
 </script>
-
-<?php if (!$doLoad): ?>
-<div class="rpt-prompt">Select filters and click <strong>View</strong> to load attendance data.</div>
-<?php else: ?>
-
-<div class="stats-grid-sm" style="margin-bottom:16px">
-    <div class="stat-card stat-green"><div class="stat-val"><?= $totalEmps ?></div><div class="stat-lbl">Employees</div></div>
-    <div class="stat-card stat-blue"><div class="stat-val"><?= $totalDays ?></div><div class="stat-lbl">Day Entries</div></div>
-    <div class="stat-card"><div class="stat-val"><?= count($rows) ?></div><div class="stat-lbl">Total Punches</div></div>
-</div>
-
-<?php if (empty($summary)): ?>
-<div class="table-wrap"><p class="empty-row">No attendance recorded for the selected period.</p></div>
-<?php else: ?>
-
-<div class="report-header-box">
-    <strong>Dangee Dums Ltd</strong><br>
-    Date wise Punch Report<?= $withLocation ? ' (With Punch Machine Location)' : '' ?>
-    &nbsp;From Date — <?= date('d/m/Y', strtotime($fromDate)) ?>
-    &nbsp;To Date <?= date('d/m/Y', strtotime($toDate)) ?>
-</div>
-
-<div class="table-wrap" data-stack>
-<table class="table rpt-table">
-    <thead>
-        <tr>
-            <th class="rpt-sr">Sr No</th>
-            <th class="rpt-id">Employee ID</th>
-            <th class="rpt-name">Employee Name</th>
-            <th class="rpt-date">Date</th>
-            <th>Punches <?php if ($withLocation): ?><span class="rpt-loc-hdr">(with location)</span><?php endif; ?></th>
-            <th class="rpt-hrs">Productive<br>Working Hours</th>
-            <th class="rpt-hrs">Total<br>Working Hours</th>
-        </tr>
-    </thead>
-    <tbody>
-    <?php $sr = 1; $empIdx = 0; foreach ($summary as $code => $emp): $empIdx++; ?>
-        <?php $dayKeys = array_keys($emp['days']); $firstDay = true; ?>
-        <?php foreach ($dayKeys as $day): ?>
-            <?php $d = $emp['days'][$day]; $punches = $d['punches']; ?>
-            <?php $hrs = fmtHours($d['first']['punch_time'] ?? null, $d['last']['punch_time'] ?? null); ?>
-            <tr class="<?= ($firstDay && $empIdx > 1) ? 'rpt-emp-start' : '' ?>">
-                <?php if ($firstDay): ?>
-                <td class="rpt-sr" rowspan="<?= count($dayKeys) ?>"><?= $sr++ ?></td>
-                <td class="rpt-id" rowspan="<?= count($dayKeys) ?>"><code><?= h($code) ?></code></td>
-                <td class="rpt-name" rowspan="<?= count($dayKeys) ?>">
-                    <?= h($emp['name']) ?>
-                    <?php if ($emp['dept']): ?><br><small class="text-muted"><?= h($emp['dept']) ?></small><?php endif; ?>
-                </td>
-                <?php $firstDay = false; endif; ?>
-                <td class="rpt-date" data-label="Date"><?= date('d/m/Y', strtotime($day)) ?></td>
-                <td class="rpt-punches-cell" data-label="Punches">
-                    <?php foreach ($punches as $p): $isAuto = (($p['punch_method'] ?? '') === 'auto_close'); ?>
-                    <span class="punch-chip punch-chip-<?= mb_strtolower($p['punch_type']) ?>"<?= $isAuto ? ' style="border:1px dashed var(--yellow)" title="Auto-close placeholder — system-generated, not a real punch (creates wrong ERP timing)"' : '' ?>>
-                        <span class="punch-chip-type"><?= $p['punch_type'] ?><?= $isAuto ? ' · AUTO' : '' ?></span>
-                        <span class="punch-chip-time"><?= date('H:i:s', strtotime($p['punch_time'])) ?></span>
-                        <?php if ($withLocation && !empty($p['location_name'])): ?>
-                        <span class="punch-chip-loc"><?= h($p['location_name']) ?></span>
-                        <?php endif; ?>
-                    </span>
-                    <?php endforeach; ?>
-                </td>
-                <td class="rpt-hrs" data-label="Productive Hours"><?= $hrs ?></td>
-                <td class="rpt-hrs" data-label="Total Hours"><?= $hrs ?></td>
-            </tr>
-        <?php endforeach; ?>
-    <?php endforeach; ?>
-    </tbody>
-</table>
-</div>
-<?php endif; ?>
-<?php endif; ?>
 <?php
 }
 
@@ -264,9 +281,7 @@ function pageMyPunches(): void {
     $rows = $summary = [];
     $days = [];
     if ($doLoad) {
-        $rows    = getMyPunches(myCode(), $month, $year);
-        // Hide system auto-close placeholders from the on-screen view.
-        $rows    = array_values(array_filter($rows, fn($r) => ($r['punch_method'] ?? '') !== 'auto_close'));
+        $rows    = attStripAutoClose(getMyPunches(myCode(), $month, $year));
         $summary = buildDaySummary($rows);
         $empData = reset($summary) ?: ['name' => myName(), 'dept' => '', 'days' => []];
         $days    = $empData['days'];
@@ -638,7 +653,9 @@ function exportAttendanceReport(): void {
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $fromDate)) $fromDate = date('Y-m-01');
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDate))   $toDate   = date('Y-m-d');
 
-    $rows    = getAttendance($empCode, $fromDate, $toDate, $locationId);
+    // Same rows the on-screen report shows: auto-close placeholders out, so the
+    // export and the page agree on punch times and working hours.
+    $rows    = attStripAutoClose(getAttendance($empCode, $fromDate, $toDate, $locationId));
     $summary = buildDaySummary($rows);
 
     header('Content-Type: text/csv');
@@ -667,6 +684,392 @@ function exportAttendanceReport(): void {
     }
     fclose($out);
     exit;
+}
+
+// ═════════════════════════════════════════════════════════
+//  Odd Punch Report — incomplete in→out traces
+// ═════════════════════════════════════════════════════════
+// A finished shift day always carries an EVEN number of punches: IN/OUT,
+// IN/OUT/IN/OUT, and so on (2, 4, 6, 8…). An odd count means one half of a
+// pair never happened — someone forgot to punch — and the day cannot be
+// traced end to end. The auto-close placeholder is deliberately excluded
+// (attStripAutoClose): the system's 05:59:59 OUT would pad an odd day back
+// to even and hide the very thing this report exists to find.
+
+// The shift day that is still running, on the devices' own cutoff. Punches
+// keep arriving for it, so an odd count there is simply "still at work" —
+// never an exception. Everything strictly before it is final.
+function attOpenShiftDay(): string {
+    return shiftDayAt(date('Y-m-d H:i:s'), shiftCutoffHour());
+}
+
+// Keep only the days whose punch count is odd, and drop employees left with
+// nothing. Days in the still-open shift are never flagged.
+function attOddPunchSummary(array $summary): array {
+    $open = attOpenShiftDay();
+    $out  = [];
+    foreach ($summary as $code => $emp) {
+        $days = [];
+        foreach ($emp['days'] as $day => $d) {
+            if ($day >= $open) continue;
+            if (count($d['punches']) % 2 === 1) $days[$day] = $d;
+        }
+        if (!$days) continue;
+        $emp['days'] = $days;
+        $out[$code]  = $emp;
+    }
+    return $out;
+}
+
+// Odd-punch days for a window: grouped on the devices' configured cutoff so
+// an OUT punched at 05:30 still closes the shift it belongs to instead of
+// leaving an odd day on both sides of midnight.
+function attOddPunchDays(string $empCode, string $fromDate, string $toDate, int $locationId = 0): array {
+    $cut  = shiftCutoffHour();
+    $rows = attStripAutoClose(getAttendance($empCode, $fromDate, $toDate, $locationId, $cut));
+    return attOddPunchSummary(buildDaySummary($rows, $cut));
+}
+
+// "IN 09:02:11, OUT 14:30:00, IN 15:10:42" — the day's trace on one line.
+function attPunchTrace(array $punches): string {
+    return implode(', ', array_map(
+        fn($p) => $p['punch_type'] . ' ' . date('H:i:s', strtotime($p['punch_time'])),
+        $punches
+    ));
+}
+
+// ── Page: Odd Punch Report ───────────────────────────────
+function pageOddPunches(): void {
+    if (!canViewAttendance()) { echo '<div class="alert alert-error">Access denied.</div>'; return; }
+
+    $empCode      = trim($_GET['emp']       ?? '');
+    $fromDate     = trim($_GET['from_date'] ?? '');
+    $toDate       = trim($_GET['to_date']   ?? '');
+    $locationId   = (int)($_GET['loc']      ?? 0);
+    $withLocation = !empty($_GET['with_location']);
+    $doLoad       = isset($_GET['filter']);
+
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $fromDate)) $fromDate = date('Y-m-01');
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDate))   $toDate   = date('Y-m-d');
+    if (substr($fromDate, 0, 7) !== substr($toDate, 0, 7)) {
+        $toDate = date('Y-m-t', strtotime($fromDate));
+    }
+    if ($fromDate > $toDate) $toDate = $fromDate;
+
+    $monthEnd = date('Y-m-t', strtotime($fromDate));
+
+    $emps = [];
+    try {
+        $emps = getDb()->query('SELECT employee_code,full_name FROM employees ORDER BY full_name')->fetchAll();
+    } catch (Exception $e) {}
+
+    $locs = getActiveLocations();
+
+    $empLabel = '';
+    foreach ($emps as $e) {
+        if ($e['employee_code'] === $empCode) {
+            $empLabel = $e['full_name'] . ' (' . $e['employee_code'] . ')';
+            break;
+        }
+    }
+
+    $summary = [];
+    $totalDays = $totalEmps = $totalPunches = 0;
+    if ($doLoad) {
+        $summary   = attOddPunchDays($empCode, $fromDate, $toDate, $locationId);
+        $totalEmps = count($summary);
+        foreach ($summary as $emp) {
+            $totalDays += count($emp['days']);
+            foreach ($emp['days'] as $d) $totalPunches += count($d['punches']);
+        }
+    }
+?>
+<div class="page-header"><h2>Odd Punch Report</h2></div>
+
+<form method="GET" class="rpt-filter">
+    <input type="hidden" name="page"   value="odd_punches">
+    <input type="hidden" name="filter" value="1">
+    <input type="hidden" name="emp" id="attEmpCode" value="<?= h($empCode) ?>">
+    <span class="input-clear-wrap" style="flex:1 1 auto;min-width:200px">
+        <input type="text" id="attEmpSearch" class="form-control rpt-filter-emp"
+               placeholder="All Employees — type to search"
+               value="<?= h($empLabel) ?>" autocomplete="off"
+               style="max-width:none">
+        <button type="button" id="attEmpClear" class="input-clear-btn" data-no-auto aria-label="Clear" tabindex="-1">&times;</button>
+        <div id="attEmpList" style="position:absolute;top:100%;left:0;right:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;margin-top:2px;max-height:280px;overflow-y:auto;display:none;z-index:100;box-shadow:0 6px 18px rgba(0,0,0,.35)"></div>
+    </span>
+    <input type="date" name="from_date" id="attFromDate" class="form-control" style="width:160px"
+           value="<?= h($fromDate) ?>" required>
+    <input type="date" name="to_date"   id="attToDate"   class="form-control" style="width:160px"
+           value="<?= h($toDate)   ?>" min="<?= h($fromDate) ?>" max="<?= h($monthEnd) ?>" required>
+    <select name="loc" class="form-control" style="width:200px">
+        <option value="0">All Locations</option>
+        <?php foreach ($locs as $l): ?>
+        <option value="<?= (int)$l['location_id'] ?>" <?= $locationId === (int)$l['location_id'] ? 'selected' : '' ?>>
+            <?= h($l['location_name']) ?>
+        </option>
+        <?php endforeach; ?>
+    </select>
+    <label class="rpt-filter-chk">
+        <input type="checkbox" name="with_location" value="1" <?= $withLocation ? 'checked' : '' ?>>
+        Show Location
+    </label>
+    <button class="btn btn-primary">View</button>
+    <a href="?page=attendance&filter=1&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm">Full Report</a>
+    <?php if ($doLoad): ?>
+    <a href="?page=export_odd_punches&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm" target="_blank">Export CSV</a>
+    <?php endif; ?>
+</form>
+<?php attFilterScript($emps); ?>
+
+<?php if (!$doLoad): ?>
+<div class="rpt-prompt">Select filters and click <strong>View</strong> to list the days with an odd number of punches.</div>
+<?php else: ?>
+
+<div class="stats-grid-sm" style="margin-bottom:16px">
+    <div class="stat-card stat-red"><div class="stat-val"><?= $totalDays ?></div><div class="stat-lbl">Odd Punch Days</div></div>
+    <div class="stat-card stat-yellow"><div class="stat-val"><?= $totalEmps ?></div><div class="stat-lbl">Employees</div></div>
+    <div class="stat-card"><div class="stat-val"><?= $totalPunches ?></div><div class="stat-lbl">Punches Involved</div></div>
+</div>
+
+<?php if (empty($summary)): ?>
+<div class="table-wrap"><p class="empty-row">Every completed shift in this period has an even punch count — nothing to fix.</p></div>
+<?php else: ?>
+
+<div class="report-header-box">
+    <strong>Dangee Dums Ltd</strong><br>
+    Odd Punch Report — incomplete in/out trace<?= $withLocation ? ' (With Punch Machine Location)' : '' ?>
+    &nbsp;From Date — <?= date('d/m/Y', strtotime($fromDate)) ?>
+    &nbsp;To Date <?= date('d/m/Y', strtotime($toDate)) ?>
+</div>
+
+<div class="table-wrap" data-stack>
+<table class="table rpt-table">
+    <thead>
+        <tr>
+            <th class="rpt-sr">Sr No</th>
+            <th class="rpt-id">Employee ID</th>
+            <th class="rpt-name">Employee Name</th>
+            <th class="rpt-date">Date</th>
+            <th>Punches <?php if ($withLocation): ?><span class="rpt-loc-hdr">(with location)</span><?php endif; ?></th>
+            <th class="rpt-hrs">Punch<br>Count</th>
+            <th class="rpt-hrs">Missing</th>
+        </tr>
+    </thead>
+    <tbody>
+    <?php $sr = 1; $empIdx = 0; foreach ($summary as $code => $emp): $empIdx++; ?>
+        <?php $dayKeys = array_keys($emp['days']); $firstDay = true; ?>
+        <?php foreach ($dayKeys as $day): ?>
+            <?php
+                $punches = $emp['days'][$day]['punches'];
+                // Odd count: whichever type the trace ends on is the one whose
+                // pair never arrived — an open IN needs an OUT, and vice versa.
+                $missing = (end($punches)['punch_type'] === 'IN') ? 'OUT' : 'IN';
+            ?>
+            <tr class="<?= ($firstDay && $empIdx > 1) ? 'rpt-emp-start' : '' ?>">
+                <?php if ($firstDay): ?>
+                <td class="rpt-sr" rowspan="<?= count($dayKeys) ?>"><?= $sr++ ?></td>
+                <td class="rpt-id" rowspan="<?= count($dayKeys) ?>"><code><?= h($code) ?></code></td>
+                <td class="rpt-name" rowspan="<?= count($dayKeys) ?>">
+                    <?= h($emp['name']) ?>
+                    <?php if ($emp['dept']): ?><br><small class="text-muted"><?= h($emp['dept']) ?></small><?php endif; ?>
+                </td>
+                <?php $firstDay = false; endif; ?>
+                <td class="rpt-date" data-label="Date"><?= date('d/m/Y', strtotime($day)) ?></td>
+                <td class="rpt-punches-cell" data-label="Punches">
+                    <?php foreach ($punches as $p): ?>
+                    <span class="punch-chip punch-chip-<?= mb_strtolower($p['punch_type']) ?>">
+                        <span class="punch-chip-type"><?= $p['punch_type'] ?></span>
+                        <span class="punch-chip-time"><?= date('H:i:s', strtotime($p['punch_time'])) ?></span>
+                        <?php if ($withLocation && !empty($p['location_name'])): ?>
+                        <span class="punch-chip-loc"><?= h($p['location_name']) ?></span>
+                        <?php endif; ?>
+                    </span>
+                    <?php endforeach; ?>
+                </td>
+                <td class="rpt-hrs" data-label="Punch Count"><?= count($punches) ?></td>
+                <td class="rpt-hrs" data-label="Missing"><?= $missing ?></td>
+            </tr>
+        <?php endforeach; ?>
+    <?php endforeach; ?>
+    </tbody>
+</table>
+</div>
+<?php endif; ?>
+<?php endif; ?>
+<?php
+}
+
+// ── Export odd punch report CSV ──────────────────────────
+function exportOddPunches(): void {
+    if (!canViewAttendance()) { flash('error', 'Access denied.'); header('Location: index.php'); exit; }
+
+    $empCode    = trim($_GET['emp']       ?? '');
+    $fromDate   = trim($_GET['from_date'] ?? '');
+    $toDate     = trim($_GET['to_date']   ?? '');
+    $locationId = (int)($_GET['loc']      ?? 0);
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $fromDate)) $fromDate = date('Y-m-01');
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDate))   $toDate   = date('Y-m-d');
+
+    $summary = attOddPunchDays($empCode, $fromDate, $toDate, $locationId);
+
+    header('Content-Type: text/csv');
+    header('Content-Disposition: attachment; filename="odd_punches_' . date('Ymd_His') . '.csv"');
+    $out = fopen('php://output', 'w');
+    fputcsv($out, ['Sr No', 'Employee ID', 'Employee Name', 'Department', 'Date', 'Punch Times', 'Punch Count', 'Missing'], escape: '');
+
+    $sr = 1;
+    foreach ($summary as $code => $emp) {
+        foreach ($emp['days'] as $day => $d) {
+            $punches = $d['punches'];
+            fputcsv($out, [
+                $sr++,
+                $code,
+                $emp['name'],
+                $emp['dept'],
+                date('d/m/Y', strtotime($day)),
+                attPunchTrace($punches),
+                count($punches),
+                end($punches)['punch_type'] === 'IN' ? 'OUT' : 'IN',
+            ], escape: '');
+        }
+    }
+    fclose($out);
+    exit;
+}
+
+// ── Daily odd-punch alert ────────────────────────────────
+// Recipients for the digest. Falls back to the punch-request notification
+// addresses so the alert reaches HR/Operations on installs that never set
+// the dedicated key.
+function attOddPunchNotifyEmails(): array {
+    $raw = trim((string)getSetting('OddPunchNotifyEmails', ''));
+    if ($raw === '') {
+        $raw = implode(',', array_filter([
+            trim((string)getSetting('PunchRequestNotifyHR', '')),
+            trim((string)getSetting('PunchRequestNotifyOps', '')),
+        ]));
+    }
+    if ($raw === '') return [];
+    $rows = json_decode($raw, true);
+    // Tolerate the plain comma-separated list people actually type into the
+    // settings box, same as the inward-barcode digest does.
+    if (!is_array($rows)) $rows = preg_split('/[,;\s]+/', $raw, -1, PREG_SPLIT_NO_EMPTY);
+    $out = [];
+    foreach ($rows as $r) {
+        $e = is_array($r) ? trim((string)($r['email'] ?? '')) : trim((string)$r);
+        if ($e !== '' && filter_var($e, FILTER_VALIDATE_EMAIL)) $out[] = $e;
+    }
+    return array_values(array_unique($out));
+}
+
+// The shift day the 07:00 run reports on: the one that closed at
+// (cutoff-1):59:59 this morning, i.e. the day before the one now running.
+function attOddPunchTargetDay(): string {
+    return date('Y-m-d', strtotime(attOpenShiftDay() . ' -1 day'));
+}
+
+function attBuildOddPunchEmail(array $summary, string $shiftDate): string {
+    $base = rtrim((string)getSetting('AppBaseUrl', ''), '/');
+    $th   = "style='padding:6px 8px;text-align:left;border-bottom:1px solid #ddd'";
+    $td   = "style='padding:5px 8px;border-bottom:1px solid #eee'";
+
+    $body = "<table cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;font:13px/1.5 Arial,sans-serif'>"
+          . "<thead><tr style='background:#fafafa'>"
+          . "<th {$th}>Employee</th><th {$th}>Department</th><th {$th}>Location</th>"
+          . "<th {$th}>Punches</th>"
+          . "<th style='padding:6px 8px;text-align:right;border-bottom:1px solid #ddd'>Count</th>"
+          . "<th {$th}>Missing</th>"
+          . '</tr></thead><tbody>';
+
+    $days = 0;
+    foreach ($summary as $code => $emp) {
+        foreach ($emp['days'] as $d) {
+            $days++;
+            $punches = $d['punches'];
+            $loc     = (string)($punches[0]['location_name'] ?? '');
+            $missing = end($punches)['punch_type'] === 'IN' ? 'OUT' : 'IN';
+            $body .= '<tr>'
+                  . "<td {$td}>" . h($emp['name']) . ' <span style=\'color:#888\'>(' . h((string)$code) . ')</span></td>'
+                  . "<td {$td}>" . h($emp['dept'] !== '' ? $emp['dept'] : '—') . '</td>'
+                  . "<td {$td}>" . h($loc !== '' ? $loc : '—') . '</td>'
+                  . "<td {$td}>" . h(attPunchTrace($punches)) . '</td>'
+                  . "<td style='padding:5px 8px;border-bottom:1px solid #eee;text-align:right;color:#c0392b;font-weight:700'>" . count($punches) . '</td>'
+                  . "<td {$td}><strong>" . $missing . '</strong></td>'
+                  . '</tr>';
+        }
+    }
+    $body .= '</tbody></table>';
+
+    $link = '';
+    if ($base !== '') {
+        $url  = $base . '/index.php?' . http_build_query([
+            'page' => 'odd_punches', 'filter' => 1, 'emp' => '',
+            'from_date' => $shiftDate, 'to_date' => $shiftDate, 'loc' => 0,
+        ]);
+        $link = "<p style='margin:18px 0 0'><a href='" . h($url)
+              . "' style='color:#1a8fe3;text-decoration:none'>Open the Odd Punch Report &rarr;</a></p>";
+    }
+
+    return "<div style='font:14px/1.6 Arial,sans-serif;color:#222'>"
+         . "<h2 style='font:600 18px/1.4 Arial,sans-serif;margin:0 0 6px'>Odd punches — shift of "
+         . h(date('d M Y', strtotime($shiftDate))) . '</h2>'
+         . "<p style='margin:0 0 14px;color:#555'>The shift closed at "
+         . h(sprintf('%02d:59:59', shiftCutoffHour() - 1))
+         . '. A complete in&rarr;out trace always has an even number of punches (2, 4, 6, 8&hellip;); '
+         . 'the ' . $days . ' day' . ($days === 1 ? '' : 's') . ' below ended on an odd count, so a punch is missing.</p>'
+         . $body
+         . $link
+         . "<p style='margin:22px 0 0;color:#888;font-size:12px'>Work Pulse &middot; HRMS &rsaquo; Odd Punch Report</p>"
+         . '</div>';
+}
+
+// Digest for one closed shift day. Silent when every trace is even — an
+// empty "nothing to report" mail every morning trains people to ignore it.
+// Returns the number of odd-punch days reported.
+function attSendOddPunchDigest(string $shiftDate = ''): int {
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $shiftDate)) $shiftDate = attOddPunchTargetDay();
+
+    $summary = attOddPunchDays('', $shiftDate, $shiftDate, 0);
+    if (!$summary) return 0;
+
+    $days = 0;
+    foreach ($summary as $emp) $days += count($emp['days']);
+
+    $emails = attOddPunchNotifyEmails();
+    if (!$emails) {
+        error_log('[attendance] ' . $days . ' odd-punch day(s) on ' . $shiftDate
+                . ' but OddPunchNotifyEmails is empty');
+        return 0;
+    }
+
+    $subject = 'Odd punches — ' . $days . ' incomplete in/out trace' . ($days === 1 ? '' : 's')
+             . ' — ' . date('d M Y', strtotime($shiftDate));
+    $body    = attBuildOddPunchEmail($summary, $shiftDate);
+    foreach ($emails as $e) sendSmtpEmailQuiet($e, $subject, $body);
+
+    return $days;
+}
+
+// Once-per-shift-day fallback for installs without a server cron — same shape
+// as inwExpiryLazyRun(). The marker holds the shift day already reported, not
+// today's date, so an early-morning request cannot send yesterday's digest a
+// second time. Nothing runs until the shift has closed and 07:00 has passed.
+function attOddPunchLazyRun(): void {
+    if ((int)date('G') < shiftCutoffHour() + 1) return;
+
+    $dir    = __DIR__ . '/../uploads';
+    $marker = $dir . '/odd_punch_lastrun.txt';
+    $target = attOddPunchTargetDay();
+    $last   = @file_get_contents($marker);
+    if ($last !== false && trim($last) === $target) return;
+    if (!is_dir($dir)) @mkdir($dir, 0775, true);
+    if (@file_put_contents($marker, $target, LOCK_EX) === false) return; // can't claim → skip quietly
+    try {
+        attSendOddPunchDigest($target);
+    } catch (Exception $e) {
+        error_log('[attendance] odd-punch lazy run failed: ' . $e->getMessage());
+    }
 }
 
 // ── Page: Failed Punches (superadmin) ───────────────────

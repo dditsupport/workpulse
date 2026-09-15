@@ -220,9 +220,30 @@ function getStats(): array {
 define('SHIFT_CUTOFF_HOUR', 4);
 
 function shiftDay(string $punchTime): string {
+    return shiftDayAt($punchTime, SHIFT_CUTOFF_HOUR);
+}
+
+// Same, against an explicit cutoff. The punch devices read their cutoff from
+// system_settings ('ShiftCutoffHour') and can be configured past the constant
+// above -- a 6 there is what puts the auto-close OUT at 05:59:59. Reports that
+// must agree with the devices on where a shift day ends pass shiftCutoffHour().
+function shiftDayAt(string $punchTime, int $cutoff): string {
     $ts = strtotime($punchTime);
-    if ((int)date('G', $ts) < SHIFT_CUTOFF_HOUR) $ts -= 86400;
+    if ((int)date('G', $ts) < $cutoff) $ts -= 86400;
     return date('Y-m-d', $ts);
+}
+
+// The cutoff the punch devices actually use. SHIFT_CUTOFF_HOUR stays the
+// fallback for installs that never wrote the setting. Clamped to 1-12: the
+// window maths below builds its end time from ($cutoff - 1), and a shift that
+// closes in the afternoon is a misconfiguration, not a night shift.
+function shiftCutoffHour(): int {
+    static $cached = null;
+    if ($cached === null) {
+        $h = (int)getSetting('ShiftCutoffHour', (string)SHIFT_CUTOFF_HOUR);
+        $cached = ($h >= 1 && $h <= 12) ? $h : SHIFT_CUTOFF_HOUR;
+    }
+    return $cached;
 }
 
 // Fetch raw rows for selected date range.
@@ -231,12 +252,15 @@ function shiftDay(string $punchTime): string {
 //   end   = (toDate + 1 day) @ (SHIFT_CUTOFF_HOUR-1):59:59  (toDate's shift ends)
 // Punches before SHIFT_CUTOFF_HOUR on fromDate belong to (fromDate-1)'s shift
 // and are excluded so we don't crossover into the previous shift day.
-function getAttendance(string $empCode = '', string $fromDate = '', string $toDate = '', int $locationId = 0): array {
+// Pass $cutoffHour (1-12) to align the window with the devices' configured
+// cutoff instead of the constant -- see shiftCutoffHour().
+function getAttendance(string $empCode = '', string $fromDate = '', string $toDate = '', int $locationId = 0, int $cutoffHour = 0): array {
     if ($fromDate === '') $fromDate = date('Y-m-01');
     if ($toDate   === '') $toDate   = date('Y-m-d');
-    $from = $fromDate . ' ' . sprintf('%02d:00:00', SHIFT_CUTOFF_HOUR);
+    $cut  = ($cutoffHour >= 1 && $cutoffHour <= 12) ? $cutoffHour : SHIFT_CUTOFF_HOUR;
+    $from = $fromDate . ' ' . sprintf('%02d:00:00', $cut);
     $to   = date('Y-m-d', strtotime($toDate . ' +1 day'))
-          . ' ' . sprintf('%02d:59:59', SHIFT_CUTOFF_HOUR - 1);
+          . ' ' . sprintf('%02d:59:59', $cut - 1);
     try {
         $sql = 'SELECT a.*,
                        COALESCE(e.full_name, a.employee_code) AS full_name,
@@ -270,13 +294,15 @@ function getMyPunches(string $empCode, int $month = 0, int $year = 0): array {
 }
 
 // Build day-summary keyed by [empCode][shiftDate].
-// ALL punches kept for display.
+// ALL punches kept for display. $cutoffHour (1-12) overrides SHIFT_CUTOFF_HOUR
+// for callers that group on the devices' configured cutoff.
 // first = earliest, last = latest (for hours calculation).
-function buildDaySummary(array $rows): array {
+function buildDaySummary(array $rows, int $cutoffHour = 0): array {
+    $cut = ($cutoffHour >= 1 && $cutoffHour <= 12) ? $cutoffHour : SHIFT_CUTOFF_HOUR;
     $out = [];
     foreach ($rows as $r) {
         $code = $r['employee_code'];
-        $day  = shiftDay($r['punch_time']);
+        $day  = shiftDayAt($r['punch_time'], $cut);
         if (!isset($out[$code])) {
             $out[$code] = ['name' => $r['full_name'] ?? $code, 'dept' => $r['department'] ?? '', 'days' => []];
         }
