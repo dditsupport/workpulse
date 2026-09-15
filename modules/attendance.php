@@ -700,7 +700,7 @@ function exportAttendanceReport(): void {
 // keep arriving for it, so an odd count there is simply "still at work" —
 // never an exception. Everything strictly before it is final.
 function attOpenShiftDay(): string {
-    return shiftDayAt(date('Y-m-d H:i:s'), shiftCutoffHour());
+    return shiftDay(date('Y-m-d H:i:s'));
 }
 
 // Keep only the days whose punch count is odd, and drop employees left with
@@ -721,13 +721,12 @@ function attOddPunchSummary(array $summary): array {
     return $out;
 }
 
-// Odd-punch days for a window: grouped on the devices' configured cutoff so
-// an OUT punched at 05:30 still closes the shift it belongs to instead of
-// leaving an odd day on both sides of midnight.
+// Odd-punch days for a window. Grouping comes from shiftDay(), which follows
+// the devices' configured cutoff -- so an OUT punched at 05:30 closes the
+// shift it belongs to instead of leaving an odd day on both sides of midnight.
 function attOddPunchDays(string $empCode, string $fromDate, string $toDate, int $locationId = 0): array {
-    $cut  = shiftCutoffHour();
-    $rows = attStripAutoClose(getAttendance($empCode, $fromDate, $toDate, $locationId, $cut));
-    return attOddPunchSummary(buildDaySummary($rows, $cut));
+    $rows = attStripAutoClose(getAttendance($empCode, $fromDate, $toDate, $locationId));
+    return attOddPunchSummary(buildDaySummary($rows));
 }
 
 // "IN 09:02:11, OUT 14:30:00, IN 15:10:42" — the day's trace on one line.
