@@ -45,16 +45,26 @@ if ($expected === '' || !hash_equals($expected, $token)) {
 // No ?date= — the scheduled case. Claims the shift day first, so that a run
 // here and the lazy fallback in index.php cannot both mail the same morning.
 $date = (string)($_GET['date'] ?? ($argv[2] ?? ''));
+$report = null;
 if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
     $date = attOddPunchTargetDay();
-    $days = attRunOddPunchAlert();
+    $days = attRunOddPunchAlert($report);
     if ($days < 0) {
-        echo 'SKIP shift=' . $date . ' already sent at ' . date('Y-m-d H:i:s') . "\n";
+        echo 'SKIP shift=' . $date . ' — this shift day was already claimed by an earlier run.' . "\n"
+           . 'Note the claim is written BEFORE the digest runs, so this does NOT mean mail went out.' . "\n"
+           . 'Re-send it with &date=' . $date . ', or see uploads/odd_punch.log for what the first run did.' . "\n";
         exit;
     }
 } else {
     // Explicit date = someone asking for this day again on purpose. Re-send.
-    $days = attSendOddPunchDigest($date);
+    $days = attSendOddPunchDigest($date, $report);
 }
 
 echo 'OK shift=' . $date . ' odd_days=' . $days . ' at ' . date('Y-m-d H:i:s') . "\n";
+
+// Say who it went to. Without this the endpoint reports that it ran but never
+// what it did, which makes "no mail arrived" impossible to tell apart from
+// "there was nothing to send".
+foreach ($report['notes'] ?? [] as $n) echo '  · ' . $n . "\n";
+echo '  ' . count($report['sent'] ?? []) . " mail(s) queued. Delivery itself is logged to the PHP error log\n"
+   . "  by SmtpQueue (lines starting 'SmtpQueue:'), since the queue drains after this response.\n";
