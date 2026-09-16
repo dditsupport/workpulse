@@ -2098,7 +2098,10 @@ function chkDoneCount(int $checklistId, int $locationId, string $logDate, ?strin
 // Answered items per location per calendar day, for one checklist over a date
 // range: [location_id][Y-m-d] => int. Feeds the Overview grid, the fill page's
 // month tiles and the dashboard reminder, so all three agree on what "done"
-// means.
+// means. $freqOnly narrows it to one cycle — the fill page's day strip asks
+// for 'daily', so a tile counts the day's own work instead of inheriting its
+// month's; the report and the dashboard ask "is the whole checklist satisfied
+// on this day" and take every cycle, fanned out.
 //
 // A weekly or monthly answer is credited to *every* day of the cycle it
 // covers. Counting by log_date alone would put a monthly answer on the 1st and
@@ -2118,7 +2121,8 @@ function chkDoneByLocationDay(
     string $from,
     string $to,
     array $locationIds = [],
-    array $sectionNames = []
+    array $sectionNames = [],
+    ?string $freqOnly = null
 ): array {
     if ($from > $to) return [];
     $f = chkItemFreqSql();
@@ -2137,6 +2141,14 @@ function chkDoneByLocationDay(
     if ($sectionNames) {
         $where[] = 'i.section_name IN (' . implode(',', array_fill(0, count($sectionNames), '?')) . ')';
         foreach ($sectionNames as $sn) $args[] = (string)$sn;
+    }
+    // One cycle only. Asked for 'daily', the fan-out below is a no-op — a
+    // daily answer covers its own day and no other — which is how a caller
+    // gets "what was answered ON this day" rather than "what the day inherits
+    // from its week and month".
+    if ($freqOnly !== null && chkHasFrequency()) {
+        $where[] = "{$f} = ?";
+        $args[]  = $freqOnly;
     }
     // DAYOFWEEK() is Sunday = 1, matching chkPeriodStart('weekly', …). Every
     // branch is formatted, so the anchor comes back as a plain Y-m-d string
@@ -2328,9 +2340,7 @@ function pageChecklistFill(int $checklistId): void {
     // ── Day picker ───────────────────────────────────────
     // One tile per day of the month. Picking a day drives every section: the
     // daily ones show that day, the weekly and monthly ones the week and month
-    // containing it. A tile's figure is measured the same way, against every
-    // cycle — a monthly task answered once reads as done for the rest of its
-    // month rather than leaving every other tile a task short.
+    // containing it. A tile's figure is that day's daily work — see $totalQ.
     // Are a task's minutes kept per day worked? Decides both what the duration
     // box is pre-filled with and whether the cycle total is worth showing.
     $perDayUi = chkHasTaskTimeDay();
@@ -2357,17 +2367,26 @@ function pageChecklistFill(int $checklistId): void {
     $sections = chkGetSections($checklistId);
     $tasks = [];
     $existingCounts = [];
-    $totalQ = max(1, chkItemTotal($checklistId));
+    // A tile is one day, so it counts that day's daily work: its daily tasks
+    // done, out of the daily tasks there are. Weekly and monthly tasks are not
+    // a day's work — crediting their answer to every day of the cycle is what
+    // made a day nobody touched read "8/30" — so they are counted in their own
+    // cycle instead (the sections in the form below, and the hub's cycle
+    // lines). A checklist with no daily tasks at all keeps the whole-checklist
+    // figure, which is the only thing its strip can mean.
+    $byFreqTotal = chkItemTotalByFreq($checklistId);
+    $dailyTotal  = (int)($byFreqTotal['daily'] ?? 0);
+    $tilesDaily  = $dailyTotal > 0;
+    $totalQ = max(1, $tilesDaily ? $dailyTotal : chkItemTotal($checklistId));
 
     // The anchor each cycle resolves to for the selected day.
     $anchors = [];
     foreach (CHK_FREQS as $f) $anchors[$f] = chkPeriodStart($f, $displayDate);
 
     if ($haveScope) {
-        // Tile counts. $totalQ is every active item, so the numerator has to
-        // span every cycle too: a monthly answer counts for each day of its
-        // month, otherwise a mixed-cycle checklist could never tile green.
-        $existingCounts = chkDoneByLocationDay($checklistId, $tileMin, $tileMax, [$locationId])[$locationId] ?? [];
+        // Tile counts, measured the same way as $totalQ above.
+        $existingCounts = chkDoneByLocationDay($checklistId, $tileMin, $tileMax, [$locationId], [],
+                                               $tilesDaily ? 'daily' : null)[$locationId] ?? [];
 
         // Tasks, each carrying the cycle it runs on so the view can group and
         // label by it and resolve its answer to the right anchor.
@@ -2506,7 +2525,7 @@ function pageChecklistFill(int $checklistId): void {
         </span>
         <?php else: ?>
         <a href="?page=checklist&id=<?= $checklistId ?><?= $locQS ?>&date=<?= $tileDate ?>"
-           title="<?= h(chkPeriodLabel($freq, $tileDate)) ?>"
+           title="<?= h(chkPeriodLabel($freq, $tileDate)) ?><?= $tilesDaily ? ' — ' . $done . ' of ' . $totalQ . ' daily task(s) answered on this day' : '' ?>"
            style="background:<?= $bg ?>;color:#fff;border-radius:6px;padding:8px 4px;text-align:center;
                   font-size:11px;font-weight:700;text-decoration:none;display:block;opacity:<?= $tileOpacity ?>;<?= $active ?>">
             <?= h($tile['label']) ?><br><span style="font-weight:400"><?= $done ?>/<?= $totalQ ?></span>
@@ -2514,10 +2533,13 @@ function pageChecklistFill(int $checklistId): void {
         <?php endif; ?>
         <?php endforeach; ?>
     </div>
-    <div style="display:flex;gap:14px;margin-top:10px;font-size:11px;color:var(--muted)">
+    <div style="display:flex;gap:14px;margin-top:10px;font-size:11px;color:var(--muted);flex-wrap:wrap">
         <span><span style="color:var(--green)">&#9632;</span> Complete</span>
         <span><span style="color:var(--yellow)">&#9632;</span> Partial</span>
         <span><span style="color:var(--red)">&#9632;</span> Pending</span>
+        <?php if ($tilesDaily && count($byFreqTotal) > 1): ?>
+        <span>Each tile counts that day's <strong>daily</strong> tasks. Weekly and monthly work is counted in its own cycle, in the sections below.</span>
+        <?php endif; ?>
     </div>
 </div>
 
