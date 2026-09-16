@@ -91,11 +91,19 @@ function pageAttendance(): void {
         Show Location
     </label>
     <button class="btn btn-primary">View</button>
-    <a href="?page=odd_punches&filter=1&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm">Odd Punches</a>
-    <?php if ($doLoad): ?>
-    <a href="?page=export_attendance&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm" target="_blank">Export CSV</a>
-    <a href="?page=export_attendance_report&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm" target="_blank">Export Report</a>
-    <?php endif; ?>
+    <?php
+        // Always shown, never gated on $doLoad: picking filters and hitting
+        // Export straight away is the common case, and having to render the
+        // report on screen first was pure ceremony. rpt-go rebuilds the query
+        // string from the live form on click (see attFilterScript), so an
+        // export follows the dates now in the boxes, not the ones last
+        // submitted. The href is the server-side equivalent, so no-JS and
+        // right-click → open in new tab still work.
+        $q = ['emp' => $empCode, 'from_date' => $fromDate, 'to_date' => $toDate, 'loc' => $locationId];
+        attGoButton('odd_punches',             'Odd Punches',   $q + ['filter' => 1]);
+        attGoButton('export_attendance',        'Export CSV',    $q, true);
+        attGoButton('export_attendance_report', 'Export Report', $q, true);
+    ?>
 </form>
 <?php attFilterScript($emps); ?>
 
@@ -173,6 +181,16 @@ function pageAttendance(): void {
 <?php
 }
 
+// One filter-strip button that carries the current filters to another page.
+// $blank opens in a new tab, which is what an export wants.
+function attGoButton(string $page, string $label, array $params, bool $blank = false): void {
+    $href = '?' . http_build_query(['page' => $page] + $params);
+    echo '<a href="' . h($href) . '" class="btn btn-ghost btn-sm rpt-go"'
+       . ' data-page="' . h($page) . '"'
+       . ($blank ? ' target="_blank" data-blank="1"' : '')
+       . '>' . h($label) . '</a>';
+}
+
 // The filter strip's behaviour: to_date locked inside from_date's month, plus
 // the type-to-search employee dropdown. Shared by the Attendance Report and
 // the Odd Punch Report, which carry the same filters and the same element ids.
@@ -201,6 +219,28 @@ function attFilterScript(array $emps): void {
         };
         f.addEventListener('change', sync);
         t.addEventListener('change', sync);
+    }
+
+    // Filter-strip buttons (Odd Punches / the exports) follow whatever is in
+    // the form RIGHT NOW, not what was last submitted -- otherwise changing a
+    // date and hitting Export silently exports the previous range.
+    var form = document.querySelector('form.rpt-filter');
+    if (form) {
+        form.querySelectorAll('.rpt-go').forEach(function (a) {
+            a.addEventListener('click', function (ev) {
+                ev.preventDefault();
+                var q = new URLSearchParams();
+                q.set('page', a.dataset.page);
+                new FormData(form).forEach(function (v, k) {
+                    if (k !== 'page' && k !== 'filter') q.append(k, v);
+                });
+                // Report pages need ?filter=1 to actually run; exports don't.
+                if (a.dataset.blank !== '1') q.set('filter', '1');
+                var url = 'index.php?' + q.toString();
+                if (a.dataset.blank === '1') window.open(url, '_blank');
+                else window.location.href = url;
+            });
+        });
     }
 
     // Employee keyword search → custom dropdown below input
@@ -721,11 +761,24 @@ function attOddPunchSummary(array $summary): array {
     return $out;
 }
 
+// A department selection only narrows anything when it is a real subset.
+// Everything ticked (or nothing ticked) means no filter -- which also keeps
+// employees who have no department at all in the report, and this report must
+// not quietly drop anyone.
+function attDeptFilter(array $selected, array $all): array {
+    return ($selected && count($selected) < count($all)) ? $selected : [];
+}
+
 // Odd-punch days for a window. Grouping comes from shiftDay(), which follows
 // the devices' configured cutoff -- so an OUT punched at 05:30 closes the
 // shift it belongs to instead of leaving an odd day on both sides of midnight.
-function attOddPunchDays(string $empCode, string $fromDate, string $toDate, int $locationId = 0): array {
+function attOddPunchDays(string $empCode, string $fromDate, string $toDate,
+                         int $locationId = 0, array $deptIds = []): array {
     $rows = attStripAutoClose(getAttendance($empCode, $fromDate, $toDate, $locationId));
+    if ($deptIds) {
+        $keep = array_flip(array_map('intval', $deptIds));
+        $rows = array_values(array_filter($rows, fn($r) => isset($keep[(int)($r['department_id'] ?? 0)])));
+    }
     return attOddPunchSummary(buildDaySummary($rows));
 }
 
@@ -762,7 +815,15 @@ function pageOddPunches(): void {
         $emps = getDb()->query('SELECT employee_code,full_name FROM employees ORDER BY full_name')->fetchAll();
     } catch (Exception $e) {}
 
-    $locs = getActiveLocations();
+    $locs  = getActiveLocations();
+    $depts = getDepartments();
+
+    // Department multi-select, same control as the Employees page. Everything
+    // is ticked on a first load so the page reads "Department: All".
+    $allDeptIds = array_map(fn($d) => (string)$d['id'], $depts);
+    $deptIds    = $doLoad
+        ? array_values(array_intersect(array_map('strval', (array)($_GET['dept'] ?? [])), $allDeptIds))
+        : $allDeptIds;
 
     $empLabel = '';
     foreach ($emps as $e) {
@@ -775,7 +836,7 @@ function pageOddPunches(): void {
     $summary = [];
     $totalDays = $totalEmps = $totalPunches = 0;
     if ($doLoad) {
-        $summary   = attOddPunchDays($empCode, $fromDate, $toDate, $locationId);
+        $summary   = attOddPunchDays($empCode, $fromDate, $toDate, $locationId, attDeptFilter($deptIds, $allDeptIds));
         $totalEmps = count($summary);
         foreach ($summary as $emp) {
             $totalDays += count($emp['days']);
@@ -809,17 +870,24 @@ function pageOddPunches(): void {
         </option>
         <?php endforeach; ?>
     </select>
+    <?php
+        $deptOptions = [];
+        foreach ($depts as $d) $deptOptions[(string)$d['id']] = $d['department_name'];
+        msFilterField('dept', 'Department', $deptOptions, $deptIds);
+    ?>
     <label class="rpt-filter-chk">
         <input type="checkbox" name="with_location" value="1" <?= $withLocation ? 'checked' : '' ?>>
         Show Location
     </label>
     <button class="btn btn-primary">View</button>
-    <a href="?page=attendance&filter=1&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm">Full Report</a>
-    <?php if ($doLoad): ?>
-    <a href="?page=export_odd_punches&emp=<?= urlencode($empCode) ?>&from_date=<?= urlencode($fromDate) ?>&to_date=<?= urlencode($toDate) ?>&loc=<?= (int)$locationId ?>" class="btn btn-ghost btn-sm" target="_blank">Export CSV</a>
-    <?php endif; ?>
+    <?php
+        $q = ['emp' => $empCode, 'from_date' => $fromDate, 'to_date' => $toDate,
+              'loc' => $locationId, 'dept' => $deptIds];
+        attGoButton('attendance',         'Full Report', $q + ['filter' => 1]);
+        attGoButton('export_odd_punches', 'Export CSV',  $q, true);
+    ?>
 </form>
-<?php attFilterScript($emps); ?>
+<?php attFilterScript($emps); msFilterScript(); ?>
 
 <?php if (!$doLoad): ?>
 <div class="rpt-prompt">Select filters and click <strong>View</strong> to list the days with an odd number of punches.</div>
@@ -910,7 +978,11 @@ function exportOddPunches(): void {
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $fromDate)) $fromDate = date('Y-m-01');
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $toDate))   $toDate   = date('Y-m-d');
 
-    $summary = attOddPunchDays($empCode, $fromDate, $toDate, $locationId);
+    $allDeptIds = array_map(fn($d) => (string)$d['id'], getDepartments());
+    $deptIds    = array_values(array_intersect(array_map('strval', (array)($_GET['dept'] ?? [])), $allDeptIds));
+
+    $summary = attOddPunchDays($empCode, $fromDate, $toDate, $locationId,
+                               attDeptFilter($deptIds, $allDeptIds));
 
     header('Content-Type: text/csv');
     header('Content-Disposition: attachment; filename="odd_punches_' . date('Ymd_His') . '.csv"');

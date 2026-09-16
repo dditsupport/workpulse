@@ -134,6 +134,20 @@ code{font-family:Consolas,monospace;font-size:12px;background:rgba(255,255,255,.
 .rpt-loc-hdr{font-size:10px;color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0}
 .rpt-prompt{margin-top:24px;padding:32px;text-align:center;color:var(--muted);font-size:14px;background:var(--surface);border:1px solid var(--border);border-radius:8px}
 /* Report filter bar */
+/* Multi-select filter dropdown (Employees, Odd Punch Report) — a button that
+   opens a checkbox list and summarises the selection as its own label. */
+.ms-filter{position:relative;display:inline-block;vertical-align:top}
+.ms-toggle{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;cursor:pointer;text-align:left;padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ms-toggle::after{content:'\25BE';opacity:.55;font-size:11px;flex:0 0 auto;margin-left:6px}
+.ms-filter.open .ms-toggle::after{transform:rotate(180deg)}
+.ms-panel{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:100%;max-height:280px;overflow-y:auto;background:var(--surface,#1f1f23);color:var(--text,#eee);border:1px solid var(--border,#444);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.4);z-index:50;padding:6px 0;white-space:nowrap}
+.ms-filter.open .ms-panel{display:block}
+.ms-row{display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;font-size:13px;font-weight:400;margin:0}
+.ms-row:hover{background:rgba(255,255,255,.06)}
+.ms-row input{margin:0;cursor:pointer}
+.ms-row span{flex:1;min-width:0}
+.ms-all-row{font-weight:600}
+.ms-divider{height:1px;background:var(--border,#444);margin:4px 0}
 .rpt-filter{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:nowrap}
 .rpt-filter-emp{flex:1;min-width:200px;max-width:340px;font-size:14px}
 .rpt-filter-month{width:130px;font-size:14px}
@@ -368,3 +382,104 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 }
 </style>
 <?php }
+
+// ── Multi-select filter control ──────────────────────────
+// One dropdown of checkboxes that posts $name . '[]', with a "select all" row
+// and a label that summarises the selection ("Department: All", "Department: 3
+// selected"). $options is [value => label]; $selected is the checked values as
+// strings. Pair with msFilterScript(), which must run once per page.
+function msFilterField(string $name, string $label, array $options, array $selected,
+                       string $width = '200px', string $allLabel = 'Select all'): void {
+?>
+<div class="ms-filter" data-label="<?= h($label) ?>" style="width:<?= h($width) ?>">
+    <button type="button" class="form-control ms-toggle" aria-haspopup="listbox" aria-expanded="false"><?= h($label) ?></button>
+    <div class="ms-panel" role="listbox">
+        <label class="ms-row ms-all-row"><input type="checkbox" class="ms-all"> <span><?= h($allLabel) ?></span></label>
+        <div class="ms-divider"></div>
+        <?php foreach ($options as $val => $optLabel): ?>
+        <label class="ms-row">
+            <input type="checkbox" name="<?= h($name) ?>[]" value="<?= h((string)$val) ?>"
+                <?= in_array((string)$val, $selected, true) ? 'checked' : '' ?>>
+            <span><?= h((string)$optLabel) ?></span>
+        </label>
+        <?php endforeach; ?>
+    </div>
+</div>
+<?php
+}
+
+// Behaviour for every .ms-filter on the page. Emits once however many times it
+// is called, so a page can ask for it beside each field without duplicating the
+// listeners.
+function msFilterScript(): void {
+    static $done = false;
+    if ($done) return;
+    $done = true;
+?>
+<script>
+(function(){
+    document.querySelectorAll('.ms-filter').forEach(initMs);
+    // Click outside closes all open dropdowns.
+    document.addEventListener('click', function(e){
+        document.querySelectorAll('.ms-filter.open').forEach(function(f){
+            if (!f.contains(e.target)) {
+                f.classList.remove('open');
+                var t = f.querySelector('.ms-toggle');
+                if (t) t.setAttribute('aria-expanded', 'false');
+            }
+        });
+    });
+    function initMs(f) {
+        var label  = f.dataset.label || 'Filter';
+        var toggle = f.querySelector('.ms-toggle');
+        var allBox = f.querySelector('.ms-all');
+        var boxes  = Array.prototype.slice.call(f.querySelectorAll('input[type="checkbox"]:not(.ms-all)'));
+        if (!toggle || !boxes.length) return;
+        function refreshLabel() {
+            var checked = boxes.filter(function(b){ return b.checked; });
+            var n = checked.length, total = boxes.length;
+            var text;
+            if      (n === 0)     text = label + ': None';
+            else if (n === total) text = label + ': All';
+            else if (n === 1)     text = label + ': ' + (checked[0].parentNode.querySelector('span') || {}).textContent;
+            else                  text = label + ': ' + n + ' selected';
+            toggle.textContent = text;
+        }
+        function refreshAll() {
+            if (!allBox) return;
+            allBox.checked = boxes.every(function(b){ return b.checked; });
+            allBox.indeterminate = !allBox.checked && boxes.some(function(b){ return b.checked; });
+        }
+        toggle.addEventListener('click', function(e){
+            e.stopPropagation();
+            var willOpen = !f.classList.contains('open');
+            // Close any other open dropdown.
+            document.querySelectorAll('.ms-filter.open').forEach(function(o){
+                if (o !== f) {
+                    o.classList.remove('open');
+                    var ot = o.querySelector('.ms-toggle');
+                    if (ot) ot.setAttribute('aria-expanded', 'false');
+                }
+            });
+            f.classList.toggle('open', willOpen);
+            toggle.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        });
+        if (allBox) {
+            allBox.addEventListener('change', function(){
+                boxes.forEach(function(b){ b.checked = allBox.checked; });
+                refreshLabel();
+            });
+        }
+        boxes.forEach(function(b){
+            b.addEventListener('change', function(){
+                refreshAll();
+                refreshLabel();
+            });
+        });
+        refreshAll();
+        refreshLabel();
+    }
+})();
+</script>
+<?php
+}
