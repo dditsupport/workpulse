@@ -37,6 +37,7 @@ function buildNav(): array {
             ['page' => 'employees',         'icon' => navIcon('employees'),   'label' => 'Employees'],
             ['page' => 'locations',         'icon' => navIcon('locations'),   'label' => 'Locations'],
             ['page' => 'attendance',        'icon' => navIcon('attendance'),  'label' => 'Attendance'],
+            ['page' => 'odd_punches',       'icon' => navIcon('alert'),       'label' => 'Odd Punch Report'],
             ['page' => 'approve_punches',   'icon' => navIcon('punch'),       'label' => 'Punch Requests'],
             ['page' => 'failed_punches',    'icon' => navIcon('alert'),       'label' => 'Punch Issues'],
         ]],
@@ -138,7 +139,12 @@ function buildNav(): array {
     if (hasTxn('departments'))     $hrms[] = ['page' => 'departments',     'icon' => navIcon('departments'), 'label' => 'Departments'];
     if (hasTxn('employees'))       $hrms[] = ['page' => 'employees',       'icon' => navIcon('employees'),   'label' => 'Employees'];
     if (hasTxn('locations'))       $hrms[] = ['page' => 'locations',       'icon' => navIcon('locations'),   'label' => 'Locations'];
-    if (hasTxn('attendance'))      $hrms[] = ['page' => 'attendance',      'icon' => navIcon('attendance'),  'label' => 'Attendance'];
+    // Odd Punch Report reads the same punches as Attendance, so it rides the
+    // same transaction instead of needing a new flag on every role.
+    if (hasTxn('attendance')) {
+        $hrms[] = ['page' => 'attendance',  'icon' => navIcon('attendance'), 'label' => 'Attendance'];
+        $hrms[] = ['page' => 'odd_punches', 'icon' => navIcon('alert'),      'label' => 'Odd Punch Report'];
+    }
     if (hasTxn('approve_punches')) $hrms[] = ['page' => 'approve_punches', 'icon' => navIcon('punch'),       'label' => 'Punch Requests'];
     if (hasTxn('failed_punches'))  $hrms[] = ['page' => 'failed_punches',  'icon' => navIcon('alert'),       'label' => 'Punch Issues'];
 
@@ -303,7 +309,7 @@ function allowedPages(): array {
         $pages = array_merge($pages, ['create','edit','add_location','edit_location',
             'create_issue','view_issue','edit_issue','export_attendance','export_issues',
             'export_checklist_report','change_password','punch_request','download_pr_attachment','download_issue_attachment',
-            'export_attendance_report','export_employees_csv',
+            'export_attendance_report','odd_punches','export_odd_punches','export_employees_csv',
             'delete_issues']);
     }
     if (hasTxn('employees')) {
@@ -313,7 +319,7 @@ function allowedPages(): array {
         $pages = array_merge($pages, ['add_location','edit_location']);
     }
     if (hasTxn('attendance')) {
-        $pages = array_merge($pages, ['export_attendance','export_attendance_report']);
+        $pages = array_merge($pages, ['export_attendance','export_attendance_report','export_odd_punches']);
     }
     if (hasTxn('approve_punches')) {
         $pages = array_merge($pages, ['punch_request','download_pr_attachment']);
@@ -844,6 +850,7 @@ function dispatchPage(string $page): void {
         case 'create':          pageEmpForm(null); break;
         case 'edit':            pageEmpForm(getEmployee((int)($_GET['id'] ?? 0))); break;
         case 'attendance':      pageAttendance(); break;
+        case 'odd_punches':     pageOddPunches(); break;
         case 'mypunches':       pageMyPunches();  break;
         case 'my_time':         if (function_exists('pageMyTime')) pageMyTime(); break;
         case 'time_tasks':      if (function_exists('pageTimeTasks')) pageTimeTasks(); break;
@@ -904,6 +911,7 @@ function dispatchPage(string $page): void {
         // Exports
         case 'export_attendance': exportAttendance(); break;
         case 'export_attendance_report': if (function_exists('exportAttendanceReport')) exportAttendanceReport(); break;
+        case 'export_odd_punches': if (function_exists('exportOddPunches')) exportOddPunches(); break;
         case 'export_mypunches':  exportMyPunches();  break;
         case 'export_employees_csv': if (function_exists('exportEmployeesCsv')) exportEmployeesCsv(); break;
         case 'export_issues':     exportIssues();     break;

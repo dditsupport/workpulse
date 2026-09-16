@@ -48,7 +48,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_sample','dc_download_zip','dc_export_answers'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_odd_punches','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_sample','dc_download_zip','dc_export_answers'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
@@ -78,6 +78,11 @@ if (function_exists('ticketSchedLazyRun')) ticketSchedLazyRun();
 // daily email still goes out on installs without a server cron. The real
 // entrypoint is cron/run_barcode_expiry.php.
 if (function_exists('inwExpiryLazyRun')) inwExpiryLazyRun();
+
+// Odd-punch alert — the 07:00 digest of shifts that closed on an odd punch
+// count. Once per shift day, self-throttled, and it does nothing before the
+// shift has closed. The real entrypoint is cron/run_odd_punch_alert.php.
+if (function_exists('attOddPunchLazyRun')) attOddPunchLazyRun();
 
 $flash = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
