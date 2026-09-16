@@ -1209,6 +1209,49 @@ function attSendOddPunchDigest(string $shiftDate = ''): int {
     return $days;
 }
 
+// Claim a shift day so it is only ever mailed once. The marker holds the shift
+// day already reported, not today's date, so an early-morning request cannot
+// re-send yesterday's digest.
+//
+// BOTH scheduled entry points claim through here -- the cron and the lazy
+// fallback. With the marker on one side only they race every morning: cron
+// mails at 07:00, then the first page load after it finds the day unclaimed
+// and mails everyone a second copy. (inwSendDailyExpiryDigest() gets away with
+// one-sided marking because it stamps last_alert_date on the rows it sends;
+// there is no equivalent here, since what resolves an odd punch is the punch
+// data itself changing.)
+//
+// Returns false when the day is already spoken for.
+function attOddPunchClaimDay(string $shiftDate): bool {
+    $dir    = __DIR__ . '/../uploads';
+    $marker = $dir . '/odd_punch_lastrun.txt';
+    $last   = @file_get_contents($marker);
+    if ($last !== false && trim($last) === $shiftDate) return false;
+    if (!is_dir($dir)) @mkdir($dir, 0775, true);
+    return @file_put_contents($marker, $shiftDate, LOCK_EX) !== false;
+}
+
+// What a SCHEDULED run calls -- the cron and the lazy fallback alike. Sends the
+// digest for the shift that has just closed, unless it has already gone out.
+// Returns the day count, or -1 when the day was already claimed.
+function attRunOddPunchAlert(): int {
+    $target = attOddPunchTargetDay();
+    if (!attOddPunchClaimDay($target)) return -1;
+    return attSendOddPunchDigest($target);
+}
+
+// Once-per-shift-day fallback for installs without a server cron — same shape
+// as inwExpiryLazyRun(). Nothing runs until the shift has closed and 07:00 has
+// passed; on a 6 o'clock cutoff that is the hour after 05:59:59.
+function attOddPunchLazyRun(): void {
+    if ((int)date('G') < shiftCutoffHour() + 1) return;
+    try {
+        attRunOddPunchAlert();
+    } catch (Exception $e) {
+        error_log('[attendance] odd-punch lazy run failed: ' . $e->getMessage());
+    }
+}
+
 // ── Page: Failed Punches (superadmin) ───────────────────
 // POST: superadmin-only — wipe every row from failed_punch_logs.
 // There is no "soft" version: this is the maintenance escape hatch

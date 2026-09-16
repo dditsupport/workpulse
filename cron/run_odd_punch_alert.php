@@ -42,8 +42,19 @@ if ($expected === '' || !hash_equals($expected, $token)) {
     exit;
 }
 
+// No ?date= — the scheduled case. Claims the shift day first, so that a run
+// here and the lazy fallback in index.php cannot both mail the same morning.
 $date = (string)($_GET['date'] ?? ($argv[2] ?? ''));
-if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) $date = attOddPunchTargetDay();
+if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $date)) {
+    $date = attOddPunchTargetDay();
+    $days = attRunOddPunchAlert();
+    if ($days < 0) {
+        echo 'SKIP shift=' . $date . ' already sent at ' . date('Y-m-d H:i:s') . "\n";
+        exit;
+    }
+} else {
+    // Explicit date = someone asking for this day again on purpose. Re-send.
+    $days = attSendOddPunchDigest($date);
+}
 
-$days = attSendOddPunchDigest($date);
 echo 'OK shift=' . $date . ' odd_days=' . $days . ' at ' . date('Y-m-d H:i:s') . "\n";
