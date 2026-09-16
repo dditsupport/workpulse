@@ -267,7 +267,8 @@ function getAttendance(string $empCode = '', string $fromDate = '', string $toDa
         // shift at another store.
         $sql = 'SELECT a.*,
                        COALESCE(e.full_name, a.employee_code) AS full_name,
-                       d.department_name AS department,
+                       e.department_id    AS department_id,
+                       d.department_name  AS department,
                        l.location_name,
                        e.location_id      AS emp_location_id,
                        el.location_name   AS emp_location_name

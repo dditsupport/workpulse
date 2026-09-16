@@ -166,52 +166,12 @@ function pageEmployees(): void {
     <?php
         $statusLabels = ['pending_enrollment' => 'Pending', 'partial' => 'Partial', 'active' => 'Active'];
         $activeLabels = ['1' => 'Active', '0' => 'Inactive'];
+        $deptOptions  = [];
+        foreach ($depts as $d) $deptOptions[(string)$d['id']] = $d['department_name'];
+        msFilterField('dept',   'Department', $deptOptions,  $deptIds);
+        msFilterField('status', 'Status',     $statusLabels, $statuses,    '170px');
+        msFilterField('active', 'Active',     $activeLabels, $activeFlags, '160px', 'Both');
     ?>
-    <!-- Department (multi-select) -->
-    <div class="ms-filter" data-label="Department" style="width:200px">
-        <button type="button" class="form-control ms-toggle" aria-haspopup="listbox" aria-expanded="false">Department</button>
-        <div class="ms-panel" role="listbox">
-            <label class="ms-row ms-all-row"><input type="checkbox" class="ms-all"> <span>Select all</span></label>
-            <div class="ms-divider"></div>
-            <?php foreach ($depts as $d): ?>
-            <label class="ms-row">
-                <input type="checkbox" name="dept[]" value="<?= (int)$d['id'] ?>"
-                    <?= in_array((string)$d['id'], $deptIds, true) ? 'checked' : '' ?>>
-                <span><?= h($d['department_name']) ?></span>
-            </label>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <!-- Status (multi-select) -->
-    <div class="ms-filter" data-label="Status" style="width:170px">
-        <button type="button" class="form-control ms-toggle" aria-haspopup="listbox" aria-expanded="false">Status</button>
-        <div class="ms-panel" role="listbox">
-            <label class="ms-row ms-all-row"><input type="checkbox" class="ms-all"> <span>Select all</span></label>
-            <div class="ms-divider"></div>
-            <?php foreach ($statusLabels as $v => $l): ?>
-            <label class="ms-row">
-                <input type="checkbox" name="status[]" value="<?= h($v) ?>"
-                    <?= in_array($v, $statuses, true) ? 'checked' : '' ?>>
-                <span><?= h($l) ?></span>
-            </label>
-            <?php endforeach; ?>
-        </div>
-    </div>
-    <!-- Active / Inactive (multi-select) -->
-    <div class="ms-filter" data-label="Active" style="width:160px">
-        <button type="button" class="form-control ms-toggle" aria-haspopup="listbox" aria-expanded="false">Active</button>
-        <div class="ms-panel" role="listbox">
-            <label class="ms-row ms-all-row"><input type="checkbox" class="ms-all"> <span>Both</span></label>
-            <div class="ms-divider"></div>
-            <?php foreach ($activeLabels as $v => $l): ?>
-            <label class="ms-row">
-                <input type="checkbox" name="active[]" value="<?= h((string)$v) ?>"
-                    <?= in_array((string)$v, $activeFlags, true) ? 'checked' : '' ?>>
-                <span><?= h($l) ?></span>
-            </label>
-            <?php endforeach; ?>
-        </div>
-    </div>
     <select name="location" class="form-control" style="width:200px">
         <option value="">All Locations</option>
         <option value="none" <?= $location === 'none' ? 'selected' : '' ?>>— No self-claim —</option>
@@ -228,85 +188,7 @@ function pageEmployees(): void {
     <?php endif; ?>
 </form>
 
-<style>
-.ms-filter{position:relative;display:inline-block;vertical-align:top}
-.ms-toggle{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;cursor:pointer;text-align:left;padding-right:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ms-toggle::after{content:'\25BE';opacity:.55;font-size:11px;flex:0 0 auto;margin-left:6px}
-.ms-filter.open .ms-toggle::after{transform:rotate(180deg)}
-.ms-panel{display:none;position:absolute;top:calc(100% + 4px);left:0;min-width:100%;max-height:280px;overflow-y:auto;background:var(--surface,#1f1f23);color:var(--text,#eee);border:1px solid var(--border,#444);border-radius:6px;box-shadow:0 8px 24px rgba(0,0,0,.4);z-index:50;padding:6px 0;white-space:nowrap}
-.ms-filter.open .ms-panel{display:block}
-.ms-row{display:flex;align-items:center;gap:8px;padding:6px 12px;cursor:pointer;font-size:13px;font-weight:400;margin:0}
-.ms-row:hover{background:rgba(255,255,255,.06)}
-.ms-row input{margin:0;cursor:pointer}
-.ms-row span{flex:1;min-width:0}
-.ms-all-row{font-weight:600}
-.ms-divider{height:1px;background:var(--border,#444);margin:4px 0}
-</style>
-<script>
-(function(){
-    document.querySelectorAll('.ms-filter').forEach(initMs);
-    // Click outside closes all open dropdowns.
-    document.addEventListener('click', function(e){
-        document.querySelectorAll('.ms-filter.open').forEach(function(f){
-            if (!f.contains(e.target)) {
-                f.classList.remove('open');
-                var t = f.querySelector('.ms-toggle');
-                if (t) t.setAttribute('aria-expanded', 'false');
-            }
-        });
-    });
-    function initMs(f) {
-        var label  = f.dataset.label || 'Filter';
-        var toggle = f.querySelector('.ms-toggle');
-        var allBox = f.querySelector('.ms-all');
-        var boxes  = Array.prototype.slice.call(f.querySelectorAll('input[type="checkbox"]:not(.ms-all)'));
-        if (!toggle || !boxes.length) return;
-        function refreshLabel() {
-            var checked = boxes.filter(function(b){ return b.checked; });
-            var n = checked.length, total = boxes.length;
-            var text;
-            if      (n === 0)     text = label + ': None';
-            else if (n === total) text = label + ': All';
-            else if (n === 1)     text = label + ': ' + (checked[0].parentNode.querySelector('span') || {}).textContent;
-            else                  text = label + ': ' + n + ' selected';
-            toggle.textContent = text;
-        }
-        function refreshAll() {
-            if (!allBox) return;
-            allBox.checked = boxes.every(function(b){ return b.checked; });
-            allBox.indeterminate = !allBox.checked && boxes.some(function(b){ return b.checked; });
-        }
-        toggle.addEventListener('click', function(e){
-            e.stopPropagation();
-            var willOpen = !f.classList.contains('open');
-            // Close any other open dropdown.
-            document.querySelectorAll('.ms-filter.open').forEach(function(o){
-                if (o !== f) {
-                    o.classList.remove('open');
-                    var ot = o.querySelector('.ms-toggle');
-                    if (ot) ot.setAttribute('aria-expanded', 'false');
-                }
-            });
-            f.classList.toggle('open', willOpen);
-            toggle.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
-        });
-        if (allBox) {
-            allBox.addEventListener('change', function(){
-                boxes.forEach(function(b){ b.checked = allBox.checked; });
-                refreshLabel();
-            });
-        }
-        boxes.forEach(function(b){
-            b.addEventListener('change', function(){
-                refreshAll();
-                refreshLabel();
-            });
-        });
-        refreshAll();
-        refreshLabel();
-    }
-})();
-</script>
+<?php msFilterScript(); ?>
 
 <div class="table-wrap" data-stack>
 <table class="table">
