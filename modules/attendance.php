@@ -1018,6 +1018,20 @@ function exportOddPunches(): void {
 // not by the machine the punch landed on -- someone covering a shift at
 // another store is still their own manager's to chase.
 
+// Trace every run to uploads/odd_punch.log, the same convention notifyIssue()
+// uses for uploads/email_debug.log. error_log() alone is not good enough here:
+// on shared hosting it lands wherever php.ini says, which is often not a file
+// anyone looks at -- and the one thing this alert must never be is silently
+// undiagnosable. The lastrun marker cannot stand in for it, because the day is
+// claimed BEFORE the digest runs, so the marker appearing proves only that the
+// alert fired, never that a mail went out.
+function attOddPunchLog(string $msg): void {
+    $dir = __DIR__ . '/../uploads';
+    if (!is_dir($dir)) @mkdir($dir, 0775, true);   // else the trace silently no-ops
+    @file_put_contents($dir . '/odd_punch.log',
+                       date('Y-m-d H:i:s') . ' ' . $msg . "\n", FILE_APPEND);
+}
+
 // HR + Operations, the consolidated recipients. These are the addresses that
 // already receive punch-request notifications, which is exactly the audience
 // for a missing punch.
@@ -1169,11 +1183,20 @@ function attBuildOddPunchEmail(array $grouped, string $shiftDate, string $headin
 // Digest for one closed shift day. Silent when every trace is even -- an
 // empty "nothing to report" mail every morning trains people to ignore it.
 // Returns the number of odd-punch days reported.
-function attSendOddPunchDigest(string $shiftDate = ''): int {
+function attSendOddPunchDigest(string $shiftDate = '', ?array &$report = null): int {
     if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $shiftDate)) $shiftDate = attOddPunchTargetDay();
+    $report = ['shift_date' => $shiftDate, 'days' => 0, 'sent' => [], 'notes' => []];
+
+    $note = function (string $msg) use (&$report, $shiftDate): void {
+        $report['notes'][] = $msg;
+        attOddPunchLog('[' . $shiftDate . '] ' . $msg);
+    };
 
     $summary = attOddPunchDays('', $shiftDate, $shiftDate, 0);
-    if (!$summary) return 0;
+    if (!$summary) {
+        $note('no odd punches — every trace on this shift day is even, nothing to send');
+        return 0;
+    }
 
     $grouped = attOddPunchByLocation($summary);
     $days    = array_sum(array_column($grouped, 'days'));
@@ -1185,14 +1208,22 @@ function attSendOddPunchDigest(string $shiftDate = ''): int {
         'Odd punches — ' . ($where !== '' ? $where . ' — ' : '') . $n
         . ' incomplete in/out trace' . ($n === 1 ? '' : 's') . ' — ' . $nice;
 
+    $report['days'] = $days;
+    $note($days . ' odd-punch day(s) across ' . count($grouped) . ' location group(s)');
+
+    $queue = function (string $to, string $scope, string $subj, string $body) use (&$report, $note): void {
+        sendSmtpEmailQuiet($to, $subj, $body);
+        $report['sent'][] = ['to' => $to, 'scope' => $scope];
+        $note('queued -> ' . $to . '  [' . $scope . ']');
+    };
+
     // 1. Consolidated digest — HR + Operations, every location.
     $emails = attOddPunchNotifyEmails();
     if ($emails) {
         $body = attBuildOddPunchEmail($grouped, $shiftDate, 'Odd punches — shift of ' . $nice);
-        foreach ($emails as $e) sendSmtpEmailQuiet($e, $subject($days, ''), $body);
+        foreach ($emails as $e) $queue($e, 'consolidated', $subject($days, ''), $body);
     } else {
-        error_log('[attendance] ' . $days . ' odd-punch day(s) on ' . $shiftDate
-                . ' but PunchRequestNotifyHR/Ops are both empty');
+        $note('NO consolidated mail — PunchRequestNotifyHR and PunchRequestNotifyOps are both empty or unparseable');
     }
 
     // 2. One mail per location, to that store's own contact_email. The
@@ -1200,12 +1231,22 @@ function attSendOddPunchDigest(string $shiftDate = ''): int {
     //    consolidated digest only.
     $byLoc = attLocationEmails();
     foreach ($grouped as $locId => $loc) {
-        if ($locId === 0 || empty($byLoc[$locId])) continue;
+        if ($locId === 0) {
+            $note('no store mail for "' . $loc['name'] . '" (' . $loc['days']
+                . ' day(s)) — these employees have no location_id; consolidated digest only');
+            continue;
+        }
+        if (empty($byLoc[$locId])) {
+            $note('NO store mail for "' . $loc['name'] . '" (' . $loc['days']
+                . ' day(s)) — locations.contact_email is empty for location_id=' . $locId);
+            continue;
+        }
         $body = attBuildOddPunchEmail([$locId => $loc], $shiftDate,
                                       'Odd punches — ' . $loc['name'] . ' — shift of ' . $nice);
-        foreach ($byLoc[$locId] as $e) sendSmtpEmailQuiet($e, $subject($loc['days'], $loc['name']), $body);
+        foreach ($byLoc[$locId] as $e) $queue($e, $loc['name'], $subject($loc['days'], $loc['name']), $body);
     }
 
+    $note('done — ' . count($report['sent']) . ' mail(s) handed to the SMTP queue');
     return $days;
 }
 
@@ -1234,10 +1275,13 @@ function attOddPunchClaimDay(string $shiftDate): bool {
 // What a SCHEDULED run calls -- the cron and the lazy fallback alike. Sends the
 // digest for the shift that has just closed, unless it has already gone out.
 // Returns the day count, or -1 when the day was already claimed.
-function attRunOddPunchAlert(): int {
+function attRunOddPunchAlert(?array &$report = null): int {
     $target = attOddPunchTargetDay();
-    if (!attOddPunchClaimDay($target)) return -1;
-    return attSendOddPunchDigest($target);
+    if (!attOddPunchClaimDay($target)) {
+        attOddPunchLog('[' . $target . '] SKIP — already claimed by an earlier run today');
+        return -1;
+    }
+    return attSendOddPunchDigest($target, $report);
 }
 
 // Once-per-shift-day fallback for installs without a server cron — same shape
