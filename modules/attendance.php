@@ -1296,6 +1296,122 @@ function attOddPunchLazyRun(): void {
     }
 }
 
+// ── Login notice: your own unfinished punch days ─────────
+// How far back the popup looks. Long enough to catch a miss nobody chased for
+// a week or two, short enough that the list stays actionable rather than
+// becoming a wall someone learns to dismiss.
+const ODD_PUNCH_NOTICE_DAYS = 14;
+
+// The logged-in employee's own odd-punch days, CLOSED shifts only. The shift
+// runs 07:00 → 06:00 the next morning (ShiftCutoffHour = 6), and
+// attOddPunchSummary() drops the day still in progress — an open IN there just
+// means the person is at work, not that they forgot to punch. So a miss only
+// ever appears once the shift it belongs to has ended at 05:59:59.
+function attMyOddPunchDays(string $empCode): array {
+    if ($empCode === '') return [];
+    $to      = attOpenShiftDay();
+    $from    = date('Y-m-d', strtotime($to . ' -' . ODD_PUNCH_NOTICE_DAYS . ' day'));
+    $summary = attOddPunchDays($empCode, $from, $to, 0);
+    return $summary[$empCode]['days'] ?? [];
+}
+
+// Shown once per login, on the first page rendered after sign-in. Skips
+// silently for logins with no employee code of their own (superadmin, the
+// biometric enrollment account), since they have no punches to be missing.
+//
+// The session flag is claimed BEFORE the query, so the rest of the session
+// costs nothing — one lookup per login, not one per page view.
+function attOddPunchNotice(): void {
+    if (!empty($_SESSION['odd_punch_notice_seen'])) return;
+    $_SESSION['odd_punch_notice_seen'] = 1;
+
+    $code = myCode();
+    if ($code === '') return;
+
+    try {
+        $days = attMyOddPunchDays($code);
+    } catch (Throwable $e) {           // a notice must never break the page
+        error_log('[attendance] odd-punch notice failed: ' . $e->getMessage());
+        return;
+    }
+    if (!$days) return;
+
+    $n = count($days);
+?>
+<style>
+.opn-back{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:9998;display:flex;align-items:center;justify-content:center;padding:16px}
+.opn-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;max-width:560px;width:100%;max-height:86vh;overflow-y:auto;box-shadow:0 18px 50px rgba(0,0,0,.5)}
+.opn-head{display:flex;align-items:flex-start;gap:12px;padding:18px 20px 12px;border-bottom:1px solid var(--border)}
+.opn-icon{flex:0 0 auto;width:34px;height:34px;border-radius:50%;background:rgba(224,49,49,.16);color:var(--red);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:700}
+.opn-title{margin:0;font-size:16px;font-weight:600;line-height:1.35}
+.opn-sub{margin:4px 0 0;font-size:13px;color:var(--muted);line-height:1.5}
+.opn-body{padding:6px 20px 0}
+.opn-day{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--border)}
+.opn-day:last-child{border-bottom:0}
+.opn-date{font-weight:600;font-size:13px;min-width:112px}
+.opn-date small{display:block;font-weight:400;color:var(--muted)}
+.opn-chips{display:flex;gap:6px;flex-wrap:wrap;flex:1 1 auto;min-width:0}
+.opn-miss{font-size:11px;font-weight:700;color:var(--red);border:1px dashed var(--red);border-radius:999px;padding:3px 9px;white-space:nowrap}
+.opn-foot{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end;padding:16px 20px 18px}
+@media(max-width:560px){.opn-date{min-width:100%}.opn-foot .btn{flex:1 1 auto;text-align:center}}
+</style>
+<div class="opn-back" id="oddPunchNotice" role="dialog" aria-modal="true" aria-labelledby="oddPunchTitle">
+  <div class="opn-card">
+    <div class="opn-head">
+      <div class="opn-icon">!</div>
+      <div>
+        <h3 class="opn-title" id="oddPunchTitle">
+          <?= $n ?> day<?= $n === 1 ? '' : 's' ?> with an incomplete punch
+        </h3>
+        <p class="opn-sub">
+          A finished day always has an even number of punches — IN/OUT, or IN/OUT/IN/OUT.
+          The day<?= $n === 1 ? '' : 's' ?> below ended on an odd count, so a punch is missing
+          and the in&rarr;out trace can't be completed. Raise a Missing Punch request and HR can add it.
+        </p>
+      </div>
+    </div>
+    <div class="opn-body">
+      <?php foreach ($days as $day => $d):
+            $punches = $d['punches'];
+            $missing = end($punches)['punch_type'] === 'IN' ? 'OUT' : 'IN'; ?>
+      <div class="opn-day">
+        <div class="opn-date">
+          <?= date('d/m/Y', strtotime($day)) ?>
+          <small><?= date('l', strtotime($day)) ?></small>
+        </div>
+        <div class="opn-chips">
+          <?php foreach ($punches as $p): ?>
+          <span class="punch-chip punch-chip-<?= mb_strtolower($p['punch_type']) ?>">
+            <span class="punch-chip-type"><?= $p['punch_type'] ?></span>
+            <span class="punch-chip-time"><?= date('H:i:s', strtotime($p['punch_time'])) ?></span>
+          </span>
+          <?php endforeach; ?>
+        </div>
+        <span class="opn-miss">No <?= $missing ?></span>
+      </div>
+      <?php endforeach; ?>
+    </div>
+    <div class="opn-foot">
+      <button type="button" class="btn btn-ghost" data-opn-close>Later</button>
+      <a href="index.php?page=mypunches&filter=1" class="btn btn-ghost">My Punches</a>
+      <a href="index.php?page=punch_request" class="btn btn-primary">Raise Missing Punch</a>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+    var box = document.getElementById('oddPunchNotice');
+    if (!box) return;
+    var close = function () { box.remove(); };
+    box.querySelectorAll('[data-opn-close]').forEach(function (b) { b.addEventListener('click', close); });
+    // Backdrop click closes; a click inside the card must not.
+    box.addEventListener('click', function (e) { if (e.target === box) close(); });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') close(); });
+})();
+</script>
+<?php
+}
+
 // ── Page: Failed Punches (superadmin) ───────────────────
 // POST: superadmin-only — wipe every row from failed_punch_logs.
 // There is no "soft" version: this is the maintenance escape hatch

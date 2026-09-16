@@ -583,6 +583,11 @@ function renderShell(string $page, ?array $flash): void {
         <?= h($flash['msg']) ?>
     </div>
     <?php endif; ?>
+    <?php
+        // Once per login: your own days that ended on an odd punch count.
+        // Self-throttled by a session flag, so it costs one query per login.
+        if (function_exists('attOddPunchNotice')) attOddPunchNotice();
+    ?>
     <?php dispatchPage($page); ?>
 </div>
 <script>
