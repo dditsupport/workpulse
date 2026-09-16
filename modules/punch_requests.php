@@ -118,6 +118,55 @@ function doSubmitPunchRequest(): void {
     header('Location: index.php?page=punch_request'); exit;
 }
 
+// Force one shift day's punches to alternate IN/OUT/IN/OUT in time order.
+//
+// A device has no idea which punch is which: it alternates from the last one
+// it saw, so a forgotten IN silently mislabels every punch after it. Time
+// order is the only thing that is never wrong — within a shift day the
+// earliest punch IS the arrival, so alternating from it rebuilds the truth.
+// Shift-day grouping is what makes this safe: a punch at 00:43 belongs to the
+// PREVIOUS day's shift, so it is that day's last punch, not the next day's
+// first.
+//
+// Only ever called after an approval, and only for that employee and that one
+// shift day. auto_close placeholders are left alone — they are not punches and
+// must not take part in the alternation. Returns how many rows were corrected.
+function prResequenceShiftDay(PDO $db, string $empCode, string $punchDatetime): int {
+    $cut   = function_exists('shiftCutoffHour') ? shiftCutoffHour() : 6;
+    $day   = function_exists('shiftDay') ? shiftDay($punchDatetime) : substr($punchDatetime, 0, 10);
+    $from  = $day . ' ' . sprintf('%02d:00:00', $cut);
+    $to    = date('Y-m-d', strtotime($day . ' +1 day')) . ' ' . sprintf('%02d:59:59', $cut - 1);
+
+    $st = $db->prepare(
+        "SELECT id, punch_type, punch_time
+           FROM attendance_logs
+          WHERE employee_code = ? AND punch_time >= ? AND punch_time <= ?
+            AND punch_method <> 'auto_close'
+          ORDER BY punch_time ASC, id ASC"
+    );
+    $st->execute([$empCode, $from, $to]);
+    $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+    if (count($rows) < 2) return 0;   // a lone punch has no sequence to fix
+
+    $fix     = $db->prepare('UPDATE attendance_logs SET punch_type = ? WHERE id = ?');
+    $changed = 0;
+    foreach ($rows as $i => $r) {
+        $want = ($i % 2 === 0) ? 'IN' : 'OUT';
+        if ($r['punch_type'] === $want) continue;
+        $fix->execute([$want, (int)$r['id']]);
+        $changed++;
+        // The device's original reading is evidence, so never silently
+        // overwrite it — leave a trail of exactly what was changed and why.
+        if (function_exists('attOddPunchLog')) {
+            attOddPunchLog(sprintf(
+                '[%s] re-sequenced %s punch #%d at %s: %s -> %s (missing punch approved by %s)',
+                $day, $empCode, (int)$r['id'], $r['punch_time'], $r['punch_type'], $want, myCode()
+            ));
+        }
+    }
+    return $changed;
+}
+
 // ── Delete own punch request (owner, while not approved) ──
 // An approved request has already been written into attendance_logs, so
 // it stays put — only HR can undo that. Pending/rejected rows are the
@@ -209,12 +258,24 @@ function doReviewPunchRequest(): void {
         }
 
         // If approved, insert into attendance_logs
+        $resequenced = 0;
         if ($action === 'approved') {
             $punchDatetime = $req['punch_date'] . ' ' . $req['punch_time'];
             $db->prepare(
                 "INSERT INTO attendance_logs (employee_code, device_serial, device_type, location_id, punch_type, punch_method, match_score, punch_time)
                  VALUES (?, 'MANUAL', 'MFS500', ?, ?, 'manual', 0, ?)"
             )->execute([$req['employee_code'], $req['location_id'], $req['punch_type'], $punchDatetime]);
+
+            // Adding the missing punch can leave the day's types wrong, because
+            // the device decides IN/OUT by alternating from whatever it saw
+            // first. Someone who forgot the evening IN and punched out at
+            // 00:43 gets that punch stored as an IN — it was the first of the
+            // shift day. Insert the real 18:00 IN and the day now reads
+            // IN 18:00, IN 00:43: even, so it drops off the odd-punch report,
+            // but the in→out trace is still nonsense and the ERP still can't
+            // use it. Re-sequencing fixes the type that the missing punch
+            // invalidated.
+            $resequenced = prResequenceShiftDay($db, (string)$req['employee_code'], $punchDatetime);
         }
 
         $db->commit();
@@ -238,12 +299,16 @@ function doReviewPunchRequest(): void {
             'reviewed_at'    => date('d M Y H:i'),
             'message'        => $action === 'approved'
                 ? 'Punch request approved and added to attendance.'
+                    . ($resequenced ? ' ' . $resequenced . ' existing punch(es) on that shift day re-sequenced to keep the in/out trace correct.' : '')
                 : 'Punch request rejected.',
         ]);
         exit;
     }
 
-    flash('success', $action === 'approved' ? 'Punch request approved and added to attendance.' : 'Punch request rejected.');
+    flash('success', $action === 'approved'
+        ? 'Punch request approved and added to attendance.'
+            . ($resequenced ? ' ' . $resequenced . ' existing punch(es) on that shift day re-sequenced to keep the in/out trace correct.' : '')
+        : 'Punch request rejected.');
     header('Location: index.php?page=approve_punches'); exit;
 }
 
