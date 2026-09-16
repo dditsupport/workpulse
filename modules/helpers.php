@@ -411,6 +411,23 @@ class SmtpQueue {
     // for the full limit.
     private const DRAIN_BUDGET_SECONDS = 100;
 
+    // Keep the drain's diagnostics somewhere reachable. error_log() alone goes
+    // wherever php.ini points -- on cPanel a per-directory error_log nobody
+    // thinks to open -- and the drain runs after the response, so a failed
+    // send leaves no trace in the browser either. Mirroring to uploads/ is the
+    // difference between "no mail arrived" being diagnosable and being a
+    // mystery. Rotates at 2MB so it cannot grow without bound.
+    private const LOG_MAX_BYTES = 2097152;
+
+    private static function log(string $msg): void {
+        error_log($msg);
+        $dir = __DIR__ . '/../uploads';
+        if (!is_dir($dir)) @mkdir($dir, 0775, true);
+        $file = $dir . '/smtp_queue.log';
+        if (@filesize($file) > self::LOG_MAX_BYTES) @rename($file, $file . '.1');
+        @file_put_contents($file, date('Y-m-d H:i:s') . ' ' . $msg . "\n", FILE_APPEND);
+    }
+
     public static function enqueue(string $to, string $subject, string $body): void {
         self::$queue[] = ['to' => $to, 'subject' => $subject, 'body' => $body];
         // Read the SMTP settings now, during the request, so flush() — which
@@ -487,7 +504,7 @@ class SmtpQueue {
         }
 
         $t1 = microtime(true);
-        error_log(sprintf(
+        self::log(sprintf(
             'SmtpQueue: SAPI=%s release=%s queue=%d setupMs=%d',
             PHP_SAPI, $released, $count, (int)round(($t1 - $t0) * 1000)
         ));
@@ -505,7 +522,7 @@ class SmtpQueue {
             $from     = (string)($cfg['from'] ?? '') ?: $user;
             $fromName = (string)($cfg['fromName'] ?? '') ?: 'Work Pulse';
             if (!$host || !$user || !$pass) {
-                error_log('SmtpQueue: skipping ' . count($batch) . ' mails — SMTP not configured');
+                self::log('SmtpQueue: skipping ' . count($batch) . ' mails — SMTP not configured');
                 return;
             }
 
@@ -529,7 +546,7 @@ class SmtpQueue {
             $deadline  = $sendStart + self::DRAIN_BUDGET_SECONDS;
             foreach ($batch as $msg) {
                 if (microtime(true) > $deadline) {
-                    error_log('SmtpQueue: drain budget exhausted, dropping ' . $msg['to']);
+                    self::log('SmtpQueue: drain budget exhausted, dropping ' . $msg['to']);
                     continue;
                 }
                 $one = microtime(true);
@@ -540,16 +557,16 @@ class SmtpQueue {
                     $mail->Body    = $msg['body'];
                     $mail->AltBody = strip_tags(str_replace(['<br>', '<br/>', '<br />'], "\n", $msg['body']));
                     $mail->send();
-                    error_log(sprintf('SmtpQueue: → %s OK in %dms', $msg['to'], (int)round((microtime(true) - $one) * 1000)));
+                    self::log(sprintf('SmtpQueue: → %s OK in %dms', $msg['to'], (int)round((microtime(true) - $one) * 1000)));
                 } catch (Throwable $e) {
-                    error_log(sprintf('SmtpQueue: → %s FAIL in %dms: %s', $msg['to'], (int)round((microtime(true) - $one) * 1000), $e->getMessage()));
+                    self::log(sprintf('SmtpQueue: → %s FAIL in %dms: %s', $msg['to'], (int)round((microtime(true) - $one) * 1000), $e->getMessage()));
                 }
             }
             $mail->smtpClose();
-            error_log(sprintf('SmtpQueue: drain done in %dms (%d msgs)',
+            self::log(sprintf('SmtpQueue: drain done in %dms (%d msgs)',
                 (int)round((microtime(true) - $sendStart) * 1000), count($batch)));
         } catch (Throwable $e) {
-            error_log('SmtpQueue: batch send failed: ' . $e->getMessage());
+            self::log('SmtpQueue: batch send failed: ' . $e->getMessage());
         }
     }
 }
