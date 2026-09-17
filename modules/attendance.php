@@ -1312,7 +1312,48 @@ function attMyOddPunchDays(string $empCode): array {
     $to      = attOpenShiftDay();
     $from    = date('Y-m-d', strtotime($to . ' -' . ODD_PUNCH_NOTICE_DAYS . ' day'));
     $summary = attOddPunchDays($empCode, $from, $to, 0);
-    return $summary[$empCode]['days'] ?? [];
+    $days    = $summary[$empCode]['days'] ?? [];
+    if (!$days) return [];
+
+    // Drop the days they have already reported and are waiting on. Once the
+    // request is in, the ball is HR's -- nagging them at every login for
+    // something they cannot act on is how a notice teaches people to dismiss
+    // it unread.
+    return array_diff_key($days, attPendingRequestShiftDays($empCode, $from, $to));
+}
+
+// Shift days with a punch request still awaiting review, as a [day => true]
+// set. Matched by SHIFT DAY, not punch_date: a request for the missing OUT at
+// 00:43 carries punch_date = the 15th while the shift day it closes is the
+// 14th, so comparing the raw dates would miss it. The window is widened a day
+// either side for exactly that reason.
+//
+// Only 'pending' suppresses. An approved request has already added the punch,
+// so the day is even and was never in the list; a rejected one means the day
+// is still broken and still theirs to sort out.
+function attPendingRequestShiftDays(string $empCode, string $from, string $to): array {
+    $out = [];
+    try {
+        $st = getDb()->prepare(
+            "SELECT punch_date, punch_time
+               FROM punch_requests
+              WHERE employee_code = ? AND status = 'pending'
+                AND punch_date BETWEEN ? AND ?"
+        );
+        $st->execute([
+            $empCode,
+            date('Y-m-d', strtotime($from . ' -1 day')),
+            date('Y-m-d', strtotime($to   . ' +1 day')),
+        ]);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $out[shiftDay($r['punch_date'] . ' ' . $r['punch_time'])] = true;
+        }
+    } catch (Exception $e) {
+        // No punch_requests table, or a query error: fall through with an
+        // empty set. Showing the notice is the safe failure, not hiding it.
+        error_log('[attendance] pending punch-request lookup failed: ' . $e->getMessage());
+    }
+    return $out;
 }
 
 // Shown once per login, on the first page rendered after sign-in. Skips
