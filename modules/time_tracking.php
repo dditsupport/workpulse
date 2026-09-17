@@ -15,6 +15,10 @@
 // =========================================================
 
 // ── Duration helpers ─────────────────────────────────────
+// A normal working day. A day's total above this is shown in red on the
+// timesheet — it is a flag to look at the day, not a limit on logging.
+const TIME_DAY_LIMIT_MIN = 8 * 60;
+
 // The slots the duration dropdown offers, in minutes, ascending. Fine at the
 // short end where the difference actually matters — a five-minute ticket
 // glance had to be rounded up to 15m or left blank — and coarse past 6h,
@@ -691,8 +695,8 @@ function renderTimesheetGrid(array $grid, array $days, array $dayTotals, int $we
         <tfoot>
             <tr>
                 <th style="text-align:right">Daily total</th>
-                <?php foreach ($days as $day): ?>
-                <th style="text-align:right"><?= $dayTotals[$day] > 0 ? h(fmtMinutes((int)$dayTotals[$day])) : '<span class="text-muted">0h</span>' ?></th>
+                <?php foreach ($days as $day): $dt = (int)$dayTotals[$day]; $over = $dt > TIME_DAY_LIMIT_MIN; ?>
+                <th style="text-align:right<?= $over ? ';color:var(--red)' : '' ?>"<?= $over ? ' title="More than ' . (int)(TIME_DAY_LIMIT_MIN / 60) . 'h logged on this day"' : '' ?>><?= $dt > 0 ? h(fmtMinutes($dt)) : '<span class="text-muted">0h</span>' ?></th>
                 <?php endforeach; ?>
                 <th style="text-align:right;color:var(--accent)"><?= h(fmtMinutes($weekTotal)) ?></th>
             </tr>
@@ -731,7 +735,7 @@ function renderTimeEntriesList(array $entries, array $days, string $weekStart, b
 <div class="form-card" style="margin-bottom:12px;padding:12px;max-width:none">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <strong style="<?= $day === $today ? 'color:var(--accent)' : '' ?>"><?= date('l, d M', strtotime($day)) ?></strong>
-        <span class="badge badge-grey"><?= h(fmtMinutes($dayTotal)) ?></span>
+        <span class="badge <?= $dayTotal > TIME_DAY_LIMIT_MIN ? 'badge-red' : 'badge-grey' ?>"><?= h(fmtMinutes($dayTotal)) ?></span>
     </div>
     <div class="table-wrap" data-stack>
         <table class="table" style="font-size:13px;table-layout:fixed;width:100%">
