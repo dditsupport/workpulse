@@ -396,6 +396,11 @@ function allowedPages(): array {
     if (isSuperadmin() || hasTxn('audit_approve')) {
         $pages[] = 'audit_approve';
     }
+    // Correcting a filed audit's answers is superadmin-only — it moves a
+    // score outside the workflow, with no review behind it.
+    if (isSuperadmin()) {
+        $pages[] = 'audit_correct';
+    }
     if (isSuperadmin() || hasTxn('audit_operation')) {
         $pages[] = 'audit_operation_review';
     }
@@ -943,6 +948,7 @@ function dispatchPage(string $page): void {
         case 'audit_new':         if (function_exists('pageAuditNew'))        pageAuditNew();        break;
         case 'audit_edit':        if (function_exists('pageAuditEdit'))       pageAuditEdit();       break;
         case 'audit_view':        if (function_exists('pageAuditView'))       pageAuditView();       break;
+        case 'audit_correct':     if (function_exists('pageAuditCorrect'))    pageAuditCorrect();    break;
         case 'audit_approve':     if (function_exists('pageAuditApprove'))    pageAuditApprove();    break;
         case 'audit_manager_review':    if (function_exists('pageAuditManagerReview'))    pageAuditManagerReview();    break;
         case 'audit_operation_review':  if (function_exists('pageAuditOperationReview'))  pageAuditOperationReview();  break;

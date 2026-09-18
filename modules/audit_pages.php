@@ -406,6 +406,8 @@ function pageAuditList(): void {
                             <a class="btn btn-sm btn-secondary" href="?page=audit_view&id=<?= (int)$a['id'] ?>">View</a>
                         <?php endif; ?>
                         <?php if (isSuperadmin()): ?>
+                            <a class="btn btn-sm btn-ghost" href="?page=audit_correct&id=<?= (int)$a['id'] ?>"
+                               title="Fix a wrong answer on this audit — superadmin only, logged">Correct</a>
                             <form method="POST" class="inline-form" onsubmit="return confirm('Delete audit <?= h($a['audit_number'] ?: ('#' . (int)$a['id'] . ' (unsaved)')) ?>? This removes responses, attachments, and history.')">
                                 <input type="hidden" name="action" value="delete_audit">
                                 <input type="hidden" name="audit_id" value="<?= (int)$a['id'] ?>">
@@ -1107,6 +1109,10 @@ function pageAuditView(): void {
     ?>
     <div class="form-actions" style="margin-top:18px">
         <a class="btn btn-ghost" href="?page=audit_list">Back</a>
+        <?php if (isSuperadmin()): ?>
+            <a class="btn btn-danger" href="?page=audit_correct&id=<?= (int)$id ?>"
+               title="Fix a wrong answer on this audit — superadmin only, logged">Correct Answers</a>
+        <?php endif; ?>
     </div>
     <?php
 }
@@ -1374,6 +1380,265 @@ function pageAuditManagerReview(): void {
             <a class="btn btn-ghost" href="?page=audit_list" style="margin-left:auto">Back</a>
         </div>
     </form>
+    <?php
+}
+
+// ===========================================================
+// PAGE: Correct Audit — superadmin-only answer correction
+// ===========================================================
+// A filed audit can only be re-answered by its own auditor, and only
+// while it sits in draft / sent_back (auditCanEditRow). Every screen
+// downstream of that — SM justify, Operation, Approver, Management —
+// writes remarks and never moves a score, and the Approver's Modified
+// Wt. boxes change weights, not answers. So a condition ticked wrongly
+// on an audit that has already been submitted had no in-app fix at all;
+// it needed a hand-written UPDATE against audit_responses.
+//
+// This page is that fix, done properly. Superadmin only, because it
+// steps outside the workflow: the audit does not change status, nobody
+// is asked to re-review, and the score simply moves. The points still
+// come from the condition master (doCorrectAudit re-reads them and
+// ignores anything the browser posts), a reason is mandatory, and every
+// changed answer is written to audit_history and shown in the log at the
+// bottom of this page.
+function pageAuditCorrect(): void {
+    if (!isSuperadmin()) { echo '<p>Access denied.</p>'; return; }
+    $id = (int)($_GET['id'] ?? 0);
+    $a  = $id > 0 ? auditGetById($id) : null;
+    if (!$a) { echo '<p>Audit not found.</p>'; return; }
+
+    $tree = auditGetTree($id, (int)$a['template_id']);
+    renderAuditHeader($a);
+    ?>
+    <div class="alert alert-error" style="margin-bottom:14px;background:rgba(231,76,60,.10);color:#f3a49a;border:1px solid rgba(231,76,60,.30);padding:10px 14px;border-radius:6px">
+        <strong>Correction mode.</strong> You are editing answers on a filed audit, outside the normal workflow.
+        The status stays <strong><?= h($a['status']) ?></strong> and nobody is asked to review the change again —
+        only the score moves. Every answer you change is recorded in the audit history with your name and reason.
+        <?php if ($a['status'] === 'draft' || $a['status'] === 'sent_back'): ?>
+            <br>This audit is still with its auditor — prefer
+            <a href="?page=audit_edit&id=<?= (int)$id ?>" style="color:inherit;text-decoration:underline">the normal edit screen</a>.
+        <?php endif; ?>
+    </div>
+    <form method="POST" id="auditCorrectForm">
+        <input type="hidden" name="action" value="correct_audit">
+        <input type="hidden" name="audit_id" value="<?= (int)$id ?>">
+        <?php renderAuditCorrectTable($tree); ?>
+        <div class="form-card" style="max-width:none;margin-top:16px">
+            <div class="form-group">
+                <label>Reason for this correction <span class="required">*</span></label>
+                <textarea class="form-control" name="correction_reason" rows="2" required
+                          placeholder="e.g. Auditor ticked the wrong condition — store was under renovation, outside area was not cleaned"></textarea>
+                <div class="hint">Goes into the audit history alongside the before → after of every answer you change.</div>
+            </div>
+        </div>
+        <div class="form-actions"
+             style="position:sticky;bottom:0;z-index:50;
+                    margin:16px -8px 0;padding:12px 16px;
+                    background:var(--surface);border-top:1px solid var(--border);
+                    border-radius:8px 8px 0 0;
+                    box-shadow:0 -6px 18px rgba(0,0,0,.45);
+                    display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+            <button class="btn btn-danger" type="submit"
+                    onclick="return confirm('Save this correction? The audit score will be recalculated and the change logged against your name.')">
+                Save Correction
+            </button>
+            <a class="btn btn-ghost" href="?page=audit_view&id=<?= (int)$id ?>" style="margin-left:auto">Cancel</a>
+        </div>
+    </form>
+    <?php
+    renderAuditCorrectionLog($id);
+}
+
+// Every question on the audit with its recorded answer and, beside it,
+// the conditions it could have been answered with. The ticked one is
+// pre-selected, so leaving the page alone changes nothing — a correction
+// is only ever the difference between what is ticked now and what the
+// superadmin ticks instead.
+function renderAuditCorrectTable(array $tree): void {
+    ?>
+    <div class="table-wrap" data-stack>
+        <table class="table audit-table">
+            <thead>
+                <tr>
+                    <th style="width:46px">#</th>
+                    <th>Audit Category / Parameter</th>
+                    <th style="width:110px">Modified Wt.</th>
+                    <th style="width:150px">Recorded Answer</th>
+                    <th style="width:90px">Obtain</th>
+                    <th style="width:110px">Obtain %</th>
+                </tr>
+            </thead>
+            <tbody>
+            <?php $idx = 0; foreach ($tree as $c): $idx++; ?>
+                <tr>
+                    <td><?= $idx ?></td>
+                    <td><strong><?= h($c['name']) ?></strong></td>
+                    <td class="num"><?= number_format((float)$c['modified_weightage'], 0) ?></td>
+                    <td colspan="3"></td>
+                </tr>
+                <?php foreach ($c['parameters'] as $p):
+                    $r      = $p['response'] ?? null;
+                    $valEnt = $r ? $r['value_entered'] : null;
+                    $optTxt = $r && isset($r['option_text']) ? (string)$r['option_text'] : '';
+                    $obt    = $r ? $r['obtain_score'] : null;
+                    $modW   = $r ? (float)$r['modified_weightage'] : (float)$p['score_weightage'];
+                    $obtPct = ($obt !== null) ? round($modW * $obt / 100, 2) : null;
+                    $scoreCls = auditScoreColor($obt !== null ? (float)$obt : null);
+                    // Everything ticked on this answer: the option_ids list
+                    // when the question takes several, the single option_id
+                    // otherwise. Mirrors renderAuditEditTable.
+                    $opts  = $p['options'] ?? [];
+                    $optOn = [];
+                    if ($r && !empty($r['option_ids'])) {
+                        foreach (explode(',', (string)$r['option_ids']) as $oidRaw) {
+                            $oidRaw = (int)trim($oidRaw);
+                            if ($oidRaw > 0) $optOn[] = $oidRaw;
+                        }
+                    } elseif ($r && !empty($r['option_id'])) {
+                        $optOn[] = (int)$r['option_id'];
+                    }
+                    $optMulti = ($p['option_mode'] ?? 'radio') === 'checkbox';
+                    $optName  = 'param_option[' . (int)$p['id'] . ']' . ($optMulti ? '[]' : '');
+                    // A question added to the template after this audit was
+                    // filed has no response row to correct. doCorrectAudit
+                    // only ever updates rows that exist, so offering inputs
+                    // here would be a control that silently does nothing.
+                    $correctable = $r !== null;
+                ?>
+                <tr>
+                    <td></td>
+                    <td class="param-text">
+                        <div class="param-text-wrap">
+                            <span class="param-text-label"><?= h($p['parameter_text']) ?></span>
+                        </div>
+                        <?php
+                        // Roster of what this form actually carries.
+                        // doCorrectAudit only touches these, so an answer the
+                        // page could not render — a response whose category
+                        // has since been dropped from the template, say — is
+                        // left alone rather than cleared by its own absence
+                        // from the post.
+                        if ($correctable): ?>
+                            <input type="hidden" name="param_present[]" value="<?= (int)$p['id'] ?>">
+                        <?php endif; ?>
+                        <?php if (!$correctable): ?>
+                            <div class="hint">Not answered on this audit — added to the template after it was filed, so there is nothing to correct.</div>
+                        <?php elseif ($opts): ?>
+                            <ul class="opt-guide<?= $optMulti ? ' is-multi' : '' ?>" role="group"
+                                aria-label="<?= h($p['parameter_text']) ?>">
+                                <?php foreach ($opts as $o): $oid = (int)$o['id']; $isOn = in_array($oid, $optOn, true); ?>
+                                    <li<?= $isOn ? ' class="is-picked"' : '' ?>>
+                                        <label>
+                                            <input type="<?= $optMulti ? 'checkbox' : 'radio' ?>" class="opt-input"
+                                                   name="<?= h($optName) ?>" value="<?= $oid ?>"
+                                                   data-points="<?= h((string)(float)$o['points']) ?>"
+                                                   <?= $isOn ? 'checked' : '' ?>>
+                                            <span class="opt-body">
+                                                <span class="opt-cond"><?= h($o['option_text']) ?></span>
+                                                <span class="opt-pts"><?= h((string)(float)$o['points']) ?></span>
+                                            </span>
+                                        </label>
+                                    </li>
+                                <?php endforeach; ?>
+                            </ul>
+                            <?php if ($optMulti): ?>
+                                <div class="hint">Ticking none scores 0 for this question.</div>
+                            <?php endif; ?>
+                        <?php elseif ($p['type'] === 'boolean'): ?>
+                            <select class="form-control" name="param_value[<?= (int)$p['id'] ?>]" style="max-width:140px">
+                                <option value="">—</option>
+                                <option value="1" <?= $valEnt !== null && (float)$valEnt >  0 ? 'selected' : '' ?>>Yes</option>
+                                <option value="0" <?= $valEnt !== null && (float)$valEnt == 0 ? 'selected' : '' ?>>No</option>
+                            </select>
+                        <?php elseif ($p['type'] === 'rating'): ?>
+                            <input type="number" step="0.5" min="0" max="5" class="form-control" style="max-width:140px"
+                                   name="param_value[<?= (int)$p['id'] ?>]" inputmode="decimal"
+                                   value="<?= $valEnt !== null ? h((string)(float)$valEnt) : '' ?>"
+                                   placeholder="0–5 (steps of 0.5)">
+                        <?php else: /* value */ ?>
+                            <input type="number" step="0.01" min="0" class="form-control" style="max-width:140px"
+                                   name="param_value[<?= (int)$p['id'] ?>]"
+                                   value="<?= $valEnt !== null ? h((string)(float)$valEnt) : '' ?>"
+                                   placeholder="<?= $p['max_value'] !== null ? 'max ' . h((string)(float)$p['max_value']) : 'numeric' ?>">
+                        <?php endif; ?>
+                    </td>
+                    <td class="num"><?= number_format($modW, 0) ?></td>
+                    <td class="num"><?= auditAnswerHtml($p, $valEnt, $optTxt) ?></td>
+                    <td class="num <?= h($scoreCls) ?>"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
+                    <td class="num <?= h($scoreCls) ?>"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
+                </tr>
+                <?php endforeach; ?>
+            <?php endforeach; ?>
+            </tbody>
+        </table>
+    </div>
+    <script>
+    // Keep the highlight on whatever is ticked now. The edit screen does
+    // this inside its live-score script; here there is no live score to
+    // keep, so the correction page carries its own three lines rather
+    // than pulling in a recalc that has no inputs to read.
+    (function(){
+        var form = document.getElementById('auditCorrectForm');
+        if (!form) return;
+        form.addEventListener('change', function(e){
+            if (!e.target.matches('.opt-input')) return;
+            var list = e.target.closest('.opt-guide');
+            if (!list) return;
+            list.querySelectorAll('.opt-input').forEach(function(inp){
+                var li = inp.closest('li');
+                if (li) li.classList.toggle('is-picked', inp.checked);
+            });
+        });
+    })();
+    </script>
+    <?php
+}
+
+// Past corrections on this audit, newest first. audit_history is written
+// by every workflow step but rendered nowhere else, so this block is
+// deliberately narrow: only the 'correction' rows, which are the ones
+// that moved a score without a review behind them.
+function renderAuditCorrectionLog(int $auditId): void {
+    $rows = [];
+    try {
+        $st = getDb()->prepare(
+            'SELECT h.action, h.by_code, h.remark, h.at, e.full_name
+             FROM audit_history h
+             LEFT JOIN employees e ON e.employee_code = h.by_code
+             WHERE h.audit_id = ? AND h.action = ?
+             ORDER BY h.at DESC, h.id DESC');
+        $st->execute([$auditId, 'correction']);
+        $rows = $st->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { /* fail open — the log is a nicety, not the record */ }
+    ?>
+    <details class="form-card" style="max-width:none;margin-top:18px" <?= $rows ? '' : 'open' ?>>
+        <summary style="cursor:pointer;font-weight:600;font-size:14px;list-style:none;display:flex;align-items:center;gap:8px">
+            <span>🛠 Correction Log</span>
+            <span style="font-size:11px;font-weight:400;color:var(--muted)">
+                — <?= count($rows) ?> correction<?= count($rows) === 1 ? '' : 's' ?>
+            </span>
+        </summary>
+        <?php if (!$rows): ?>
+            <div style="margin-top:10px;color:var(--muted);font-size:13px">This audit has never been corrected.</div>
+        <?php else: ?>
+            <div class="table-wrap" style="margin-top:10px">
+                <table class="table" style="font-size:12.5px">
+                    <thead><tr><th style="width:160px">When</th><th style="width:200px">By</th><th>Change</th></tr></thead>
+                    <tbody>
+                    <?php foreach ($rows as $r): ?>
+                        <tr>
+                            <td><?= h($r['at']) ?></td>
+                            <td><?= h($r['full_name'] ?? $r['by_code']) ?>
+                                <span style="color:var(--muted);font-size:11px">(<?= h($r['by_code']) ?>)</span>
+                            </td>
+                            <td><?= nl2br(h((string)($r['remark'] ?? ''))) ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+        <?php endif; ?>
+    </details>
     <?php
 }
 

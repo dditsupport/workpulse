@@ -186,6 +186,8 @@ function routePost(string $a): void {
         case 'operation_review_audit':    if (function_exists('doOperationReviewAudit'))   doOperationReviewAudit();   break;
         case 'approve_audit':             if (function_exists('doApproveAudit'))           doApproveAudit();           break;
         case 'management_approve_audit':  if (function_exists('doManagementApproveAudit')) doManagementApproveAudit(); break;
+        // Superadmin-only answer correction on a filed audit (gate is inside the handler).
+        case 'correct_audit':             if (function_exists('doCorrectAudit'))           doCorrectAudit();           break;
         // Audit attachment annotations
         case 'create_audit_annotation':       if (function_exists('doCreateAuditAnnotation'))     doCreateAuditAnnotation();     break;
         case 'add_audit_annotation_comment':  if (function_exists('doAddAuditAnnotationComment')) doAddAuditAnnotationComment(); break;

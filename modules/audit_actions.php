@@ -720,6 +720,201 @@ function doManagementApproveAudit(): void {
 }
 
 // ===========================================================
+// POST: correct_audit (superadmin fixes a filed audit's answers)
+// ===========================================================
+// The auditor's own edit form closes the moment an audit leaves draft /
+// sent_back, and no reviewer screen moves a score — so a condition
+// ticked wrongly on a submitted audit had no in-app fix. This is it,
+// and it is superadmin-only on purpose: it changes a score without a
+// review behind it.
+//
+// Two rules keep it honest. Points are re-read from the condition
+// master exactly as doSaveAuditAnswers does, so a correction can only
+// ever be an answer the template actually offers — nothing typed, and a
+// tampered post can't invent a score. And only answers that actually
+// move are written, each one logged to audit_history as before → after
+// with the reason, so the correction log reads as a list of changes
+// rather than "someone opened the page".
+function doCorrectAudit(): void {
+    if (!isSuperadmin()) { header('Location: ?page=audit_list'); return; }
+    $auditId = (int)($_POST['audit_id'] ?? 0);
+    $a = $auditId > 0 ? auditGetById($auditId) : null;
+    if (!$a) { flash('error', 'Audit not found.'); header('Location: ?page=audit_list'); return; }
+    $back = '?page=audit_correct&id=' . $auditId;
+
+    $reason = trim((string)($_POST['correction_reason'] ?? ''));
+    if ($reason === '') {
+        flash('error', 'Give a reason for the correction — it goes into the audit history.');
+        header('Location: ' . $back); return;
+    }
+
+    $db         = getDb();
+    $hasOptCols = auditHasResponseOptionCols();
+    $hasOptIds  = auditHasResponseOptionIdsCol();
+
+    // Current answers, with the type / max the response was filed under
+    // so a later master edit can't re-interpret them (same snapshot
+    // preference as doSaveAuditAnswers).
+    $extra = ($hasOptCols ? ', r.option_id, r.option_text' : '') . ($hasOptIds ? ', r.option_ids' : '');
+    if (auditHasResponseSnapshotCols()) {
+        $pSt = $db->prepare(
+            "SELECT r.parameter_id AS id,
+                    COALESCE(r.parameter_text, p.parameter_text)  AS text,
+                    COALESCE(r.parameter_type, p.type)            AS type,
+                    COALESCE(r.parameter_max_value, p.max_value)  AS max_value,
+                    r.value_entered, r.obtain_score{$extra}
+             FROM audit_responses r
+             LEFT JOIN audit_parameters p ON p.id = r.parameter_id
+             WHERE r.audit_id = ?");
+    } else {
+        $pSt = $db->prepare(
+            "SELECT p.id, p.parameter_text AS text, p.type, p.max_value,
+                    r.value_entered, r.obtain_score{$extra}
+             FROM audit_responses r
+             JOIN audit_parameters p ON p.id = r.parameter_id
+             WHERE r.audit_id = ?");
+    }
+    $pSt->execute([$auditId]);
+    $allParams = [];
+    foreach ($pSt->fetchAll(PDO::FETCH_ASSOC) as $row) $allParams[(int)$row['id']] = $row;
+    if (!$allParams) {
+        flash('error', 'This audit has no saved answers to correct.');
+        header('Location: ' . $back); return;
+    }
+
+    // Active conditions only — a correction picks from what an auditor
+    // could pick today, not from retired wording.
+    $optsByParam = auditGetParameterOptions(array_keys($allParams));
+    $optById = [];
+    foreach ($optsByParam as $rowsOpt) {
+        foreach ($rowsOpt as $o) $optById[(int)$o['id']] = $o;
+    }
+
+    $paramVals = is_array($_POST['param_value']  ?? null) ? $_POST['param_value']  : [];
+    $paramOpts = is_array($_POST['param_option'] ?? null) ? $_POST['param_option'] : [];
+
+    // The questions the page actually put on screen. A response can exist
+    // for a question the tree can't render — one whose category has since
+    // been deleted from the template — and that answer must survive a
+    // correction untouched rather than be cleared by its own absence from
+    // the post. Everything below is scoped to this roster.
+    $present = [];
+    foreach ((is_array($_POST['param_present'] ?? null) ? $_POST['param_present'] : []) as $pidRaw) {
+        $pid = (int)$pidRaw;
+        if ($pid > 0 && isset($allParams[$pid])) $present[$pid] = true;
+    }
+    if (!$present) {
+        flash('error', 'Nothing was submitted to correct — reload the page and try again.');
+        header('Location: ' . $back); return;
+    }
+
+    // Short "what it said" label for the history line — the picked
+    // condition with its points, or the raw value against its scale.
+    $label = function (?string $optText, $val) {
+        if ($optText !== null && $optText !== '') {
+            return '"' . mb_substr($optText, 0, 60) . '"' . ($val !== null ? ' (' . (float)$val . ')' : '');
+        }
+        return $val === null ? '(blank)' : (string)(float)$val;
+    };
+
+    $setCols = 'value_entered = ?, obtain_score = ?';
+    if ($hasOptCols) $setCols .= ', option_id = ?, option_text = ?';
+    if ($hasOptIds)  $setCols .= ', option_ids = ?';
+    $up = $db->prepare("UPDATE audit_responses SET {$setCols} WHERE audit_id = ? AND parameter_id = ?");
+
+    $changes = [];
+    $db->beginTransaction();
+    try {
+        // Within the roster an absent field really does mean "cleared" —
+        // unlike the auditor's section-at-a-time form, where it only means
+        // "not on this screen". A radio question can't be un-ticked in a
+        // browser, so in practice this only bites the checkbox ones.
+        foreach ($allParams as $pid => $p) {
+            if (!isset($present[$pid])) continue;
+            $optId = 0; $optText = null; $optIds = null; $val = null;
+
+            if (!empty($optsByParam[$pid])) {
+                $picked = $paramOpts[$pid] ?? [];
+                if (!is_array($picked)) $picked = ($picked === '' ? [] : [$picked]);
+                $ids = []; $texts = []; $sum = 0.0;
+                foreach ($picked as $oidRaw) {
+                    $oid = (int)$oidRaw;
+                    if ($oid > 0 && isset($optById[$oid]) && (int)$optById[$oid]['parameter_id'] === $pid
+                        && !in_array($oid, $ids, true)) {
+                        $ids[]   = $oid;
+                        $texts[] = (string)$optById[$oid]['option_text'];
+                        $sum    += (float)$optById[$oid]['points'];
+                    }
+                }
+                if ($ids) {
+                    $optIds  = implode(',', $ids);
+                    $optText = implode(' | ', $texts);
+                    $optId   = count($ids) === 1 ? $ids[0] : 0;
+                    $val     = $sum;
+                }
+            } else {
+                $rawVal = trim((string)($paramVals[$pid] ?? ''));
+                $val    = $rawVal === '' ? null : (float)$rawVal;
+                // Ratings snap to the same half-steps the auditor's form
+                // enforces, so a correction can't land off-scale.
+                if ($val !== null && $p['type'] === 'rating') {
+                    $val = round($val * 2) / 2;
+                    if ($val < 0) $val = 0;
+                    if ($val > 5) $val = 5;
+                }
+            }
+
+            $obtain = auditComputeObtainScore(
+                (string)$p['type'],
+                $p['max_value'] !== null ? (float)$p['max_value'] : null,
+                $val);
+
+            // Nothing moved on this question — leave the row alone so an
+            // untouched audit can be opened and saved without churning
+            // every response.
+            $oldVal  = $p['value_entered'] === null ? null : (float)$p['value_entered'];
+            $oldObt  = $p['obtain_score']  === null ? null : (float)$p['obtain_score'];
+            $oldText = $hasOptCols ? ($p['option_text'] ?? null) : null;
+            // Wording only counts as a difference where there is a column
+            // to keep it in — on a pre-conditions database every answer
+            // would otherwise look changed on every save.
+            $textSame = !$hasOptCols || (string)$oldText === (string)$optText;
+            if ($oldVal === $val && $oldObt === $obtain && $textSame) continue;
+
+            $args = [$val, $obtain];
+            if ($hasOptCols) { $args[] = $optId ?: null; $args[] = $optText; }
+            if ($hasOptIds)  { $args[] = $optIds; }
+            $args[] = $auditId;
+            $args[] = $pid;
+            $up->execute($args);
+
+            $changes[] = mb_substr((string)$p['text'], 0, 70) . ': '
+                       . $label($oldText, $oldVal) . ' → ' . $label($optText, $val);
+        }
+        $db->commit();
+    } catch (Exception $e) {
+        $db->rollBack();
+        flash('error', 'Correction failed: ' . $e->getMessage());
+        header('Location: ' . $back); return;
+    }
+
+    if (!$changes) {
+        flash('error', 'Nothing changed — every answer is still as it was.');
+        header('Location: ' . $back); return;
+    }
+
+    $before = $a['total_score'] !== null ? number_format((float)$a['total_score'], 2) : '—';
+    $after  = auditRecalcTotalScore($auditId);
+    auditAddHistory($auditId, 'correction', myCode(),
+        'Reason: ' . mb_substr($reason, 0, 500)
+        . ' | Score ' . $before . ' → ' . number_format($after, 2)
+        . ' | ' . implode(' | ', $changes));
+
+    flash('success', count($changes) . ' answer(s) corrected. Score ' . $before . ' → ' . number_format($after, 2) . '.');
+    header('Location: ?page=audit_view&id=' . $auditId);
+}
+
+// ===========================================================
 // POST: delete_audit_attachment
 // ===========================================================
 function doDeleteAuditAttachment(): void {
