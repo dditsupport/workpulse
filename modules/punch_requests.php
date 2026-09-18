@@ -28,6 +28,24 @@ function prAttachmentPath(string $punchDate, string $stored, bool $forWrite = fa
     return is_file($flat) ? $flat : $bucketed;
 }
 
+// punch_requests.attendance_log_id arrives with
+// 2026-09-18_punch_request_reversal.sql: the attendance row an approval
+// created, so reversing that approval deletes exactly that punch. Until
+// the migration runs, approvals simply record nothing and a reversal
+// falls back to matching the punch the INSERT would have written — same
+// deploy-PHP-before-SQL guard the rest of the app uses.
+function prHasLogIdColumn(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        $st = getDb()->query("SHOW COLUMNS FROM punch_requests LIKE 'attendance_log_id'");
+        $cached = $st !== false && $st->fetch() !== false;
+    } catch (Throwable $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
 // ── Submit punch request (any user) ──────────────────────
 function doSubmitPunchRequest(): void {
     $punchDate  = trim($_POST['punch_date'] ?? '');
@@ -128,10 +146,18 @@ function doSubmitPunchRequest(): void {
 // PREVIOUS day's shift, so it is that day's last punch, not the next day's
 // first.
 //
-// Only ever called after an approval, and only for that employee and that one
-// shift day. auto_close placeholders are left alone — they are not punches and
-// must not take part in the alternation. Returns how many rows were corrected.
-function prResequenceShiftDay(PDO $db, string $empCode, string $punchDatetime): int {
+// Called after an approval, and again after an approval is reversed, for that
+// employee and that one shift day. auto_close placeholders are left alone —
+// they are not punches and must not take part in the alternation. Returns how
+// many rows were corrected.
+//
+// $afterRemoval says the manual punch has just been taken back out, and
+// changes two things. A lone punch is then worth sequencing: an approval that
+// flipped the day's only other punch to OUT leaves that flip behind once its
+// own punch is gone, and the rule (earliest punch of the shift day is the
+// arrival) puts it back to IN. On the approval side the same lone punch is
+// HR's own explicit IN/OUT decision, so it is left exactly as approved.
+function prResequenceShiftDay(PDO $db, string $empCode, string $punchDatetime, bool $afterRemoval = false): int {
     $cut   = function_exists('shiftCutoffHour') ? shiftCutoffHour() : 6;
     $day   = function_exists('shiftDay') ? shiftDay($punchDatetime) : substr($punchDatetime, 0, 10);
     $from  = $day . ' ' . sprintf('%02d:00:00', $cut);
@@ -146,7 +172,7 @@ function prResequenceShiftDay(PDO $db, string $empCode, string $punchDatetime): 
     );
     $st->execute([$empCode, $from, $to]);
     $rows = $st->fetchAll(PDO::FETCH_ASSOC);
-    if (count($rows) < 2) return 0;   // a lone punch has no sequence to fix
+    if (count($rows) < ($afterRemoval ? 1 : 2)) return 0;   // nothing left to alternate
 
     $fix     = $db->prepare('UPDATE attendance_logs SET punch_type = ? WHERE id = ?');
     $changed = 0;
@@ -159,8 +185,9 @@ function prResequenceShiftDay(PDO $db, string $empCode, string $punchDatetime): 
         // overwrite it — leave a trail of exactly what was changed and why.
         if (function_exists('attOddPunchLog')) {
             attOddPunchLog(sprintf(
-                '[%s] re-sequenced %s punch #%d at %s: %s -> %s (missing punch approved by %s)',
-                $day, $empCode, (int)$r['id'], $r['punch_time'], $r['punch_type'], $want, myCode()
+                '[%s] re-sequenced %s punch #%d at %s: %s -> %s (%s by %s)',
+                $day, $empCode, (int)$r['id'], $r['punch_time'], $r['punch_type'], $want,
+                $afterRemoval ? 'approval reversed' : 'missing punch approved', myCode()
             ));
         }
     }
@@ -261,10 +288,19 @@ function doReviewPunchRequest(): void {
         $resequenced = 0;
         if ($action === 'approved') {
             $punchDatetime = $req['punch_date'] . ' ' . $req['punch_time'];
-            $db->prepare(
+            $ins = $db->prepare(
                 "INSERT INTO attendance_logs (employee_code, device_serial, device_type, location_id, punch_type, punch_method, match_score, punch_time)
                  VALUES (?, 'MANUAL', 'MFS500', ?, ?, 'manual', 0, ?)"
-            )->execute([$req['employee_code'], $req['location_id'], $req['punch_type'], $punchDatetime]);
+            );
+            $ins->execute([$req['employee_code'], $req['location_id'], $req['punch_type'], $punchDatetime]);
+
+            // Tie the request to the punch it just created. Without this a
+            // reversal has to guess which attendance row was ours, and a
+            // re-sequenced punch is no longer recognisable by its type.
+            if (prHasLogIdColumn()) {
+                $db->prepare('UPDATE punch_requests SET attendance_log_id = ? WHERE id = ?')
+                   ->execute([(int)$db->lastInsertId(), $id]);
+            }
 
             // Adding the missing punch can leave the day's types wrong, because
             // the device decides IN/OUT by alternating from whatever it saw
@@ -310,6 +346,148 @@ function doReviewPunchRequest(): void {
             . ($resequenced ? ' ' . $resequenced . ' existing punch(es) on that shift day re-sequenced to keep the in/out trace correct.' : '')
         : 'Punch request rejected.');
     header('Location: index.php?page=approve_punches'); exit;
+}
+
+// ── Reverse an approved punch request (HR, superadmin) ───
+// Approving writes a real punch into attendance_logs, so undoing an
+// approval is not a status change on its own: leave the punch behind and
+// attendance, the odd-punch report and the ERP export all keep counting a
+// punch HR has just disowned. This flips the request back to rejected AND
+// removes the punch it created, then re-sequences that shift day — taking
+// a punch out invalidates the day's IN/OUT alternation exactly as adding
+// one does, because the device only ever alternates from the punch it saw
+// first.
+//
+// A mandatory note is the record of why: the employee sees it on Missing
+// Punch, where the request is now rejected and deletable again.
+function doReversePunchRequest(): void {
+    $isXhr = !empty($_POST['xhr']) || (($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '') === 'XMLHttpRequest');
+    $jsonFail = function (string $msg, int $http = 400) use ($isXhr) {
+        if ($isXhr) {
+            http_response_code($http);
+            header('Content-Type: application/json');
+            echo json_encode(['ok' => false, 'error' => $msg]);
+            exit;
+        }
+        flash('error', $msg);
+        header('Location: index.php?page=approve_punches&status=approved'); exit;
+    };
+
+    if (!canManageEmployees()) { $jsonFail('Access denied.', 403); }
+
+    $id   = (int)($_POST['request_id'] ?? 0);
+    $note = trim($_POST['review_note'] ?? '');
+    if ($note === '') { $jsonFail('A reason is required to reverse an approval.'); }
+
+    $db       = getDb();
+    $hasLogId = prHasLogIdColumn();
+
+    $cols = 'employee_code, punch_date, punch_time, punch_type'
+          . ($hasLogId ? ', attendance_log_id' : '');
+    $st = $db->prepare("SELECT {$cols} FROM punch_requests WHERE id = ? AND status = 'approved'");
+    $st->execute([$id]);
+    $req = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$req) { $jsonFail('Request not found or not in an approved state.', 404); }
+
+    $empCode       = (string)$req['employee_code'];
+    $punchDatetime = $req['punch_date'] . ' ' . $req['punch_time'];
+
+    $db->beginTransaction();
+    try {
+        // Same concurrency guard as the review path: only the reverser whose
+        // UPDATE moves the row off 'approved' goes on to delete the punch, so
+        // two HR users clicking at once cannot delete twice.
+        $sql = $hasLogId
+            ? "UPDATE punch_requests SET status = 'rejected', reviewed_by = ?, reviewed_at = NOW(), review_note = ?, attendance_log_id = NULL WHERE id = ? AND status = 'approved'"
+            : "UPDATE punch_requests SET status = 'rejected', reviewed_by = ?, reviewed_at = NOW(), review_note = ? WHERE id = ? AND status = 'approved'";
+        $upd = $db->prepare($sql);
+        $upd->execute([myCode(), $note, $id]);
+        if ($upd->rowCount() !== 1) {
+            $db->rollBack();
+            $jsonFail('Request not found or already reviewed.', 409);
+        }
+
+        // Which attendance row belongs to this approval? The recorded id is
+        // authoritative. Requests approved before the reversal migration
+        // carry none, so fall back to the key the approval INSERT itself
+        // used — employee + exact punch datetime + punch_method 'manual'.
+        $logId = $hasLogId ? (int)($req['attendance_log_id'] ?? 0) : 0;
+        if (!$logId) {
+            $find = $db->prepare(
+                "SELECT id FROM attendance_logs
+                  WHERE employee_code = ? AND punch_method = 'manual' AND punch_time = ?
+                  ORDER BY id ASC LIMIT 1"
+            );
+            $find->execute([$empCode, $punchDatetime]);
+            $logId = (int)$find->fetchColumn();
+
+            // Two approvals for the same employee and second would both point
+            // at that one punch. If another request already claims it, this
+            // reversal leaves attendance alone rather than deleting a punch
+            // that is still backed by a live approval.
+            if ($logId && $hasLogId) {
+                $claim = $db->prepare('SELECT COUNT(*) FROM punch_requests WHERE attendance_log_id = ? AND id <> ?');
+                $claim->execute([$logId, $id]);
+                if ((int)$claim->fetchColumn() > 0) $logId = 0;
+            }
+        }
+
+        $deleted = 0;
+        if ($logId) {
+            // punch_method 'manual' is part of the WHERE on purpose: whatever
+            // the id says, a reversal must never remove a biometric punch.
+            $del = $db->prepare("DELETE FROM attendance_logs WHERE id = ? AND employee_code = ? AND punch_method = 'manual'");
+            $del->execute([$logId, $empCode]);
+            $deleted = $del->rowCount();
+        }
+
+        // Only worth re-sequencing if a punch actually left the day.
+        $resequenced = $deleted ? prResequenceShiftDay($db, $empCode, $punchDatetime, true) : 0;
+
+        $db->commit();
+    } catch (Exception $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        $jsonFail('Error reversing request: ' . $e->getMessage(), 500);
+    }
+
+    // Deleting attendance is the one thing here that cannot be undone from
+    // the UI, so it leaves the same trail the re-sequencing does.
+    if (function_exists('attOddPunchLog')) {
+        $day = function_exists('shiftDay') ? shiftDay($punchDatetime) : substr($punchDatetime, 0, 10);
+        attOddPunchLog(sprintf(
+            '[%s] approval reversed on punch request #%d for %s (%s %s): %s; by %s — %s',
+            $day, $id, $empCode, $punchDatetime, (string)$req['punch_type'],
+            $deleted ? 'attendance punch #' . $logId . ' deleted' : 'no matching attendance punch found',
+            myCode(), $note
+        ));
+    }
+
+    $message = 'Approval reversed — request is now rejected'
+             . ($deleted
+                 ? ' and the punch was removed from attendance.'
+                 : '. No matching attendance punch was found — it may already have been removed.')
+             . ($resequenced ? ' ' . $resequenced . ' remaining punch(es) on that shift day re-sequenced to keep the in/out trace correct.' : '');
+
+    if ($isXhr) {
+        $rev = $db->prepare('SELECT full_name FROM employees WHERE employee_code = ?');
+        $rev->execute([myCode()]);
+        $reviewerName = $rev->fetchColumn() ?: myCode();
+        header('Content-Type: application/json');
+        echo json_encode([
+            'ok'            => true,
+            'request_id'    => $id,
+            'action'        => 'rejected',
+            'review_note'   => $note,
+            'reviewer_name' => $reviewerName,
+            'reviewed_at'   => date('d M Y H:i'),
+            'punch_deleted' => $deleted ? 1 : 0,
+            'message'       => $message,
+        ]);
+        exit;
+    }
+
+    flash('success', $message);
+    header('Location: index.php?page=approve_punches&status=approved'); exit;
 }
 
 // ── Punch request form page (any user) ───────────────────
@@ -459,6 +637,14 @@ function pageApprovePunches(): void {
     </select>
 </form>
 
+<?php if ($statusFilter === 'approved'): ?>
+<div style="margin:-4px 0 14px;padding:12px 14px;background:#f8f9fa;border-left:3px solid #6c757d;border-radius:4px;font-size:13px;color:#495057;line-height:1.6">
+    Approved by mistake? Open the request and use <strong>Reverse to Rejected</strong>. The request goes back to
+    rejected and the punch it added is deleted from attendance, so reports and the odd-punch list stop counting it.
+    A reason is required and is shown to the employee.
+</div>
+<?php endif; ?>
+
 <?php if (empty($requests)): ?>
 <div class="rpt-prompt">No <?= h($statusFilter) ?> punch requests.</div>
 <?php else: ?>
@@ -482,7 +668,9 @@ function pageApprovePunches(): void {
             $hasAttach = !empty($r['attachment_stored']);
             $attName   = (string)($r['attachment_name'] ?? '');
             $isImg     = $hasAttach && (bool)preg_match('/\.(jpg|jpeg|png|gif|webp|heic|heif)$/i', $attName);
-            $btnLabel  = $statusFilter === 'pending' ? 'Review' : 'View';
+            // An approved row is not read-only any more — its button opens the
+            // modal HR reverses from, so it says so.
+            $btnLabel  = $statusFilter === 'pending' ? 'Review' : ($r['status'] === 'approved' ? 'View / Reverse' : 'View');
             $btnClass  = $statusFilter === 'pending' ? 'btn-primary' : 'btn-secondary';
         ?>
             <tr id="prRow-<?= (int)$r['id'] ?>">
@@ -585,6 +773,7 @@ function pageApprovePunches(): void {
             <div style="display:flex;gap:8px;flex-wrap:wrap">
                 <button type="button" class="btn btn-ghost" onclick="prCloseReview()">Close</button>
                 <a id="prDownloadLink" class="btn btn-secondary" href="#" target="_blank" style="display:none;padding:4px 12px">Open Original</a>
+                <button type="button" class="btn btn-danger"  id="prReverseBtn" onclick="prReverseConfirm()" style="display:none">Reverse to Rejected</button>
                 <button type="button" class="btn btn-danger"  id="prRejectBtn"  onclick="prReviewConfirm('rejected')">Reject</button>
                 <button type="button" class="btn btn-success" id="prApproveBtn" onclick="prReviewConfirm('approved')">Approve</button>
             </div>
@@ -605,7 +794,9 @@ function pageApprovePunches(): void {
     var stampEl   = document.getElementById('prStamp');
     var apBtn     = document.getElementById('prApproveBtn');
     var rjBtn     = document.getElementById('prRejectBtn');
+    var rvBtn     = document.getElementById('prReverseBtn');
     var currentId = 0;
+    var notePlaceholder = noteEl.getAttribute('placeholder') || '';
 
     function esc(s){ return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){
         return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
@@ -651,19 +842,36 @@ function pageApprovePunches(): void {
         if (pending) {
             apBtn.style.display = '';
             rjBtn.style.display = '';
+            rvBtn.style.display = 'none';
             apBtn.disabled = false; apBtn.textContent = 'Approve';
             rjBtn.disabled = false; rjBtn.textContent = 'Reject';
             noteEl.disabled = false;
+            noteEl.setAttribute('placeholder', notePlaceholder);
             stampEl.textContent = '';
             stampEl.style.color = '';
         } else {
             apBtn.style.display = 'none';
             rjBtn.style.display = 'none';
-            noteEl.disabled = true;
-            stampEl.style.color = status === 'approved' ? 'var(--green)' : 'var(--red)';
-            stampEl.textContent = (status === 'approved' ? '✓ Approved' : '✗ Rejected')
+            // An approval can still be taken back: the note stays editable so
+            // the reversal carries its reason, which is what the employee
+            // reads on Missing Punch once the request flips to rejected.
+            var approved = status === 'approved';
+            rvBtn.style.display = approved ? '' : 'none';
+            rvBtn.disabled = false; rvBtn.textContent = 'Reverse to Rejected';
+            noteEl.disabled = !approved;
+            noteEl.setAttribute('placeholder', approved
+                ? 'Reason for reversing this approval (required)'
+                : notePlaceholder);
+            // The note box is where the reversal reason goes, so it starts
+            // empty on an approved row — the note the approver left is kept
+            // in view on the stamp line instead of being typed over blindly.
+            var pastNote = btn.getAttribute('data-review-note') || '';
+            if (approved) noteEl.value = '';
+            stampEl.style.color = approved ? 'var(--green)' : 'var(--red)';
+            stampEl.textContent = (approved ? '✓ Approved' : '✗ Rejected')
                 + ' by ' + (btn.getAttribute('data-reviewer') || '—')
-                + ' on '  + (btn.getAttribute('data-reviewed-at') || '—');
+                + ' on '  + (btn.getAttribute('data-reviewed-at') || '—')
+                + (pastNote ? ' · “' + pastNote + '”' : '');
         }
 
         overlay.classList.add('open');
@@ -684,20 +892,18 @@ function pageApprovePunches(): void {
         if (e.target === overlay) prCloseReview();
     });
 
-    window.prReviewConfirm = function (action) {
-        if (!currentId) return;
-        if (action === 'rejected' && !confirm('Reject this punch request?')) return;
-        var workingBtn = action === 'approved' ? apBtn : rjBtn;
-        var otherBtn   = action === 'approved' ? rjBtn : apBtn;
-        workingBtn.disabled = true; workingBtn.textContent = 'Saving…';
-        otherBtn.disabled   = true;
+    // One submit path for review and reversal alike: both POST to index.php,
+    // both disable the footer buttons while in flight, and both end with the
+    // row leaving this filtered view. Only the payload differs.
+    function prSend(fd, workingBtn, workingLabel) {
+        var footBtns = [apBtn, rjBtn, rvBtn];
+        footBtns.forEach(function (b) { b.disabled = true; });
+        workingBtn.textContent = 'Saving…';
 
-        var fd = new FormData();
-        fd.append('action',        'review_punch_request');
-        fd.append('request_id',    String(currentId));
-        fd.append('review_action', action);
-        fd.append('review_note',   noteEl.value.trim());
-        fd.append('xhr',           '1');
+        function restore() {
+            footBtns.forEach(function (b) { b.disabled = false; });
+            workingBtn.textContent = workingLabel;
+        }
 
         fetch('index.php', { method: 'POST', body: fd, credentials: 'same-origin', headers: { 'X-Requested-With': 'XMLHttpRequest' } })
             .then(function (r) { return r.text().then(function (t) { return { status: r.status, text: t }; }); })
@@ -708,14 +914,14 @@ function pageApprovePunches(): void {
                     var msg = (data && data.error) ? data.error : ('Server returned HTTP ' + resp.status);
                     stampEl.style.color = 'var(--red)';
                     stampEl.textContent = msg;
-                    workingBtn.disabled = false; workingBtn.textContent = action === 'approved' ? 'Approve' : 'Reject';
-                    otherBtn.disabled   = false;
+                    restore();
                     return;
                 }
                 // Success — drop the row from this view (status no longer matches the filter).
                 var row = document.getElementById('prRow-' + data.request_id);
                 if (row) row.remove();
                 prCloseReview();
+                restore();
                 // Tiny one-shot success banner at the top of the page.
                 var banner = document.createElement('div');
                 banner.className = 'alert alert-success';
@@ -726,14 +932,49 @@ function pageApprovePunches(): void {
                 banner.style.zIndex   = '9200';
                 banner.style.boxShadow = '0 4px 14px rgba(0,0,0,.35)';
                 document.body.appendChild(banner);
-                setTimeout(function () { banner.remove(); }, 4000);
+                setTimeout(function () { banner.remove(); }, 6000);
             })
             .catch(function (err) {
                 stampEl.style.color = 'var(--red)';
                 stampEl.textContent = 'Network error: ' + (err && err.message ? err.message : 'try again');
-                workingBtn.disabled = false; workingBtn.textContent = action === 'approved' ? 'Approve' : 'Reject';
-                otherBtn.disabled   = false;
+                restore();
             });
+    }
+
+    window.prReviewConfirm = function (action) {
+        if (!currentId) return;
+        if (action === 'rejected' && !confirm('Reject this punch request?')) return;
+
+        var fd = new FormData();
+        fd.append('action',        'review_punch_request');
+        fd.append('request_id',    String(currentId));
+        fd.append('review_action', action);
+        fd.append('review_note',   noteEl.value.trim());
+        fd.append('xhr',           '1');
+
+        prSend(fd, action === 'approved' ? apBtn : rjBtn, action === 'approved' ? 'Approve' : 'Reject');
+    };
+
+    // Reversing deletes the punch this approval put into attendance, so the
+    // reason is not optional and the confirm spells out what goes.
+    window.prReverseConfirm = function () {
+        if (!currentId) return;
+        var note = noteEl.value.trim();
+        if (!note) {
+            stampEl.style.color = 'var(--red)';
+            stampEl.textContent = 'Enter a reason before reversing this approval.';
+            noteEl.focus();
+            return;
+        }
+        if (!confirm('Reverse this approval?\n\nThe request goes back to rejected and the punch it added is removed from attendance.')) return;
+
+        var fd = new FormData();
+        fd.append('action',      'reverse_punch_request');
+        fd.append('request_id',  String(currentId));
+        fd.append('review_note', note);
+        fd.append('xhr',         '1');
+
+        prSend(fd, rvBtn, 'Reverse to Rejected');
     };
 })();
 </script>

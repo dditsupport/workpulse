@@ -162,6 +162,7 @@ function routePost(string $a): void {
         // Punch requests
         case 'submit_punch_request': if (function_exists('doSubmitPunchRequest')) doSubmitPunchRequest(); break;
         case 'review_punch_request': if (function_exists('doReviewPunchRequest') && canManageEmployees()) doReviewPunchRequest(); break;
+        case 'reverse_punch_request': if (function_exists('doReversePunchRequest') && canManageEmployees()) doReversePunchRequest(); break;
         case 'delete_punch_request': if (function_exists('doDeletePunchRequest')) doDeletePunchRequest(); break;
         case 'delete_all_failed_punches': if (function_exists('doDeleteAllFailedPunches') && isSuperadmin()) doDeleteAllFailedPunches(); break;
         // Passwords
