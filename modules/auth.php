@@ -20,9 +20,9 @@ function enforceIdleTimeout(): void {
     // review justification, or attaching files to a price variation can
     // each take >10 minutes).
     $exemptPages   = ['audit_new', 'audit_edit', 'audit_manager_review', 'audit_operation_review', 'audit_management_review',
-                      'audit_annotation_image', 'checklist_files'];
+                      'audit_correct', 'audit_annotation_image', 'checklist_files'];
     $exemptActions = ['create_audit', 'save_audit_weights', 'delete_audit_attachment', 'approve_audit', 'manager_review_audit',
-                      'operation_review_audit', 'management_approve_audit',
+                      'operation_review_audit', 'management_approve_audit', 'correct_audit',
                       'create_audit_annotation', 'add_audit_annotation_comment', 'resolve_audit_annotation', 'reopen_audit_annotation',
                       'pv_add_attachment',
                       'save_checklist', 'delete_checklist_attachment'];
