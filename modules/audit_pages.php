@@ -3637,9 +3637,13 @@ function renderAuditPhotoCompressJs(string $formId): void {
                 img.src = url;
             });
         }
+        // HEIC/HEIF has to be converted whatever its size: no browser but
+        // Safari can display it and the server will not store it, so a
+        // small one passed through untouched is a photo thrown away.
+        function mustConvert(file) { return /^image\/hei[cf]$/i.test(file.type); }
         function compressOne(file) {
             if (!IMAGE_RE.test(file.type)) return Promise.resolve(file);
-            if (file.size <= SKIP_BELOW)   return Promise.resolve(file);
+            if (!mustConvert(file) && file.size <= SKIP_BELOW) return Promise.resolve(file);
             return decode(file).then(function (bmp) {
                 var w = bmp.width || bmp.naturalWidth;
                 var h = bmp.height || bmp.naturalHeight;
@@ -3651,7 +3655,10 @@ function renderAuditPhotoCompressJs(string $formId): void {
                 canvas.getContext('2d').drawImage(bmp, 0, 0, tw, th);
                 return new Promise(function (resolve) {
                     canvas.toBlob(function (blob) {
-                        if (!blob || blob.size >= file.size) { resolve(file); return; }
+                        // Normally a re-encode that got bigger isn't worth
+                        // keeping — but for HEIC the bigger JPEG is the only
+                        // form that survives the trip at all.
+                        if (!blob || (blob.size >= file.size && !mustConvert(file))) { resolve(file); return; }
                         var nameBase = (file.name || 'photo').replace(/\.(png|jpe?g|gif|webp|heic|heif)$/i, '');
                         resolve(new File([blob], nameBase + '.jpg', { type: 'image/jpeg', lastModified: Date.now() }));
                     }, 'image/jpeg', JPEG_QUALITY);
@@ -3669,7 +3676,9 @@ function renderAuditPhotoCompressJs(string $formId): void {
             if (!files.length) { status.textContent = ''; return; }
 
             var origTotal = files.reduce(function (n, f) { return n + f.size; }, 0);
-            var compressableAny = files.some(function (f) { return IMAGE_RE.test(f.type) && f.size > SKIP_BELOW; });
+            var compressableAny = files.some(function (f) {
+                return IMAGE_RE.test(f.type) && (f.size > SKIP_BELOW || mustConvert(f));
+            });
             if (!compressableAny) {
                 status.style.color = 'var(--muted)';
                 status.textContent = files.length + ' file(s) — ' + fmtSize(origTotal);

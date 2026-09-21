@@ -15,17 +15,24 @@
 
 define('AUDIT_UPLOAD_DIR', __DIR__ . '/../uploads/audit/');
 define('AUDIT_MAX_FILE_SIZE', 5 * 1024 * 1024);
-define('AUDIT_ALLOWED_EXT', ['jpg','jpeg','png','gif','webp','pdf']);
 // Which side of the audit an attachment came from — see
 // audit_response_attachments.uploaded_stage.
 define('AUDIT_ATTACHMENT_STAGES', ['auditor', 'store_manager']);
-define('AUDIT_ALLOWED_MIME', [
-    'jpg'  => ['image/jpeg'],
-    'jpeg' => ['image/jpeg'],
-    'png'  => ['image/png'],
-    'gif'  => ['image/gif'],
-    'webp' => ['image/webp'],
-    'pdf'  => ['application/pdf'],
+// What a file actually is decides whether it is accepted and what
+// extension it is stored under — never the name it arrived with. Phones
+// and chat apps hand out names whose extension contradicts the bytes all
+// the time (WhatsApp Web saves plenty of PNGs and WebPs as ".jpeg"), and
+// refusing those is refusing a perfectly good photo. Reading the content
+// is also the safer half of the pair: the stored extension can then never
+// be one the uploader chose.
+define('AUDIT_MIME_EXT', [
+    'image/jpeg'      => 'jpg',
+    'image/pjpeg'     => 'jpg',
+    'image/png'       => 'png',
+    'image/x-png'     => 'png',
+    'image/gif'       => 'gif',
+    'image/webp'      => 'webp',
+    'application/pdf' => 'pdf',
 ]);
 const AUDIT_WEIGHT_TOLERANCE = 0.05; // rounding tolerance for weightage sums
 
@@ -830,19 +837,18 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
                 . auditFormatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
             continue;
         }
-        $ext = mb_strtolower(pathinfo($origName, PATHINFO_EXTENSION));
-        if (!in_array($ext, AUDIT_ALLOWED_EXT, true)) {
-            $reject($origName, ($ext !== '' ? '.' . $ext . ' files are' : 'that file type is')
-                . ' not accepted — use ' . implode(', ', AUDIT_ALLOWED_EXT));
-            continue;
-        }
+        // Read what the file IS. A name saying .jpeg over PNG bytes is a
+        // photo we want, not a forgery to turn away.
         $finfo = new finfo(FILEINFO_MIME_TYPE);
-        $mime  = $finfo->file($files['tmp_name'][$i]);
-        $ok = AUDIT_ALLOWED_MIME[$ext] ?? [];
-        if (!in_array($mime, $ok, true)) {
-            $reject($origName, 'the contents are not a real .' . $ext . ' file');
+        $mime  = (string)$finfo->file($files['tmp_name'][$i]);
+        $ext   = AUDIT_MIME_EXT[$mime] ?? null;
+        if ($ext === null) {
+            $reject($origName, auditUnsupportedTypeReason($mime));
             continue;
         }
+        // Keep the human-readable name but make its extension tell the
+        // truth, so the file opens in the right app when downloaded.
+        $origName   = auditNameWithExt($origName, $ext);
         $storedName = uniqid('aud_', true) . '.' . $ext;
         if (!move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
             $reject($origName, 'the server could not store it — please try again');
@@ -872,6 +878,35 @@ function auditUploadErrorReason(int $err): string {
         case UPLOAD_ERR_EXTENSION:  return 'the server could not store it — please try again';
     }
     return 'the upload did not complete';
+}
+
+// Why a file the server can't take was turned away, in words the person
+// holding the phone can act on.
+function auditUnsupportedTypeReason(string $mime): string {
+    // Formats, not extensions — "jpg, jpeg" reads like two different
+    // things to the person being told what to send.
+    $allowed = 'send a JPG, PNG, GIF, WebP or PDF';
+    if (preg_match('#^image/hei[cf]#i', $mime)) {
+        return 'an iPhone HEIC photo, which browsers cannot show — open it in Photos and'
+             . ' share it as JPEG, or retake it with the camera button here';
+    }
+    if ($mime === '' || $mime === 'application/octet-stream') {
+        return 'not a readable image or PDF — it may have been damaged in transfer; ' . $allowed;
+    }
+    if (stripos($mime, 'video/') === 0) {
+        return 'a video, and only photos and PDFs can be attached — ' . $allowed;
+    }
+    return 'a ' . $mime . ' file, which is not accepted — ' . $allowed;
+}
+
+// Swap a filename's extension for the one its contents call for, leaving
+// the readable part alone. "WhatsApp Image … .jpeg" holding PNG bytes
+// becomes "WhatsApp Image … .png".
+function auditNameWithExt(string $name, string $ext): string {
+    $base = pathinfo($name, PATHINFO_FILENAME);
+    if ($base === '') $base = 'photo';
+    $had = mb_strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    return ($had === $ext) ? $name : $base . '.' . $ext;
 }
 
 function auditFormatBytes(int $bytes): string {
