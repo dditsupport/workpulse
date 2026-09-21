@@ -2664,6 +2664,11 @@ if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
             <tbody>
             <?php
             $currentSection = null; $sr = 1;
+            // What the rows actually offer, collected while they render, so the
+            // button below can name what pressing it saves. A task answered
+            // earlier in the day still carries an editable minutes box and an
+            // editable remark box, and both post with the same submit.
+            $hasTimeBox = false; $hasRemarkBox = false;
             foreach ($tasks as $t):
                 $sid = (int)($t['section_id'] ?? 0);
                 $secInfo = $sectionStatus[$sid] ?? ['state' => 'closed', 'open' => false, 'name' => 'General',
@@ -2743,7 +2748,7 @@ if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
                             $cycNoun = function_exists('chkFreqNoun') ? chkFreqNoun($secInfo['freq']) : 'day';
                             $showCyc = $perDayUi && $secInfo['freq'] !== 'daily' && $cycMin > 0;
                             ?>
-                            <?php if ($cellEditable): ?>
+                            <?php if ($cellEditable): $hasTimeBox = true; ?>
                             <span style="display:inline-flex;align-items:center;gap:5px">
                                 <span class="text-muted" style="display:inline-flex" title="How long this task took today"><?= chkClockIcon(13) ?></span>
                                 <?= durationSelect('task_time[' . (int)$t['id'] . ']', $myMin, false, 'chk-task-time', 'width:110px;padding:3px 6px;font-size:12px') ?>
@@ -2863,7 +2868,7 @@ if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
                         // note can be added to a task ticked off earlier. The
                         // cycle's remarks become the notes of its My Time entry.
                         $myRemark = trim((string)($t['my_remarks'] ?? ''));
-                        if ($remarkUi && $cellEditable): ?>
+                        if ($remarkUi && $cellEditable): $hasRemarkBox = true; ?>
                             <div style="margin-top:4px">
                                 <input type="text" name="remark[<?= (int)$t['id'] ?>]" class="form-control chk-task-remark"
                                        maxlength="500" value="<?= h($myRemark) ?>"
@@ -2895,10 +2900,16 @@ if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
             else                               $hasAttachable = true;
         }
     }
-    if ($hasFillable || $hasAttachable): ?>
+    // "Save Attachments" is only the truth when files are all the form can
+    // still carry. On a checklist that tracks time, a day whose tasks are
+    // already answered still shows every minutes box — and a remark box
+    // beside it — so the button was offering to save attachments on a page
+    // whose whole job was recording how long each task took.
+    $savesWork = $hasFillable || $hasTimeBox || $hasRemarkBox;
+    if ($hasFillable || $hasAttachable || $hasTimeBox || $hasRemarkBox): ?>
     <div class="form-actions" style="position:sticky;bottom:0;margin-top:10px;padding:10px 0;background:var(--bg);border-top:1px solid var(--border);z-index:20">
         <button type="submit" class="btn btn-success">
-            <?= $hasFillable ? 'Submit Progress' : 'Save Attachments' ?>
+            <?= $savesWork ? 'Submit Progress' : 'Save Attachments' ?>
         </button>
         <?php if ($timeUi): ?>
         <span class="text-muted" style="font-size:12px;margin-left:10px">
