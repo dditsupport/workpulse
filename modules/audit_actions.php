@@ -409,7 +409,7 @@ function doSaveAuditWeights(): void {
 
         $db->commit();
 
-        $dropped = auditRejectedFilesNote($uploadRejected);
+        $dropped = rejectedFilesNote($uploadRejected);
 
         if (!empty($_POST['submit_after_save'])) {
             // Hold the rejection notice over the submit handler's own flash
@@ -534,7 +534,7 @@ function doManagerReviewAudit(): void {
     // A photo the server refused is the whole point of the SM's visit, so
     // it is never a footnote: the message says which file and why, and it
     // comes through as an error even though the text saved fine.
-    $dropped  = auditRejectedFilesNote($upload['rejected']);
+    $dropped  = rejectedFilesNote($upload['rejected']);
     $flashCls = $dropped !== '' ? 'error' : 'success';
 
     if ($smAction === 'forward') {

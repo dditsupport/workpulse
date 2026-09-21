@@ -828,13 +828,13 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
             // UPLOAD_ERR_NO_FILE is an empty slot in a multi-file input, not
             // a failure — the user never picked anything there.
             if ($files['error'][$i] !== UPLOAD_ERR_NO_FILE) {
-                $reject($origName, auditUploadErrorReason((int)$files['error'][$i]));
+                $reject($origName, uploadErrorReason((int)$files['error'][$i]));
             }
             continue;
         }
         if ($files['size'][$i] > AUDIT_MAX_FILE_SIZE) {
-            $reject($origName, auditFormatBytes((int)$files['size'][$i]) . ' — over the '
-                . auditFormatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
+            $reject($origName, formatBytes((int)$files['size'][$i]) . ' — over the '
+                . formatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
             continue;
         }
         // Read what the file IS. A name saying .jpeg over PNG bytes is a
@@ -848,7 +848,7 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
         }
         // Keep the human-readable name but make its extension tell the
         // truth, so the file opens in the right app when downloaded.
-        $origName   = auditNameWithExt($origName, $ext);
+        $origName   = nameWithExt($origName, $ext);
         $storedName = uniqid('aud_', true) . '.' . $ext;
         if (!move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
             $reject($origName, 'the server could not store it — please try again');
@@ -860,24 +860,6 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
         $result['saved']++;
     }
     return $result;
-}
-
-// Plain-English reason for a PHP upload error code. The size ones name the
-// server's own limit, because that is the number the user has to get under
-// and it is nowhere on screen otherwise.
-function auditUploadErrorReason(int $err): string {
-    switch ($err) {
-        case UPLOAD_ERR_INI_SIZE:
-            $lim = trim((string)ini_get('upload_max_filesize'));
-            return 'bigger than this server accepts in one file'
-                . ($lim !== '' ? ' (' . $lim . ')' : '');
-        case UPLOAD_ERR_FORM_SIZE:  return 'bigger than the form allows';
-        case UPLOAD_ERR_PARTIAL:    return 'the upload was cut off part-way — please try again';
-        case UPLOAD_ERR_NO_TMP_DIR:
-        case UPLOAD_ERR_CANT_WRITE:
-        case UPLOAD_ERR_EXTENSION:  return 'the server could not store it — please try again';
-    }
-    return 'the upload did not complete';
 }
 
 // Why a file the server can't take was turned away, in words the person
@@ -897,35 +879,6 @@ function auditUnsupportedTypeReason(string $mime): string {
         return 'a video, and only photos and PDFs can be attached — ' . $allowed;
     }
     return 'a ' . $mime . ' file, which is not accepted — ' . $allowed;
-}
-
-// Swap a filename's extension for the one its contents call for, leaving
-// the readable part alone. "WhatsApp Image … .jpeg" holding PNG bytes
-// becomes "WhatsApp Image … .png".
-function auditNameWithExt(string $name, string $ext): string {
-    $base = pathinfo($name, PATHINFO_FILENAME);
-    if ($base === '') $base = 'photo';
-    $had = mb_strtolower(pathinfo($name, PATHINFO_EXTENSION));
-    return ($had === $ext) ? $name : $base . '.' . $ext;
-}
-
-function auditFormatBytes(int $bytes): string {
-    if ($bytes >= 1024 * 1024) return round($bytes / 1024 / 1024, 1) . ' MB';
-    if ($bytes >= 1024)        return round($bytes / 1024) . ' KB';
-    return $bytes . ' B';
-}
-
-// One sentence naming every file that did not make it and why, for the
-// flash the uploader sees. Empty when everything saved.
-function auditRejectedFilesNote(array $rejected): string {
-    if (!$rejected) return '';
-    $parts = [];
-    foreach ($rejected as $r) {
-        $parts[] = $r['name'] . ' (' . $r['reason'] . ')';
-    }
-    return count($rejected) === 1
-        ? ' 1 file was NOT saved: ' . $parts[0] . '.'
-        : ' ' . count($rejected) . ' files were NOT saved: ' . implode('; ', $parts) . '.';
 }
 
 // ── History row ────────────────────────────────────────
