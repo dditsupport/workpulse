@@ -624,9 +624,11 @@ function auditGetTree(int $auditId, int $templateId): array {
         $ph = implode(',', array_fill(0, count($respIds), '?'));
         // uploaded_stage separates the auditor's evidence from the Store
         // Manager's verified-work photos. Pre-migration databases don't
-        // have the column, so we synthesise 'auditor' — which is what
-        // every file predating the column is.
-        $stageCol = auditHasAttachmentStageCol() ? 'aa.uploaded_stage' : "'auditor' AS uploaded_stage";
+        // have the column; auditDeriveAttachmentStage() fills it in below
+        // from who uploaded the file, so the Store Manager's proof still
+        // lands in the right column on an un-migrated install instead of
+        // hiding among the auditor's evidence.
+        $stageCol = auditHasAttachmentStageCol() ? 'aa.uploaded_stage' : "'' AS uploaded_stage";
         $st = $db->prepare(
             "SELECT aa.id, aa.response_id, aa.filename, aa.stored_name, aa.mime_type,
                     aa.file_size, aa.uploaded_by, aa.uploaded_at, {$stageCol},
@@ -637,6 +639,12 @@ function auditGetTree(int $auditId, int $templateId): array {
         );
         $st->execute($respIds);
         $allAtts = $st->fetchAll(PDO::FETCH_ASSOC);
+        if ($allAtts && !auditHasAttachmentStageCol()) {
+            $smCode = (string)(auditGetById($auditId)['store_manager_code'] ?? '');
+            foreach ($allAtts as $i => $att) {
+                $allAtts[$i]['uploaded_stage'] = auditDeriveAttachmentStage($att, $smCode);
+            }
+        }
 
         // Decorate each attachment with its pin counts so the UI can flag
         // annotated images at a glance. One batch query keyed by
@@ -772,12 +780,19 @@ function auditAttachmentPath(int $auditId, ?array $auditRow, string $storedName)
 // 'auditor' for the finding, 'store_manager' for the photo of the
 // verified work the SM attaches to their justification. On databases that
 // haven't run 2026-09-11_audit_sm_verification_photos.sql the column
-// doesn't exist yet, so the stage is simply not written — the upload
-// still succeeds and reads back as auditor evidence.
-function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCode, string $stage = 'auditor'): void {
-    if (empty($_FILES['attachments']['name'][0])) return;
+// doesn't exist yet, so the stage is simply not written — the upload still
+// succeeds, and auditDeriveAttachmentStage() recovers which side it came
+// from by its uploader when the audit is read back.
+//
+// Returns ['saved' => int, 'rejected' => [['name','reason'], …]]. Nothing
+// is ever dropped silently: every file the server refuses comes back with
+// a reason the caller is expected to put in front of the person who
+// attached it.
+function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCode, string $stage = 'auditor'): array {
+    $result = ['saved' => 0, 'rejected' => []];
+    if (empty($_FILES['attachments']['name'][0])) return $result;
     $auditRow = auditGetById($auditId);
-    if (!$auditRow) return; // can't bucket without template + date
+    if (!$auditRow) return $result; // can't bucket without template + date
     $dir = auditAttachmentDir($auditRow);
     if (!is_dir($dir)) @mkdir($dir, 0755, true);
     $db = getDb();
@@ -793,23 +808,89 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
               (response_id, filename, stored_name, mime_type, file_size, uploaded_by)
              VALUES (?, ?, ?, ?, ?, ?)');
     $files = $_FILES['attachments'];
+    // Every rejection below used to be a bare `continue`: the file vanished
+    // and the uploader was told nothing, which is how three photos became
+    // one with nobody the wiser. Each one now names the file and the reason
+    // so the caller can say so.
+    $reject = function (string $name, string $why) use (&$result) {
+        $result['rejected'][] = ['name' => $name !== '' ? $name : 'file', 'reason' => $why];
+    };
     for ($i = 0; $i < count($files['name']); $i++) {
-        if ($files['error'][$i] !== UPLOAD_ERR_OK) continue;
-        if ($files['size'][$i] > AUDIT_MAX_FILE_SIZE) continue;
-        $origName = basename($files['name'][$i]);
+        $origName = basename((string)$files['name'][$i]);
+        if ($files['error'][$i] !== UPLOAD_ERR_OK) {
+            // UPLOAD_ERR_NO_FILE is an empty slot in a multi-file input, not
+            // a failure — the user never picked anything there.
+            if ($files['error'][$i] !== UPLOAD_ERR_NO_FILE) {
+                $reject($origName, auditUploadErrorReason((int)$files['error'][$i]));
+            }
+            continue;
+        }
+        if ($files['size'][$i] > AUDIT_MAX_FILE_SIZE) {
+            $reject($origName, auditFormatBytes((int)$files['size'][$i]) . ' — over the '
+                . auditFormatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
+            continue;
+        }
         $ext = mb_strtolower(pathinfo($origName, PATHINFO_EXTENSION));
-        if (!in_array($ext, AUDIT_ALLOWED_EXT, true)) continue;
+        if (!in_array($ext, AUDIT_ALLOWED_EXT, true)) {
+            $reject($origName, ($ext !== '' ? '.' . $ext . ' files are' : 'that file type is')
+                . ' not accepted — use ' . implode(', ', AUDIT_ALLOWED_EXT));
+            continue;
+        }
         $finfo = new finfo(FILEINFO_MIME_TYPE);
         $mime  = $finfo->file($files['tmp_name'][$i]);
         $ok = AUDIT_ALLOWED_MIME[$ext] ?? [];
-        if (!in_array($mime, $ok, true)) continue;
-        $storedName = uniqid('aud_', true) . '.' . $ext;
-        if (move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
-            $args = [$responseId, $origName, $storedName, $mime, (int)$files['size'][$i], $uploaderCode];
-            if ($hasStage) $args[] = $stage;
-            $st->execute($args);
+        if (!in_array($mime, $ok, true)) {
+            $reject($origName, 'the contents are not a real .' . $ext . ' file');
+            continue;
         }
+        $storedName = uniqid('aud_', true) . '.' . $ext;
+        if (!move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
+            $reject($origName, 'the server could not store it — please try again');
+            continue;
+        }
+        $args = [$responseId, $origName, $storedName, $mime, (int)$files['size'][$i], $uploaderCode];
+        if ($hasStage) $args[] = $stage;
+        $st->execute($args);
+        $result['saved']++;
     }
+    return $result;
+}
+
+// Plain-English reason for a PHP upload error code. The size ones name the
+// server's own limit, because that is the number the user has to get under
+// and it is nowhere on screen otherwise.
+function auditUploadErrorReason(int $err): string {
+    switch ($err) {
+        case UPLOAD_ERR_INI_SIZE:
+            $lim = trim((string)ini_get('upload_max_filesize'));
+            return 'bigger than this server accepts in one file'
+                . ($lim !== '' ? ' (' . $lim . ')' : '');
+        case UPLOAD_ERR_FORM_SIZE:  return 'bigger than the form allows';
+        case UPLOAD_ERR_PARTIAL:    return 'the upload was cut off part-way — please try again';
+        case UPLOAD_ERR_NO_TMP_DIR:
+        case UPLOAD_ERR_CANT_WRITE:
+        case UPLOAD_ERR_EXTENSION:  return 'the server could not store it — please try again';
+    }
+    return 'the upload did not complete';
+}
+
+function auditFormatBytes(int $bytes): string {
+    if ($bytes >= 1024 * 1024) return round($bytes / 1024 / 1024, 1) . ' MB';
+    if ($bytes >= 1024)        return round($bytes / 1024) . ' KB';
+    return $bytes . ' B';
+}
+
+// One sentence naming every file that did not make it and why, for the
+// flash the uploader sees. Empty when everything saved.
+function auditRejectedFilesNote(array $rejected): string {
+    if (!$rejected) return '';
+    $parts = [];
+    foreach ($rejected as $r) {
+        $parts[] = $r['name'] . ' (' . $r['reason'] . ')';
+    }
+    return count($rejected) === 1
+        ? ' 1 file was NOT saved: ' . $parts[0] . '.'
+        : ' ' . count($rejected) . ' files were NOT saved: ' . implode('; ', $parts) . '.';
 }
 
 // ── History row ────────────────────────────────────────
@@ -892,6 +973,18 @@ function auditHasCwSnapshotCols(): bool {
         $cached = false;
     }
     return $cached;
+}
+
+// Which side of the audit a file came from on a database that has no
+// uploaded_stage column yet. Only two people ever attach anything to an
+// audit — the auditor who filed it and the Store Manager who justifies it
+// — so the uploader's code tells us which, and that beats defaulting
+// everything to 'auditor' and burying the store's proof.
+function auditDeriveAttachmentStage(array $att, string $storeManagerCode): string {
+    $stage = (string)($att['uploaded_stage'] ?? '');
+    if (in_array($stage, AUDIT_ATTACHMENT_STAGES, true)) return $stage;
+    $by = (string)($att['uploaded_by'] ?? '');
+    return ($storeManagerCode !== '' && $by === $storeManagerCode) ? 'store_manager' : 'auditor';
 }
 
 // Did 2026-09-11_audit_sm_verification_photos.sql run? Gates

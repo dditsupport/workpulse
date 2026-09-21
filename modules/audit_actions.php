@@ -262,6 +262,9 @@ function doSaveAuditWeights(): void {
         }
 
         // 2) Per-parameter: value, modified weight, remark, attachments
+        // Files the server refused, gathered across every parameter so the
+        // auditor is told rather than left to notice a missing photo later.
+        $uploadRejected = [];
         $paramVals   = $_POST['param_value']  ?? [];
         $paramMods   = $_POST['param_mod']    ?? [];
         $paramRemark = $_POST['param_remark'] ?? [];
@@ -397,7 +400,8 @@ function doSaveAuditWeights(): void {
                         'error'    => $orig['error'][$pid],
                         'size'     => $orig['size'][$pid],
                     ];
-                    auditSaveAttachments($auditId, $rid, myCode());
+                    $res = auditSaveAttachments($auditId, $rid, myCode());
+                    $uploadRejected = array_merge($uploadRejected, $res['rejected']);
                     unset($_FILES['attachments']);
                 }
             }
@@ -405,14 +409,19 @@ function doSaveAuditWeights(): void {
 
         $db->commit();
 
+        $dropped = auditRejectedFilesNote($uploadRejected);
+
         if (!empty($_POST['submit_after_save'])) {
+            // Hold the rejection notice over the submit handler's own flash
+            // so a dropped photo still reaches the auditor.
+            if ($dropped !== '') $_SESSION['audit_upload_notice'] = $dropped;
             doSubmitAudit($auditId);
             return;
         }
         auditRecalcTotalScore($auditId);
-        flash('success', $assignedNumber
+        flash($dropped !== '' ? 'error' : 'success', ($assignedNumber
             ? ('Saved. Audit number assigned: ' . $assignedNumber)
-            : 'Saved.');
+            : 'Saved.') . $dropped);
 
         // Section-stepper navigation. Any section is reachable at any
         // time — Next/Previous just move the pointer by one; they never
@@ -479,7 +488,11 @@ function doSubmitAudit(?int $auditId = null): void {
     if ($from === 'sent_back' && auditEnforceOpenPinsGate($auditId, 'audit_edit')) return;
     getDb()->prepare("UPDATE audits SET status='submitted', submitted_at=NOW() WHERE id=?")->execute([$auditId]);
     auditAddHistory($auditId, $from === 'sent_back' ? 'resubmit' : 'submit', myCode());
-    flash('success', 'Audit submitted.');
+    // A Save & Submit that dropped a photo hands its notice over here, so
+    // the auditor still learns about it on the one flash they get.
+    $dropped = (string)($_SESSION['audit_upload_notice'] ?? '');
+    unset($_SESSION['audit_upload_notice']);
+    flash($dropped !== '' ? 'error' : 'success', 'Audit submitted.' . $dropped);
     header('Location: ?page=audit_list');
 }
 
@@ -516,7 +529,13 @@ function doManagerReviewAudit(): void {
     // Photos of the verified work, attached per question alongside the
     // justification. Saved at the 'store_manager' stage so every reviewer
     // downstream can tell the store's proof from the auditor's evidence.
-    $photos = auditSaveManagerReviewFiles($auditId);
+    $upload   = auditSaveManagerReviewFiles($auditId);
+    $photos   = $upload['saved'];
+    // A photo the server refused is the whole point of the SM's visit, so
+    // it is never a footnote: the message says which file and why, and it
+    // comes through as an error even though the text saved fine.
+    $dropped  = auditRejectedFilesNote($upload['rejected']);
+    $flashCls = $dropped !== '' ? 'error' : 'success';
 
     if ($smAction === 'forward') {
         if (!auditValidateTransition('submitted', 'operation_review')) { header('Location: ?page=audit_list'); return; }
@@ -526,17 +545,19 @@ function doManagerReviewAudit(): void {
         if (auditEnforceOpenPinsGate($auditId, 'audit_manager_review')) return;
         $db->prepare("UPDATE audits SET status='operation_review', manager_reviewed_at=NOW() WHERE id = ?")->execute([$auditId]);
         if ($photos > 0) $summary[] = $photos . ' verification photo(s) attached';
+        if ($upload['rejected']) $summary[] = count($upload['rejected']) . ' photo(s) rejected on upload';
         auditAddHistory($auditId, 'sm_forward', myCode(), $summary ? implode(' | ', $summary) : 'No comments — forwarded as-is');
-        flash('success', 'Audit forwarded to Operation Team'
+        flash($flashCls, 'Audit forwarded to Operation Team'
             . ($filled > 0 ? ' with ' . $filled . ' justification(s)' : '')
-            . ($photos > 0 ? ($filled > 0 ? ' and ' : ' with ') . $photos . ' photo(s)' : '') . '.');
+            . ($photos > 0 ? ($filled > 0 ? ' and ' : ' with ') . $photos . ' photo(s)' : '') . '.' . $dropped);
         header('Location: ?page=audit_list');
         return;
     }
     if ($photos > 0) $summary[] = $photos . ' verification photo(s) attached';
+    if ($upload['rejected']) $summary[] = count($upload['rejected']) . ' photo(s) rejected on upload';
     auditAddHistory($auditId, 'manager_remark', myCode(), $summary ? implode(' | ', $summary) : 'Cleared comments');
-    flash('success', 'Justification saved'
-        . ($photos > 0 ? ' with ' . $photos . ' photo(s)' : '') . '. Forward when you are done.');
+    flash($flashCls, 'Justification saved'
+        . ($photos > 0 ? ' with ' . $photos . ' photo(s)' : '') . '. Forward when you are done.' . $dropped);
     header('Location: ?page=audit_manager_review&id=' . $auditId);
 }
 
@@ -546,8 +567,9 @@ function doManagerReviewAudit(): void {
 //
 // A question the auditor never answered has no response row to hang a file
 // on, so it is skipped — the upload box isn't rendered for those either.
-function auditSaveManagerReviewFiles(int $auditId): int {
-    if (empty($_FILES['sm_files']['name']) || !is_array($_FILES['sm_files']['name'])) return 0;
+function auditSaveManagerReviewFiles(int $auditId): array {
+    $out = ['saved' => 0, 'rejected' => []];
+    if (empty($_FILES['sm_files']['name']) || !is_array($_FILES['sm_files']['name'])) return $out;
     $db = getDb();
     $st = $db->prepare('SELECT parameter_id, id FROM audit_responses WHERE audit_id = ?');
     $st->execute([$auditId]);
@@ -556,8 +578,7 @@ function auditSaveManagerReviewFiles(int $auditId): int {
         $respByParam[(int)$row['parameter_id']] = (int)$row['id'];
     }
 
-    $saved = 0;
-    $orig  = $_FILES['sm_files'];
+    $orig = $_FILES['sm_files'];
     foreach (array_keys($orig['name']) as $pidRaw) {
         $pid = (int)$pidRaw;
         $rid = $respByParam[$pid] ?? 0;
@@ -575,21 +596,12 @@ function auditSaveManagerReviewFiles(int $auditId): int {
             'error'    => $orig['error'][$pid],
             'size'     => $orig['size'][$pid],
         ];
-        $before = auditCountResponseAttachments($rid);
-        auditSaveAttachments($auditId, $rid, myCode(), 'store_manager');
-        $saved += max(0, auditCountResponseAttachments($rid) - $before);
+        $res = auditSaveAttachments($auditId, $rid, myCode(), 'store_manager');
+        $out['saved']   += $res['saved'];
+        $out['rejected'] = array_merge($out['rejected'], $res['rejected']);
         unset($_FILES['attachments']);
     }
-    return $saved;
-}
-
-// How many files are currently attached to one response. Used to count
-// what an upload actually accepted — auditSaveAttachments() silently drops
-// anything oversized or of a disallowed type.
-function auditCountResponseAttachments(int $responseId): int {
-    $st = getDb()->prepare('SELECT COUNT(*) FROM audit_response_attachments WHERE response_id = ?');
-    $st->execute([$responseId]);
-    return (int)$st->fetchColumn();
+    return $out;
 }
 
 // Record the desks a higher-level decision passed over.
@@ -1070,9 +1082,9 @@ function doDeleteAuditAttachment(): void {
     $a = auditGetById($auditId);
     if (!$a) { flash('error', 'Audit not found.'); header('Location: ?page=audit_list'); return; }
     $db = getDb();
-    $stageCol = auditHasAttachmentStageCol() ? 'aa.uploaded_stage' : "'auditor' AS uploaded_stage";
+    $stageCol = auditHasAttachmentStageCol() ? 'aa.uploaded_stage' : "'' AS uploaded_stage";
     $st = $db->prepare(
-        "SELECT aa.stored_name, {$stageCol}
+        "SELECT aa.stored_name, aa.uploaded_by, {$stageCol}
          FROM audit_response_attachments aa
          JOIN audit_responses r ON r.id = aa.response_id
          WHERE aa.id = ? AND r.audit_id = ?");
@@ -1080,7 +1092,9 @@ function doDeleteAuditAttachment(): void {
     $row = $st->fetch(PDO::FETCH_ASSOC);
     if (!$row) { header('Location: ?page=audit_view&id=' . $auditId); return; }
 
-    $stage = (string)($row['uploaded_stage'] ?? 'auditor');
+    // Same derivation the tree uses, so what the × is offered on and what
+    // this gate allows can never disagree on an un-migrated database.
+    $stage = auditDeriveAttachmentStage($row, (string)($a['store_manager_code'] ?? ''));
     $isSm  = $stage === 'store_manager';
     $back  = $isSm ? 'audit_manager_review' : 'audit_edit';
     $allowed = $isSm
