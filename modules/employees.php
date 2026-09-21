@@ -126,6 +126,12 @@ function pageEmployees(): void {
 
     $employees = getEmployees($search, $statuses, $deptIds, $location, $activeFlags);
 
+    // Document counts for the personnel-file link on each row. One query
+    // for the whole page, and an empty array when the caller has no access
+    // to the archive (or it has not been migrated yet).
+    $docCounts = (function_exists('empDocCanView') && empDocCanView())
+        ? empDocCountsByEmployee() : [];
+
     $exportQs = http_build_query([
         'page'     => 'export_employees_csv',
         'filter'   => 1,
@@ -214,6 +220,12 @@ function pageEmployees(): void {
             <?php if (canManageEmployees()): ?>
             <td class="actions">
                 <a href="?page=edit&id=<?= $e['id'] ?>" class="btn btn-sm btn-secondary">Edit</a>
+                <?php if (function_exists('empDocCanView') && empDocCanView()): ?>
+                <a href="?page=employee_docs&emp=<?= $e['id'] ?>" class="btn btn-sm btn-ghost"
+                   title="Resume, government documents, interview sheet — kept after they leave">
+                    Docs<?= isset($docCounts[(int)$e['id']]) ? ' (' . (int)$docCounts[(int)$e['id']] . ')' : '' ?>
+                </a>
+                <?php endif; ?>
                 <form method="POST" class="inline-form"
                       onsubmit="return confirm('<?= $e['is_active'] ? 'Deactivate' : 'Activate' ?> this employee?')">
                     <input type="hidden" name="action"    value="toggle_active">
@@ -403,6 +415,9 @@ function pageEmpForm(?array $emp): void {
     <div class="form-actions">
         <button type="submit" class="btn btn-primary"><?= $isEdit ? 'Save Changes' : 'Create Employee' ?></button>
         <a href="?page=employees" class="btn btn-ghost">Cancel</a>
+        <?php if ($isEdit && function_exists('empDocCanView') && empDocCanView()): ?>
+        <a href="?page=employee_docs&emp=<?= (int)$emp['id'] ?>" class="btn btn-secondary">Documents</a>
+        <?php endif; ?>
     </div>
 </form>
 </div>

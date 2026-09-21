@@ -754,6 +754,8 @@ function navIcon(string $name): string {
         'store_ops'    => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 7 1.5-3a2 2 0 0 1 1.8-1h13.4a2 2 0 0 1 1.8 1L22 7"/><path d="M2 7v2a3 3 0 0 0 5 2.2A3 3 0 0 0 12 9.2 3 3 0 0 0 17 11.2 3 3 0 0 0 22 9V7"/><path d="M4 11v9a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-9"/><path d="M9 21v-5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v5"/></svg>',
         'comments'     => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
         'summary'      => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><polyline points="3 6 21 6"/><polyline points="3 18 14 18"/></svg>',
+        // Personnel file — the employee document archive.
+        'folder'       => '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><line x1="8" y1="14" x2="16" y2="14"/></svg>',
     ];
     return $icons[$name] ?? '';
 }

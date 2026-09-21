@@ -15,6 +15,10 @@ $txnGroups = [
                            'txn_manage_passwords' => 'Passwords', 'txn_settings' => 'Settings',
                            'txn_dept_roles' => 'Roles', 'txn_dependencies' => 'Dependencies'],
     'HRMS'             => ['txn_employees' => 'Employees', 'txn_departments' => 'Departments',
+                           // The personnel file: resume, government ID, interview
+                           // sheet — kept after the employee leaves. Deliberately
+                           // separate from txn_employees.
+                           'txn_employee_docs' => 'Employee Documents',
                            'txn_locations' => 'Locations', 'txn_attendance' => 'Attendance',
                            'txn_approve_punches' => 'Approve Punches', 'txn_failed_punches' => 'Punch Issues'],
     'Ticket Management' => ['txn_issues' => 'View Tickets', 'txn_create_issue' => 'Create Ticket',
