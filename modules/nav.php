@@ -35,6 +35,7 @@ function buildNav(): array {
         ['group' => 'HRMS', 'items' => [
             ['page' => 'departments',       'icon' => navIcon('departments'), 'label' => 'Departments'],
             ['page' => 'employees',         'icon' => navIcon('employees'),   'label' => 'Employees'],
+            ['page' => 'employee_docs',     'icon' => navIcon('folder'),      'label' => 'Employee Documents'],
             ['page' => 'locations',         'icon' => navIcon('locations'),   'label' => 'Locations'],
             ['page' => 'attendance',        'icon' => navIcon('attendance'),  'label' => 'Attendance'],
             ['page' => 'odd_punches',       'icon' => navIcon('alert'),       'label' => 'Odd Punch Report'],
@@ -138,6 +139,10 @@ function buildNav(): array {
     $hrms = [];
     if (hasTxn('departments'))     $hrms[] = ['page' => 'departments',     'icon' => navIcon('departments'), 'label' => 'Departments'];
     if (hasTxn('employees'))       $hrms[] = ['page' => 'employees',       'icon' => navIcon('employees'),   'label' => 'Employees'];
+    // The personnel file (resume, government ID, interview sheet). Its own
+    // flag, not txn_employees: it is a narrower thing than the employee
+    // master, and it keeps reading after the employee has left.
+    if (hasTxn('employee_docs')) $hrms[] = ['page' => 'employee_docs', 'icon' => navIcon('folder'), 'label' => 'Employee Documents'];
     if (hasTxn('locations'))       $hrms[] = ['page' => 'locations',       'icon' => navIcon('locations'),   'label' => 'Locations'];
     // Odd Punch Report reads the same punches as Attendance, so it rides the
     // same transaction instead of needing a new flag on every role.
@@ -314,6 +319,11 @@ function allowedPages(): array {
     }
     if (hasTxn('employees')) {
         $pages = array_merge($pages, ['create','edit','export_employees_csv']);
+    }
+    // Employee documents — the list is the nav entry; the upload form and
+    // the file stream are its sub-pages. Both re-check the flag themselves.
+    if (function_exists('empDocCanView') && empDocCanView()) {
+        $pages = array_merge($pages, ['employee_docs','employee_doc_upload','employee_doc_file']);
     }
     if (hasTxn('locations')) {
         $pages = array_merge($pages, ['add_location','edit_location']);
@@ -859,6 +869,9 @@ function dispatchPage(string $page): void {
         case 'employees':       pageEmployees();  break;
         case 'create':          pageEmpForm(null); break;
         case 'edit':            pageEmpForm(getEmployee((int)($_GET['id'] ?? 0))); break;
+        case 'employee_docs':       if (function_exists('pageEmployeeDocs'))      pageEmployeeDocs();      break;
+        case 'employee_doc_upload': if (function_exists('pageEmployeeDocUpload')) pageEmployeeDocUpload(); break;
+        case 'employee_doc_file':   if (function_exists('empDocServeFile'))       empDocServeFile();       break;
         case 'attendance':      pageAttendance(); break;
         case 'odd_punches':     pageOddPunches(); break;
         case 'mypunches':       pageMyPunches();  break;
