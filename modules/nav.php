@@ -320,10 +320,12 @@ function allowedPages(): array {
     if (hasTxn('employees')) {
         $pages = array_merge($pages, ['create','edit','export_employees_csv']);
     }
-    // Employee documents — the list is the nav entry; the upload form and
-    // the file stream are its sub-pages. Both re-check the flag themselves.
+    // Employee documents — the archive is the nav entry; the upload form,
+    // the file stream and the past-employee master (the people with no
+    // `employees` row) are its sub-pages, each re-checking the flag itself.
     if (function_exists('empDocCanView') && empDocCanView()) {
-        $pages = array_merge($pages, ['employee_docs','employee_doc_upload','employee_doc_file']);
+        $pages = array_merge($pages, ['employee_docs','employee_doc_upload','employee_doc_file',
+            'past_employees','past_employee_form','past_employees_sample']);
     }
     if (hasTxn('locations')) {
         $pages = array_merge($pages, ['add_location','edit_location']);
@@ -872,6 +874,9 @@ function dispatchPage(string $page): void {
         case 'employee_docs':       if (function_exists('pageEmployeeDocs'))      pageEmployeeDocs();      break;
         case 'employee_doc_upload': if (function_exists('pageEmployeeDocUpload')) pageEmployeeDocUpload(); break;
         case 'employee_doc_file':   if (function_exists('empDocServeFile'))       empDocServeFile();       break;
+        case 'past_employees':      if (function_exists('pagePastEmployees'))     pagePastEmployees();     break;
+        case 'past_employee_form':  if (function_exists('pagePastEmployeeForm')) pagePastEmployeeForm(); break;
+        case 'past_employees_sample': if (function_exists('doPastEmployeesSampleCsv')) doPastEmployeesSampleCsv(); break;
         case 'attendance':      pageAttendance(); break;
         case 'odd_punches':     pageOddPunches(); break;
         case 'mypunches':       pageMyPunches();  break;

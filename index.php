@@ -66,7 +66,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_odd_punches','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_sample','dc_download_zip','dc_export_answers','employee_doc_file'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_odd_punches','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_sample','dc_download_zip','dc_export_answers','employee_doc_file','past_employees_sample'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
@@ -119,6 +119,11 @@ function routePost(string $a): void {
         case 'upload_employee_doc':  if (function_exists('doUploadEmployeeDocs'))  doUploadEmployeeDocs();  break;
         case 'delete_employee_doc':  if (function_exists('doDeleteEmployeeDoc'))   doDeleteEmployeeDoc();   break;
         case 'restore_employee_doc': if (function_exists('doRestoreEmployeeDoc'))  doRestoreEmployeeDoc();  break;
+        // Past-employee master — the people the archive holds paperwork for
+        // who have no employees row (they left before this system).
+        case 'save_past_employee':    if (function_exists('doSavePastEmployee'))     doSavePastEmployee();     break;
+        case 'del_past_employee':     if (function_exists('doDelPastEmployee'))      doDelPastEmployee();      break;
+        case 'import_past_employees': if (function_exists('doImportPastEmployees'))  doImportPastEmployees();  break;
         // Locations (superadmin or locations txn)
         case 'save_location':   if (isSuperadmin() || hasTxn('locations')) doSaveLocation();   break;
         case 'del_location':    if (isSuperadmin() || hasTxn('locations')) doDelLocation();    break;
