@@ -513,6 +513,11 @@ function doManagerReviewAudit(): void {
         if ($clean !== '') { $filled++; $summary[] = 'P#' . (int)$pid . ': ' . mb_substr($clean, 0, 80); }
     }
 
+    // Photos of the verified work, attached per question alongside the
+    // justification. Saved at the 'store_manager' stage so every reviewer
+    // downstream can tell the store's proof from the auditor's evidence.
+    $photos = auditSaveManagerReviewFiles($auditId);
+
     if ($smAction === 'forward') {
         if (!auditValidateTransition('submitted', 'operation_review')) { header('Location: ?page=audit_list'); return; }
         // Send-back agenda gate: if Ops (or anyone in a prior cycle) left
@@ -520,14 +525,118 @@ function doManagerReviewAudit(): void {
         // before forwarding.
         if (auditEnforceOpenPinsGate($auditId, 'audit_manager_review')) return;
         $db->prepare("UPDATE audits SET status='operation_review', manager_reviewed_at=NOW() WHERE id = ?")->execute([$auditId]);
-        auditAddHistory($auditId, 'sm_forward', myCode(), $filled > 0 ? implode(' | ', $summary) : 'No comments — forwarded as-is');
-        flash('success', 'Audit forwarded to Operation Team' . ($filled > 0 ? ' with ' . $filled . ' justification(s).' : '.'));
+        if ($photos > 0) $summary[] = $photos . ' verification photo(s) attached';
+        auditAddHistory($auditId, 'sm_forward', myCode(), $summary ? implode(' | ', $summary) : 'No comments — forwarded as-is');
+        flash('success', 'Audit forwarded to Operation Team'
+            . ($filled > 0 ? ' with ' . $filled . ' justification(s)' : '')
+            . ($photos > 0 ? ($filled > 0 ? ' and ' : ' with ') . $photos . ' photo(s)' : '') . '.');
         header('Location: ?page=audit_list');
         return;
     }
-    auditAddHistory($auditId, 'manager_remark', myCode(), $filled > 0 ? implode(' | ', $summary) : 'Cleared comments');
-    flash('success', 'Justification saved. Forward when you are done.');
+    if ($photos > 0) $summary[] = $photos . ' verification photo(s) attached';
+    auditAddHistory($auditId, 'manager_remark', myCode(), $summary ? implode(' | ', $summary) : 'Cleared comments');
+    flash('success', 'Justification saved'
+        . ($photos > 0 ? ' with ' . $photos . ' photo(s)' : '') . '. Forward when you are done.');
     header('Location: ?page=audit_manager_review&id=' . $auditId);
+}
+
+// Move the Store Manager's per-question uploads off $_FILES['sm_files']
+// and onto the matching audit_responses row. Returns how many files were
+// accepted so the caller can say so in the history trail.
+//
+// A question the auditor never answered has no response row to hang a file
+// on, so it is skipped — the upload box isn't rendered for those either.
+function auditSaveManagerReviewFiles(int $auditId): int {
+    if (empty($_FILES['sm_files']['name']) || !is_array($_FILES['sm_files']['name'])) return 0;
+    $db = getDb();
+    $st = $db->prepare('SELECT parameter_id, id FROM audit_responses WHERE audit_id = ?');
+    $st->execute([$auditId]);
+    $respByParam = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $row) {
+        $respByParam[(int)$row['parameter_id']] = (int)$row['id'];
+    }
+
+    $saved = 0;
+    $orig  = $_FILES['sm_files'];
+    foreach (array_keys($orig['name']) as $pidRaw) {
+        $pid = (int)$pidRaw;
+        $rid = $respByParam[$pid] ?? 0;
+        if (!$rid) continue;
+        // Each entry is the multi-file array the [] in the field name
+        // produces. Anything else is a hand-built request, not our form.
+        if (!is_array($orig['name'][$pid] ?? null)) continue;
+        if (empty($orig['name'][$pid][0])) continue;
+        // auditSaveAttachments() reads the one-file-set shape, so reshape
+        // this parameter's slice of the array-of-arrays into it.
+        $_FILES['attachments'] = [
+            'name'     => $orig['name'][$pid],
+            'type'     => $orig['type'][$pid],
+            'tmp_name' => $orig['tmp_name'][$pid],
+            'error'    => $orig['error'][$pid],
+            'size'     => $orig['size'][$pid],
+        ];
+        $before = auditCountResponseAttachments($rid);
+        auditSaveAttachments($auditId, $rid, myCode(), 'store_manager');
+        $saved += max(0, auditCountResponseAttachments($rid) - $before);
+        unset($_FILES['attachments']);
+    }
+    return $saved;
+}
+
+// How many files are currently attached to one response. Used to count
+// what an upload actually accepted — auditSaveAttachments() silently drops
+// anything oversized or of a disallowed type.
+function auditCountResponseAttachments(int $responseId): int {
+    $st = getDb()->prepare('SELECT COUNT(*) FROM audit_response_attachments WHERE response_id = ?');
+    $st->execute([$responseId]);
+    return (int)$st->fetchColumn();
+}
+
+// Record the desks a higher-level decision passed over.
+//
+// Each bypassed stage is stamped with the person who superseded it and the
+// moment they did, so approved_at and the actor columns stay populated and
+// every report that reads them keeps working. audits.skipped_stages then
+// says which of those stamps came from a skip rather than a real review,
+// so no screen has to claim the Operation Team looked at an audit it never
+// saw. One history row per bypassed stage spells it out in the trail.
+//
+// Returns the stage labels that were skipped, for the caller's flash.
+function auditStampSkippedStages(PDO $db, int $auditId, string $from, string $actingStage, string $byCode): array {
+    $skipped = auditStagesSkipped($from, $actingStage);
+    if (!$skipped) return [];
+    $actor  = auditStageLabel($actingStage);
+    $labels = [];
+    foreach ($skipped as $stage) {
+        $labels[] = auditStageLabel($stage);
+        if ($stage === 'operation_review') {
+            $db->prepare('UPDATE audits SET operation_code = ?, operation_reviewed_at = NOW() WHERE id = ?')
+               ->execute([$byCode, $auditId]);
+        } elseif ($stage === 'approver_review') {
+            $db->prepare('UPDATE audits SET approver_code = ?, approved_at = NOW(), approver_reviewed_at = NOW() WHERE id = ?')
+               ->execute([$byCode, $auditId]);
+        }
+        auditAddHistory($auditId, 'stage_skipped', $byCode,
+            auditStageLabel($stage) . ' step skipped — settled at ' . $actor . ' level');
+    }
+    if (auditHasSkipStagesCol()) {
+        // Merge rather than overwrite: an audit sent back and re-approved
+        // can pass over a desk more than once, and each is worth keeping.
+        $st = $db->prepare('SELECT skipped_stages FROM audits WHERE id = ?');
+        $st->execute([$auditId]);
+        $merged = array_values(array_unique(array_merge(
+            auditSkippedStages(['skipped_stages' => (string)$st->fetchColumn()]), $skipped)));
+        $db->prepare('UPDATE audits SET skipped_stages = ? WHERE id = ?')
+           ->execute([implode(',', $merged), $auditId]);
+    }
+    return $labels;
+}
+
+// Trailing clause for the flash on a decision that passed desks over.
+function auditSkipNote(array $labels): string {
+    if (!$labels) return '';
+    return ' ' . implode(' and ', $labels) . ' review'
+        . (count($labels) === 1 ? '' : 's') . ' skipped.';
 }
 
 // Helper used by every forward handler: returns true (and emits a flash +
@@ -554,7 +663,9 @@ function doOperationReviewAudit(): void {
     if (!auditCanOperationReview()) { header('Location: ?page=audit_list'); return; }
     $auditId = (int)($_POST['audit_id'] ?? 0);
     $a = auditGetById($auditId);
-    if (!$a || $a['status'] !== 'operation_review') {
+    // The lowest review desk, so this is always its own queue — the shared
+    // gate just keeps every handler reading the same way.
+    if (!$a || !auditCanReviewAtStage($a, 'operation_review')) {
         flash('error', 'Audit not ready for Operation Team review.');
         header('Location: ?page=audit_list'); return;
     }
@@ -610,11 +721,14 @@ function doApproveAudit(): void {
     if (!auditCanApprove()) { header('Location: ?page=audit_list'); return; }
     $auditId = (int)($_POST['audit_id'] ?? 0);
     $a = auditGetById($auditId);
-    if (!$a || $a['status'] !== 'approver_review') {
+    // Own queue, or an audit still sitting with the Operation Team — the
+    // Approver's decision stands in for that step.
+    if (!$a || !auditCanReviewAtStage($a, 'approver_review')) {
         flash('error', 'Audit not ready for approval.');
         header('Location: ?page=audit_list');
         return;
     }
+    $from = (string)$a['status'];
     $decision = $_POST['decision'] ?? 'approve';
     $remarks  = $_POST['approver_remark'] ?? [];
     $db = getDb();
@@ -657,6 +771,12 @@ function doApproveAudit(): void {
     }
 
     if ($decision === 'send_back_ops') {
+        // Only meaningful from the Approver's own queue — an audit the
+        // Approver picked up early is still with Ops, nothing to send back.
+        if ($from !== 'approver_review') {
+            flash('error', 'This audit is still with the Operation Team — there is nothing to send back.');
+            header('Location: ?page=audit_approve&id=' . $auditId); return;
+        }
         if ($flagged === 0) { flash('error', 'Add a remark on at least one parameter before sending back.'); header('Location: ?page=audit_approve&id=' . $auditId); return; }
         if (!auditValidateTransition('approver_review', 'operation_review')) { header('Location: ?page=audit_list'); return; }
         $db->prepare("UPDATE audits SET status='operation_review' WHERE id = ?")->execute([$auditId]);
@@ -668,12 +788,13 @@ function doApproveAudit(): void {
     // Default: approve & forward to Management. We stamp approver_code +
     // approved_at + approver_reviewed_at here; management_approved_at is
     // stamped at the final approve step in doManagementApproveAudit.
-    if (!auditValidateTransition('approver_review', 'management_review')) { header('Location: ?page=audit_list'); return; }
+    if (!auditValidateAdvance($from, 'management_review')) { header('Location: ?page=audit_list'); return; }
     if (auditEnforceOpenPinsGate($auditId, 'audit_approve')) return;
+    $skipped = auditStampSkippedStages($db, $auditId, $from, 'approver_review', myCode());
     $db->prepare("UPDATE audits SET status='management_review', approver_code=?, approved_at=NOW(), approver_reviewed_at=NOW() WHERE id = ?")
        ->execute([myCode(), $auditId]);
     auditAddHistory($auditId, 'approver_forward', myCode(), $flagged > 0 ? implode(' | ', $flaggedSummary) : null);
-    flash('success', 'Audit forwarded to Management for final approval.');
+    flash('success', 'Audit forwarded to Management for final approval.' . auditSkipNote($skipped));
     header('Location: ?page=audit_list');
 }
 
@@ -684,10 +805,13 @@ function doManagementApproveAudit(): void {
     if (!auditCanManagementReview()) { header('Location: ?page=audit_list'); return; }
     $auditId = (int)($_POST['audit_id'] ?? 0);
     $a = auditGetById($auditId);
-    if (!$a || $a['status'] !== 'management_review') {
+    // Own queue, or any earlier desk — the final approval settles the
+    // steps it passes over.
+    if (!$a || !auditCanReviewAtStage($a, 'management_review')) {
         flash('error', 'Audit not ready for Management review.');
         header('Location: ?page=audit_list'); return;
     }
+    $from = (string)$a['status'];
     $decision = $_POST['decision'] ?? 'approve';
     $remarks  = $_POST['management_remark'] ?? [];
     $db = getDb();
@@ -701,21 +825,39 @@ function doManagementApproveAudit(): void {
     }
 
     if ($decision === 'send_back_approver') {
-        if ($flagged === 0) { flash('error', 'Add a remark on at least one parameter before sending back.'); header('Location: ?page=audit_management_review&id=' . $auditId); return; }
-        if (!auditValidateTransition('management_review', 'approver_review')) { header('Location: ?page=audit_list'); return; }
+        // From Management's own queue this hands the audit back a step, and
+        // a send-back needs an agenda. From the Operation desk the same
+        // button means "let the Approver have it rather than approving now",
+        // which is a forward pass and needs no remark — Ops forwarding
+        // doesn't either. An audit already with the Approver has nowhere to
+        // go: both readings land it where it already is.
+        $isSendBack = $from === 'management_review';
+        if ($from === 'approver_review') {
+            flash('error', 'This audit is already with the Approver — there is nothing to send back.');
+            header('Location: ?page=audit_management_review&id=' . $auditId); return;
+        }
+        if ($isSendBack && $flagged === 0) {
+            flash('error', 'Add a remark on at least one parameter before sending back.');
+            header('Location: ?page=audit_management_review&id=' . $auditId); return;
+        }
+        if (!auditValidateAdvance($from, 'approver_review')) { header('Location: ?page=audit_list'); return; }
         $db->prepare("UPDATE audits SET status='approver_review' WHERE id = ?")->execute([$auditId]);
-        auditAddHistory($auditId, 'mgmt_sendback_approver', myCode(), 'To Approver — ' . implode(' | ', $flaggedSummary));
-        flash('success', 'Audit sent back to the Approver.');
+        auditAddHistory($auditId, $isSendBack ? 'mgmt_sendback_approver' : 'mgmt_pass_approver', myCode(),
+            'To Approver — ' . ($flaggedSummary ? implode(' | ', $flaggedSummary) : 'no comments'));
+        flash('success', $isSendBack
+            ? 'Audit sent back to the Approver.'
+            : 'Audit passed to the Approver.');
         header('Location: ?page=audit_list');
         return;
     }
     // Final approve.
-    if (!auditValidateTransition('management_review', 'approved')) { header('Location: ?page=audit_list'); return; }
+    if (!auditValidateAdvance($from, 'approved')) { header('Location: ?page=audit_list'); return; }
     if (auditEnforceOpenPinsGate($auditId, 'audit_management_review')) return;
+    $skipped = auditStampSkippedStages($db, $auditId, $from, 'management_review', myCode());
     $db->prepare("UPDATE audits SET status='approved', management_code=?, management_approved_at=NOW() WHERE id = ?")
        ->execute([myCode(), $auditId]);
     auditAddHistory($auditId, 'management_approve', myCode(), $flagged > 0 ? implode(' | ', $flaggedSummary) : null);
-    flash('success', 'Audit approved by Management. Workflow complete.');
+    flash('success', 'Audit approved by Management. Workflow complete.' . auditSkipNote($skipped));
     header('Location: ?page=audit_list');
 }
 
@@ -917,32 +1059,50 @@ function doCorrectAudit(): void {
 // ===========================================================
 // POST: delete_audit_attachment
 // ===========================================================
+// Two people can delete a file, each only their own side of the audit:
+// the auditor clears evidence while the audit is still theirs to edit, and
+// the Store Manager removes a verification photo while the audit sits in
+// their justify queue. Neither can touch the other's files, and once the
+// audit moves on nobody can.
 function doDeleteAuditAttachment(): void {
     $auditId = (int)($_POST['audit_id'] ?? 0);
     $attId   = (int)($_POST['att_id']   ?? 0);
     $a = auditGetById($auditId);
-    if (!$a || !auditCanEditRow($a)) { flash('error', 'Cannot modify this audit.'); header('Location: ?page=audit_list'); return; }
+    if (!$a) { flash('error', 'Audit not found.'); header('Location: ?page=audit_list'); return; }
     $db = getDb();
+    $stageCol = auditHasAttachmentStageCol() ? 'aa.uploaded_stage' : "'auditor' AS uploaded_stage";
     $st = $db->prepare(
-        'SELECT aa.stored_name
+        "SELECT aa.stored_name, {$stageCol}
          FROM audit_response_attachments aa
          JOIN audit_responses r ON r.id = aa.response_id
-         WHERE aa.id = ? AND r.audit_id = ?');
+         WHERE aa.id = ? AND r.audit_id = ?");
     $st->execute([$attId, $auditId]);
     $row = $st->fetch(PDO::FETCH_ASSOC);
-    if ($row) {
-        $path = auditAttachmentPath($auditId, null, (string)$row['stored_name']);
-        if ($path) @unlink($path);
-        // Drop any annotation pins on this attachment first (the FK on
-        // audit_image_pin_comments.pin_id cascades comments automatically).
-        // Wrapped in try/catch so a pre-migration DB (table missing) still
-        // lets the attachment delete go through.
-        try {
-            $db->prepare('DELETE FROM audit_image_pins WHERE attachment_id = ?')->execute([$attId]);
-        } catch (Exception $e) { /* pre-migration DB — table missing, ignore */ }
-        $db->prepare('DELETE FROM audit_response_attachments WHERE id = ?')->execute([$attId]);
+    if (!$row) { header('Location: ?page=audit_view&id=' . $auditId); return; }
+
+    $stage = (string)($row['uploaded_stage'] ?? 'auditor');
+    $isSm  = $stage === 'store_manager';
+    $back  = $isSm ? 'audit_manager_review' : 'audit_edit';
+    $allowed = $isSm
+        ? (auditHasManagerReviewCols() && auditCanManagerReview($a))
+        : auditCanEditRow($a);
+    if (!$allowed) {
+        flash('error', $isSm
+            ? 'Verification photos can only be removed by the Store Manager while the audit is in their queue.'
+            : 'Cannot modify this audit.');
+        header('Location: ?page=audit_view&id=' . $auditId); return;
     }
-    header('Location: ?page=audit_edit&id=' . $auditId);
+    $path = auditAttachmentPath($auditId, null, (string)$row['stored_name']);
+    if ($path) @unlink($path);
+    // Drop any annotation pins on this attachment first (the FK on
+    // audit_image_pin_comments.pin_id cascades comments automatically).
+    // Wrapped in try/catch so a pre-migration DB (table missing) still
+    // lets the attachment delete go through.
+    try {
+        $db->prepare('DELETE FROM audit_image_pins WHERE attachment_id = ?')->execute([$attId]);
+    } catch (Exception $e) { /* pre-migration DB — table missing, ignore */ }
+    $db->prepare('DELETE FROM audit_response_attachments WHERE id = ?')->execute([$attId]);
+    header('Location: ?page=' . $back . '&id=' . $auditId);
 }
 
 // ===========================================================

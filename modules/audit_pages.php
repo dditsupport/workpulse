@@ -382,9 +382,17 @@ function pageAuditList(): void {
                         <?php
                         $canEdit    = auditCanEditRow($a);
                         $canSmRev   = auditCanManagerReview($a) && auditHasManagerReviewCols();
-                        $canOps     = auditCanOperationReview() && $a['status'] === 'operation_review';
-                        $canApprove = auditCanApprove()         && $a['status'] === 'approver_review';
-                        $canMgmt    = auditCanManagementReview() && $a['status'] === 'management_review';
+                        // Each reviewer sees their own desk, and any desk
+                        // beneath it that the audit is still waiting at —
+                        // acting there settles the ones passed over, so the
+                        // button says so.
+                        $canOps     = auditCanReviewAtStage($a, 'operation_review');
+                        $canApprove = auditCanReviewAtStage($a, 'approver_review');
+                        $canMgmt    = auditCanReviewAtStage($a, 'management_review');
+                        $skipTag    = function (string $stage) use ($a) {
+                            $names = array_map('auditStageLabel', auditStagesSkipped((string)$a['status'], $stage));
+                            return $names ? ' (skip ' . implode(', ', $names) . ')' : '';
+                        };
                         ?>
                         <?php if ($canEdit): ?>
                             <?php
@@ -399,9 +407,9 @@ function pageAuditList(): void {
                         <?php elseif ($canOps): ?>
                             <a class="btn btn-sm btn-primary" href="?page=audit_operation_review&id=<?= (int)$a['id'] ?>">Operation Review</a>
                         <?php elseif ($canApprove): ?>
-                            <a class="btn btn-sm btn-success" href="?page=audit_approve&id=<?= (int)$a['id'] ?>">Approve</a>
+                            <a class="btn btn-sm btn-success" href="?page=audit_approve&id=<?= (int)$a['id'] ?>">Approve<?= h($skipTag('approver_review')) ?></a>
                         <?php elseif ($canMgmt): ?>
-                            <a class="btn btn-sm btn-success" href="?page=audit_management_review&id=<?= (int)$a['id'] ?>">Management Review</a>
+                            <a class="btn btn-sm btn-success" href="?page=audit_management_review&id=<?= (int)$a['id'] ?>">Management Review<?= h($skipTag('management_review')) ?></a>
                         <?php else: ?>
                             <a class="btn btn-sm btn-secondary" href="?page=audit_view&id=<?= (int)$a['id'] ?>">View</a>
                         <?php endif; ?>
@@ -1187,13 +1195,16 @@ function pageAuditApprove(): void {
     $id = (int)($_GET['id'] ?? 0);
     $a  = $id > 0 ? auditGetById($id) : null;
     if (!$a) { echo '<p>Audit not found.</p>'; return; }
-    if ($a['status'] !== 'approver_review') {
+    if (!auditCanReviewAtStage($a, 'approver_review')) {
         header('Location: ?page=audit_view&id=' . $id);
         exit;
     }
+    $from    = (string)$a['status'];
+    $skipping = auditStagesSkipped($from, 'approver_review');
     $tree = auditGetTree($id, (int)$a['template_id']);
     renderAuditHeader($a);
     renderOpenPinsBanner($a);
+    renderSkipAheadBanner($skipping, 'Approving here');
     ?>
     <form method="POST" id="auditApproveForm">
         <input type="hidden" name="action" value="approve_audit">
@@ -1206,11 +1217,15 @@ function pageAuditApprove(): void {
                     border-radius:8px 8px 0 0;
                     box-shadow:0 -6px 18px rgba(0,0,0,.45);
                     display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-            <button class="btn btn-success" type="submit" name="decision" value="approve">Approve &amp; Forward to Management</button>
-            <button class="btn btn-danger"  type="submit" name="decision" value="send_back_ops"
-                    title="Send back to the Operation Team for re-review">
-                Send Back to Operation Team
+            <button class="btn btn-success" type="submit" name="decision" value="approve">
+                <?= $skipping ? 'Approve &amp; Forward to Management (skip ' . h(implode(', ', array_map('auditStageLabel', $skipping))) . ')' : 'Approve &amp; Forward to Management' ?>
             </button>
+            <?php if (!$skipping): ?>
+                <button class="btn btn-danger"  type="submit" name="decision" value="send_back_ops"
+                        title="Send back to the Operation Team for re-review">
+                    Send Back to Operation Team
+                </button>
+            <?php endif; ?>
             <a class="btn btn-ghost" href="?page=audit_list" style="margin-left:auto">Back</a>
         </div>
     </form>
@@ -1278,13 +1293,16 @@ function pageAuditManagementReview(): void {
     $id = (int)($_GET['id'] ?? 0);
     $a  = $id > 0 ? auditGetById($id) : null;
     if (!$a) { echo '<p>Audit not found.</p>'; return; }
-    if ($a['status'] !== 'management_review') {
+    if (!auditCanReviewAtStage($a, 'management_review')) {
         flash('error', 'Audit not in Management queue.');
         header('Location: ?page=audit_view&id=' . $id); return;
     }
+    $from     = (string)$a['status'];
+    $skipping = auditStagesSkipped($from, 'management_review');
     $tree = auditGetTree($id, (int)$a['template_id']);
     renderAuditHeader($a);
     renderOpenPinsBanner($a);
+    renderSkipAheadBanner($skipping, 'Final-approving here');
     ?>
     <form method="POST" id="auditMgmtReviewForm">
         <input type="hidden" name="action" value="management_approve_audit">
@@ -1297,14 +1315,37 @@ function pageAuditManagementReview(): void {
                     border-radius:8px 8px 0 0;
                     box-shadow:0 -6px 18px rgba(0,0,0,.45);
                     display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-            <button class="btn btn-success" type="submit" name="decision" value="approve">Final Approve</button>
-            <button class="btn btn-danger"  type="submit" name="decision" value="send_back_approver"
-                    title="Send back to the Approver for re-review">
-                Send Back to Approver
+            <button class="btn btn-success" type="submit" name="decision" value="approve">
+                <?= $skipping ? 'Final Approve (skip ' . h(implode(', ', array_map('auditStageLabel', $skipping))) . ')' : 'Final Approve' ?>
             </button>
+            <?php if ($from !== 'approver_review'): ?>
+                <button class="btn btn-danger"  type="submit" name="decision" value="send_back_approver"
+                        title="<?= $from === 'management_review' ? 'Send back to the Approver for re-review' : 'Let the Approver review it instead of approving now' ?>">
+                    <?= $from === 'management_review' ? 'Send Back to Approver' : 'Pass to Approver Instead' ?>
+                </button>
+            <?php endif; ?>
             <a class="btn btn-ghost" href="?page=audit_list" style="margin-left:auto">Back</a>
         </div>
     </form>
+    <?php
+}
+
+// ── Skip-ahead banner ───────────────────────────────────
+// Shown when a reviewer opens an audit that is still sitting at a desk
+// beneath theirs. Acting here settles those desks too, so say which ones
+// before they click rather than after.
+function renderSkipAheadBanner(array $skipping, string $verb): void {
+    if (!$skipping) return;
+    $names = array_map('auditStageLabel', $skipping);
+    ?>
+    <div class="alert alert-warning"
+         style="margin-bottom:14px;background:rgba(255,180,40,.10);color:#ffce6b;
+                border:1px solid rgba(255,180,40,.32);padding:12px 14px;border-radius:6px">
+        <strong>This audit is still with the <?= h(implode(' and ', $names)) ?>.</strong>
+        <?= h($verb) ?> settles <?= count($names) === 1 ? 'that step' : 'those steps' ?> too —
+        <?= h(implode(' and ', $names)) ?> will not review it, and the audit is marked as having
+        skipped <?= count($names) === 1 ? 'it' : 'them' ?>.
+    </div>
     <?php
 }
 
@@ -1359,9 +1400,9 @@ function pageAuditManagerReview(): void {
     renderAuditHeader($a);
     ?>
     <div class="alert alert-info" style="margin-bottom:14px;background:rgba(26,143,227,.10);color:#9ed1f6;border:1px solid rgba(26,143,227,.25);padding:10px 14px;border-radius:6px">
-        Add justification or context for any question the auditor flagged. Leave a row blank if no comment is needed. When you're done, click <strong>Forward to Approver</strong>.
+        Add justification or context for any question the auditor flagged, and attach a photo where the work has since been verified or corrected — that proof travels with your remark to every reviewer. Leave a row blank if no comment is needed. When you're done, click <strong>Forward to Approver</strong>.
     </div>
-    <form method="POST" id="auditManagerReviewForm">
+    <form method="POST" enctype="multipart/form-data" id="auditManagerReviewForm">
         <input type="hidden" name="action" value="manager_review_audit">
         <input type="hidden" name="audit_id" value="<?= (int)$id ?>">
         <?php renderAuditManagerReviewTable($tree, $id, (int)($a['location_id'] ?? 0)); ?>
@@ -1379,6 +1420,13 @@ function pageAuditManagerReview(): void {
             <button class="btn btn-success" type="submit" name="sm_action" value="forward">Save &amp; Forward to Approver</button>
             <a class="btn btn-ghost" href="?page=audit_list" style="margin-left:auto">Back</a>
         </div>
+    </form>
+    <!-- Sibling of the review form (forms can't nest) — the × on a photo
+         the SM just attached posts through this one. -->
+    <form method="POST" id="auditAttDelForm">
+        <input type="hidden" name="action" value="delete_audit_attachment">
+        <input type="hidden" name="audit_id" id="auditAttDelAuditId" value="">
+        <input type="hidden" name="att_id" id="auditAttDelAttId" value="">
     </form>
     <?php
 }
@@ -2526,6 +2574,15 @@ function renderAuditHeader(array $a): void {
         return '<div class="stat-sub" style="font-size:11px;color:var(--muted);margin-top:2px">'
             . h($label) . ': ' . h($val) . '</div>';
     };
+    // A desk a higher level settled on its behalf carries that person's
+    // name and time in its columns, so say plainly that it was skipped
+    // rather than leaving the cell reading like a review that happened.
+    $skipped  = auditSkippedStages($a);
+    $skipNote = function (string $stage) use ($skipped) {
+        if (!in_array($stage, $skipped, true)) return '';
+        return '<div class="stat-sub" style="font-size:11px;color:#ffce6b;margin-top:2px">'
+            . 'Skipped — settled at a higher level</div>';
+    };
     ?>
     <div class="form-card" style="max-width:none;margin-bottom:18px">
         <div class="form-grid" style="grid-template-columns:repeat(4,1fr)">
@@ -2552,11 +2609,13 @@ function renderAuditHeader(array $a): void {
                 <div class="stat-lbl">Operation Team</div>
                 <div><?= $opName !== null ? h($opName) : '—' ?></div>
                 <?= $stageDate($a['operation_reviewed_at'] ?? null, 'Reviewed') ?>
+                <?= $skipNote('operation_review') ?>
             </div>
             <div>
                 <div class="stat-lbl">Approver</div>
                 <div><?= h($a['approver_name'] ?? '—') ?></div>
                 <?= $stageDate($a['approved_at'] ?? null, 'Approved') ?>
+                <?= $skipNote('approver_review') ?>
             </div>
 
             <div>
@@ -2749,6 +2808,12 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                         <?php if (!empty($smRmk)): ?>
                             <div class="sm-remark-banner">Store Manager: <?= h($smRmk) ?></div>
                         <?php endif; ?>
+                        <?php
+                        // Proof of the verified work, shown with the
+                        // justification it backs rather than in the
+                        // Documents column, which is the auditor's evidence.
+                        renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'store_manager'), $auditId, true);
+                        ?>
                         <?php if (!empty($opRmk)): ?>
                             <div class="ops-remark-banner">Operation: <?= h($opRmk) ?></div>
                         <?php endif; ?>
@@ -2812,37 +2877,7 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                         <?php endif; ?>
                     </td>
                     <td class="wide-cell" data-label="Documents">
-                        <?php if ($p['attachments']): ?>
-                            <div class="att-list">
-                                <?php foreach ($p['attachments'] as $att):
-                                    $isImg     = isset($att['mime_type']) && stripos((string)$att['mime_type'], 'image/') === 0;
-                                    $pinsOpen  = (int)($att['pins_open']  ?? 0);
-                                    $pinsTotal = (int)($att['pins_total'] ?? 0);
-                                    $chipCls   = $pinsOpen > 0 ? ' has-open-pins'
-                                              : ($pinsTotal > 0 ? ' has-resolved-pins' : '');
-                                ?>
-                                    <a class="att-chip<?= $chipCls ?>" href="?page=download_audit_attachment&audit_id=<?= $auditId ?>&att_id=<?= (int)$att['id'] ?>" target="_blank"
-                                       title="<?= $pinsTotal > 0 ? ($pinsOpen . ' open / ' . $pinsTotal . ' total pin' . ($pinsTotal === 1 ? '' : 's')) : 'No annotations yet' ?>">
-                                        <?= h($att['filename']) ?>
-                                    </a>
-                                    <?php if ($isImg): ?>
-                                        <a class="att-annotate<?= $chipCls ?>" href="?page=audit_annotation_image&audit_att=<?= (int)$att['id'] ?>" target="_blank"
-                                           title="<?= $pinsTotal > 0 ? ('Open viewer · ' . $pinsOpen . ' open of ' . $pinsTotal . ' pin' . ($pinsTotal === 1 ? '' : 's')) : 'Drop pins and comment on this image' ?>">
-                                            📌 Annotate
-                                            <?php if ($pinsOpen > 0): ?>
-                                                <span class="att-pin-badge att-pin-badge-open"><?= $pinsOpen ?></span>
-                                            <?php elseif ($pinsTotal > 0): ?>
-                                                <span class="att-pin-badge att-pin-badge-done">✓</span>
-                                            <?php endif; ?>
-                                        </a>
-                                    <?php endif; ?>
-                                    <?php if (!$readonly): ?>
-                                        <button type="button" class="btn-ghost-x"
-                                            onclick="if(confirm('Delete this file?')){document.getElementById('auditAttDelAuditId').value='<?= $auditId ?>';document.getElementById('auditAttDelAttId').value='<?= (int)$att['id'] ?>';document.getElementById('auditAttDelForm').submit();}">×</button>
-                                    <?php endif; ?>
-                                <?php endforeach; ?>
-                            </div>
-                        <?php endif; ?>
+                        <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'auditor'), $auditId, $readonly, 'auditor'); ?>
                         <?php if (!$readonly): ?>
                             <input type="file" class="form-control param-files" name="param_files[<?= (int)$p['id'] ?>][]" accept="image/*,application/pdf" multiple capture="environment" style="font-size:11px;margin-top:4px">
                         <?php endif; ?>
@@ -3136,7 +3171,7 @@ function renderAuditApproveTable(array $tree, int $auditId, int $locationId = 0)
                                 </svg>
                             </button>
                         </div>
-                        <?php renderAuditAttachmentChips($p['attachments'] ?? [], $auditId, true); ?>
+                        <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'auditor'), $auditId, true); ?>
                     </td>
                     <td class="num"><?= number_format($actW, 0) ?></td>
                     <td>
@@ -3150,7 +3185,10 @@ function renderAuditApproveTable(array $tree, int $auditId, int $locationId = 0)
                     <td class="num <?= h($scoreCls) ?>"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
                     <td><?= nl2br(h($r['auditor_remark'] ?? '')) ?: '—' ?></td>
-                    <td><?= nl2br(h($r['store_manager_remark'] ?? '')) ?: '—' ?></td>
+                    <td>
+                        <?= nl2br(h($r['store_manager_remark'] ?? '')) ?: '—' ?>
+                        <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'store_manager'), $auditId, true); ?>
+                    </td>
                     <td><?= nl2br(h($r['operation_remark'] ?? '')) ?: '—' ?></td>
                     <td><textarea class="form-control" rows="2" name="approver_remark[<?= (int)$p['id'] ?>]"><?= h($r['approver_remark'] ?? '') ?></textarea></td>
                 </tr>
@@ -3268,7 +3306,7 @@ function renderAuditOperationReviewTable(array $tree, int $auditId, int $locatio
                                 </svg>
                             </button>
                         </div>
-                        <?php renderAuditAttachmentChips($p['attachments'] ?? [], $auditId, true); ?>
+                        <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'auditor'), $auditId, true); ?>
                     </td>
                     <td class="num"><?= number_format($actW, 0) ?></td>
                     <td class="num"><?= number_format($modW, 0) ?></td>
@@ -3276,7 +3314,10 @@ function renderAuditOperationReviewTable(array $tree, int $auditId, int $locatio
                     <td class="num <?= h($scoreCls) ?>"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
                     <td><?= nl2br(h($r['auditor_remark'] ?? '')) ?: '—' ?></td>
-                    <td><?= nl2br(h($r['store_manager_remark'] ?? '')) ?: '—' ?></td>
+                    <td>
+                        <?= nl2br(h($r['store_manager_remark'] ?? '')) ?: '—' ?>
+                        <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'store_manager'), $auditId, true); ?>
+                    </td>
                     <td><textarea class="form-control" rows="2" name="operation_remark[<?= (int)$p['id'] ?>]" placeholder="Comment / observation for the Approver"><?= h($r['operation_remark'] ?? '') ?></textarea></td>
                 </tr>
                 <?php endforeach; ?>
@@ -3330,13 +3371,16 @@ function renderAuditManagementReviewTable(array $tree, int $auditId, int $locati
                         <div class="param-text-wrap">
                             <span class="param-text-label"><?= h($p['parameter_text']) ?></span>
                         </div>
-                        <?php renderAuditAttachmentChips($p['attachments'] ?? [], $auditId, true); ?>
+                        <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'auditor'), $auditId, true); ?>
                     </td>
                     <td class="num"><?= number_format($actW, 0) ?></td>
                     <td class="num"><?= number_format($modW, 0) ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
                     <td><?= nl2br(h($r['auditor_remark'] ?? '')) ?: '—' ?></td>
-                    <td><?= nl2br(h($r['store_manager_remark'] ?? '')) ?: '—' ?></td>
+                    <td>
+                        <?= nl2br(h($r['store_manager_remark'] ?? '')) ?: '—' ?>
+                        <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'store_manager'), $auditId, true); ?>
+                    </td>
                     <td><?= nl2br(h($r['operation_remark'] ?? '')) ?: '—' ?></td>
                     <td><?= nl2br(h($r['approver_remark'] ?? '')) ?: '—' ?></td>
                     <td><textarea class="form-control" rows="2" name="management_remark[<?= (int)$p['id'] ?>]" placeholder="Final remark / decision context"><?= h($r['management_remark'] ?? '') ?></textarea></td>
@@ -3350,11 +3394,34 @@ function renderAuditManagementReviewTable(array $tree, int $auditId, int $locati
     <?php
 }
 
+// Which side of the audit a file came from. Pre-migration rows carry no
+// stage at all and are the auditor's by definition.
+function auditAttachmentStage(array $att): string {
+    $stage = (string)($att['uploaded_stage'] ?? 'auditor');
+    return in_array($stage, AUDIT_ATTACHMENT_STAGES, true) ? $stage : 'auditor';
+}
+
+// Filter a response's attachments down to one stage — 'auditor' for the
+// finding, 'store_manager' for the photos of the verified work. Every
+// table shows the two in different columns so a reviewer can never mistake
+// the store's fix for the auditor's evidence.
+function auditAttachmentsForStage(array $attachments, string $stage): array {
+    $out = [];
+    foreach ($attachments as $att) {
+        if (auditAttachmentStage($att) === $stage) $out[] = $att;
+    }
+    return $out;
+}
+
 // Render the attachment chip row (download + annotate links) under a
 // parameter text cell. Shared by every review table so the "Annotate"
 // affordance shows up at every post-submit stage. $readonly hides the
-// delete X — true everywhere except in auditor edit mode.
-function renderAuditAttachmentChips(array $attachments, int $auditId, bool $readonly): void {
+// delete X; $deletableStage narrows it further to the files the current
+// user owns — the auditor may clear their own evidence, the Store Manager
+// only the verification photos they just attached, and neither can delete
+// the other's. Both require the page's delete form (auditAttDelForm) to be
+// on the page.
+function renderAuditAttachmentChips(array $attachments, int $auditId, bool $readonly, string $deletableStage = 'auditor'): void {
     if (!$attachments) return;
     ?>
     <div class="att-list" style="margin-top:6px">
@@ -3362,6 +3429,8 @@ function renderAuditAttachmentChips(array $attachments, int $auditId, bool $read
         $isImg     = isset($att['mime_type']) && stripos((string)$att['mime_type'], 'image/') === 0;
         $pinsOpen  = (int)($att['pins_open']  ?? 0);
         $pinsTotal = (int)($att['pins_total'] ?? 0);
+        $stage     = auditAttachmentStage($att);
+        $isSm      = $stage === 'store_manager';
         // Highlight rule: any pin (open or resolved) marks the chip as
         // annotated; open pins keep the red callout, all-resolved gets a
         // softer green callout so reviewers can spot un-addressed images
@@ -3369,9 +3438,17 @@ function renderAuditAttachmentChips(array $attachments, int $auditId, bool $read
         $chipCls = '';
         if ($pinsOpen   > 0) $chipCls = ' has-open-pins';
         elseif ($pinsTotal > 0) $chipCls = ' has-resolved-pins';
+        $who  = (string)($att['uploader_name'] ?? $att['uploaded_by'] ?? '');
+        $when = !empty($att['uploaded_at']) ? date('d M, h:i A', strtotime((string)$att['uploaded_at'])) : '';
+        $byLine = trim(($isSm ? 'Store Manager proof' : 'Auditor evidence')
+            . ($who !== '' ? ' · ' . $who : '') . ($when !== '' ? ' · ' . $when : ''));
+        $pinLine = $pinsTotal > 0
+            ? ($pinsOpen . ' open / ' . $pinsTotal . ' total pin' . ($pinsTotal === 1 ? '' : 's'))
+            : 'No annotations yet';
     ?>
-        <a class="att-chip<?= $chipCls ?>" href="?page=download_audit_attachment&audit_id=<?= $auditId ?>&att_id=<?= (int)$att['id'] ?>" target="_blank"
-           title="<?= $pinsTotal > 0 ? ($pinsOpen . ' open / ' . $pinsTotal . ' total pin' . ($pinsTotal === 1 ? '' : 's')) : 'No annotations yet' ?>">
+        <a class="att-chip<?= $chipCls ?><?= $isSm ? ' is-sm-proof' : '' ?>" href="?page=download_audit_attachment&audit_id=<?= $auditId ?>&att_id=<?= (int)$att['id'] ?>" target="_blank"
+           title="<?= h($byLine . ' · ' . $pinLine) ?>">
+            <?php if ($isSm): ?><span class="att-stage-tag" aria-hidden="true">SM</span><?php endif; ?>
             <?= h($att['filename']) ?>
         </a>
         <?php if ($isImg): ?>
@@ -3384,6 +3461,10 @@ function renderAuditAttachmentChips(array $attachments, int $auditId, bool $read
                     <span class="att-pin-badge att-pin-badge-done">✓</span>
                 <?php endif; ?>
             </a>
+        <?php endif; ?>
+        <?php if (!$readonly && $stage === $deletableStage): ?>
+            <button type="button" class="btn-ghost-x" title="Delete this file"
+                onclick="if(confirm('Delete this file? Any unsaved text on this page will be lost.')){document.getElementById('auditAttDelAuditId').value='<?= $auditId ?>';document.getElementById('auditAttDelAttId').value='<?= (int)$att['id'] ?>';document.getElementById('auditAttDelForm').submit();}">×</button>
         <?php endif; ?>
     <?php endforeach; ?>
     </div>
@@ -3409,7 +3490,7 @@ function renderAuditManagerReviewTable(array $tree, int $auditId, int $locationI
                     <th style="width:90px">Obtain</th>
                     <th style="width:110px">Obtain %</th>
                     <th>Auditor Remark</th>
-                    <th>Your Justification</th>
+                    <th style="min-width:220px">Your Justification &amp; Proof</th>
                 </tr>
             </thead>
             <tbody>
@@ -3449,7 +3530,7 @@ function renderAuditManagerReviewTable(array $tree, int $auditId, int $locationI
                                 </svg>
                             </button>
                         </div>
-                        <?php renderAuditAttachmentChips($p['attachments'] ?? [], $auditId, true); ?>
+                        <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'auditor'), $auditId, true); ?>
                     </td>
                     <td class="num"><?= number_format($actW, 0) ?></td>
                     <td class="num"><?= number_format($modW, 0) ?></td>
@@ -3457,7 +3538,23 @@ function renderAuditManagerReviewTable(array $tree, int $auditId, int $locationI
                     <td class="num <?= h($scoreCls) ?>"><?= $obt !== null ? number_format((float)$obt, 2) : '—' ?></td>
                     <td class="num <?= h($scoreCls) ?>"><?= $obtPct !== null ? number_format($obtPct, 2) : '—' ?></td>
                     <td><?= nl2br(h($r['auditor_remark'] ?? '')) ?: '—' ?></td>
-                    <td><textarea class="form-control" rows="2" name="store_manager_remark[<?= (int)$p['id'] ?>]" placeholder="Justification / context for the approver"><?= h($r['store_manager_remark'] ?? '') ?></textarea></td>
+                    <td class="wide-cell">
+                        <textarea class="form-control" rows="2" name="store_manager_remark[<?= (int)$p['id'] ?>]" placeholder="Justification / context for the approver"><?= h($r['store_manager_remark'] ?? '') ?></textarea>
+                        <?php
+                        // Photo proof of the verified work. Only saved against
+                        // a question that already has a response row — a
+                        // parameter the auditor never answered has nothing to
+                        // hang the file on.
+                        renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'store_manager'), $auditId, false, 'store_manager');
+                        ?>
+                        <?php if ($r): ?>
+                            <label class="sm-proof-upload">
+                                <span>📷 Attach photo of verified work</span>
+                                <input type="file" class="form-control" name="sm_files[<?= (int)$p['id'] ?>][]"
+                                       accept="image/*,application/pdf" multiple capture="environment">
+                            </label>
+                        <?php endif; ?>
+                    </td>
                 </tr>
                 <?php endforeach; ?>
             <?php endforeach; ?>

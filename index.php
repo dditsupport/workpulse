@@ -32,6 +32,24 @@ foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','ch
 
 // ── POST routing ──────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // A request whose body exceeds post_max_size reaches PHP with $_POST and
+    // $_FILES already discarded — there is no action to route, so the user
+    // would get a blank page and silently lose everything they had typed
+    // alongside the files. Say what happened and send them back instead.
+    if (!$_POST && (int)($_SERVER['CONTENT_LENGTH'] ?? 0) > 0) {
+        $limit = ini_get('post_max_size') ?: '?';
+        $_SESSION['flash'] = ['type' => 'error',
+            'msg' => 'Upload too large — the whole form exceeded the ' . $limit
+                   . ' server limit and nothing was saved. Attach fewer or smaller files and try again.'];
+        // Referer is client-supplied — only follow it back when it points at
+        // this same host, so it can't be used to bounce anyone off-site.
+        $ref  = (string)($_SERVER['HTTP_REFERER'] ?? '');
+        $host = parse_url($ref, PHP_URL_HOST);
+        $back = ($ref !== '' && (!$host || $host === ($_SERVER['HTTP_HOST'] ?? '')))
+            ? $ref : 'index.php';
+        header('Location: ' . $back);
+        exit;
+    }
     $action = $_POST['action'] ?? '';
     if ($action === 'login')  { doLogin();  exit; }
     if ($action === 'logout') { doLogout(); exit; }

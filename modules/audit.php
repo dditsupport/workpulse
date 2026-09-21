@@ -16,6 +16,9 @@
 define('AUDIT_UPLOAD_DIR', __DIR__ . '/../uploads/audit/');
 define('AUDIT_MAX_FILE_SIZE', 5 * 1024 * 1024);
 define('AUDIT_ALLOWED_EXT', ['jpg','jpeg','png','gif','webp','pdf']);
+// Which side of the audit an attachment came from — see
+// audit_response_attachments.uploaded_stage.
+define('AUDIT_ATTACHMENT_STAGES', ['auditor', 'store_manager']);
 define('AUDIT_ALLOWED_MIME', [
     'jpg'  => ['image/jpeg'],
     'jpeg' => ['image/jpeg'],
@@ -106,6 +109,109 @@ function auditCanResolveAnnotation(): bool {
     return isSuperadmin() || hasTxn('audit_annotation_resolve');
 }
 
+// ── Review stages after SM justify ──────────────────────
+// The three desks an audit walks once the Store Manager has justified,
+// in order of authority. A reviewer may act at their own stage or at any
+// stage beneath it: a higher level's decision stands in for the ones it
+// passes over, so an audit never waits on a lower desk when the person
+// who would settle it anyway is already looking at it.
+//
+// Nothing here lets anyone skip the Store Manager — a 'submitted' audit
+// has rank 0 and no reviewer can touch it until the SM forwards.
+const AUDIT_REVIEW_STAGES = [
+    'operation_review'  => 1,
+    'approver_review'   => 2,
+    'management_review' => 3,
+];
+
+// Where a status sits in that order; 0 for anything that isn't one of the
+// three review stages (draft, submitted, sent_back, approved).
+function auditStageRank(string $status): int {
+    return AUDIT_REVIEW_STAGES[$status] ?? 0;
+}
+
+// Human label for a stage, used in banners, history and the flash.
+function auditStageLabel(string $stage): string {
+    $map = [
+        'operation_review'  => 'Operation Team',
+        'approver_review'   => 'Approver',
+        'management_review' => 'Management',
+    ];
+    return $map[$stage] ?? $stage;
+}
+
+// Does the current user hold the role that owns this stage?
+function auditHoldsStageRole(string $stage): bool {
+    switch ($stage) {
+        case 'operation_review':  return auditCanOperationReview();
+        case 'approver_review':   return auditCanApprove();
+        case 'management_review': return auditCanManagementReview();
+    }
+    return false;
+}
+
+// Highest stage the current user may act at (0 = no review role).
+function auditMyReviewLevel(): int {
+    $lvl = 0;
+    foreach (AUDIT_REVIEW_STAGES as $stage => $rank) {
+        if (auditHoldsStageRole($stage)) $lvl = max($lvl, $rank);
+    }
+    return $lvl;
+}
+
+// Can the current user run $stage's review screen on this audit right now?
+// True when the audit sits exactly at that stage (the normal flow) or at a
+// lower one (the skip). An audit that hasn't reached the review desks yet,
+// or is already approved, is nobody's to act on here.
+function auditCanReviewAtStage(array $a, string $stage): bool {
+    $mine = auditStageRank($stage);
+    if ($mine === 0 || !auditHoldsStageRole($stage)) return false;
+    $at = auditStageRank((string)($a['status'] ?? ''));
+    return $at > 0 && $at <= $mine;
+}
+
+// The stages a decision taken at $actingStage passes over, given the audit
+// is sitting at $status. Empty in the normal flow, where the two match.
+function auditStagesSkipped(string $status, string $actingStage): array {
+    $at   = auditStageRank($status);
+    $mine = auditStageRank($actingStage);
+    if ($at === 0 || $mine === 0 || $at >= $mine) return [];
+    $out = [];
+    foreach (AUDIT_REVIEW_STAGES as $stage => $rank) {
+        if ($rank >= $at && $rank < $mine) $out[] = $stage;
+    }
+    return $out;
+}
+
+// Stages recorded as bypassed on this audit row (see the 2026-09-11
+// skip-lower-approval migration). Empty on pre-migration databases and on
+// every audit that walked the desks one at a time.
+function auditSkippedStages(array $a): array {
+    $raw = trim((string)($a['skipped_stages'] ?? ''));
+    if ($raw === '') return [];
+    $out = [];
+    foreach (explode(',', $raw) as $stage) {
+        $stage = trim($stage);
+        if (array_key_exists($stage, AUDIT_REVIEW_STAGES)) $out[] = $stage;
+    }
+    return $out;
+}
+
+// Did 2026-09-11_audit_skip_lower_approval.sql run? Gates
+// audits.skipped_stages. Without it the skip still works and is still in
+// the history trail, the bypassed desks just aren't labelled as skipped.
+function auditHasSkipStagesCol(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        getDb()->query('SELECT skipped_stages FROM audits LIMIT 0')->fetch();
+        $cached = true;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
 // ── Status transition guard ─────────────────────────────
 // Flow:
 //   draft → submitted
@@ -139,6 +245,27 @@ function auditValidateTransition(string $from, string $to): bool {
         'approved'       => [],
     ];
     return in_array($to, $map[$from] ?? [], true);
+}
+
+// A reviewer acting on a stage beneath their own moves the audit straight
+// to their own outcome, which is a jump the step-by-step map above rightly
+// refuses (operation_review → approved, say). This allows exactly those
+// forward jumps along the review order. It says nothing about authority —
+// that is the caller's to establish with auditCanReviewAtStage() — only
+// that the audit is moving forward through the desks and not sideways or
+// back.
+function auditValidateSkipForward(string $from, string $to): bool {
+    if (!auditHasManagerReviewCols()) return false; // legacy two-step flow has no desks to skip
+    $order = AUDIT_REVIEW_STAGES + ['approved' => 4];
+    $f = $order[$from] ?? 0;
+    $t = $order[$to]   ?? 0;
+    return $f > 0 && $t > $f;
+}
+
+// The gate every forward handler uses: the normal next step, or a
+// permitted skip past the desks beneath the actor.
+function auditValidateAdvance(string $from, string $to): bool {
+    return auditValidateTransition($from, $to) || auditValidateSkipForward($from, $to);
 }
 
 // ── Status label / badge ────────────────────────────────
@@ -495,9 +622,18 @@ function auditGetTree(int $auditId, int $templateId): array {
     if ($resp) {
         $respIds = array_column($resp, 'id');
         $ph = implode(',', array_fill(0, count($respIds), '?'));
+        // uploaded_stage separates the auditor's evidence from the Store
+        // Manager's verified-work photos. Pre-migration databases don't
+        // have the column, so we synthesise 'auditor' — which is what
+        // every file predating the column is.
+        $stageCol = auditHasAttachmentStageCol() ? 'aa.uploaded_stage' : "'auditor' AS uploaded_stage";
         $st = $db->prepare(
-            "SELECT id, response_id, filename, stored_name, mime_type, file_size, uploaded_by, uploaded_at
-             FROM audit_response_attachments WHERE response_id IN ({$ph}) ORDER BY uploaded_at"
+            "SELECT aa.id, aa.response_id, aa.filename, aa.stored_name, aa.mime_type,
+                    aa.file_size, aa.uploaded_by, aa.uploaded_at, {$stageCol},
+                    e.full_name AS uploader_name
+             FROM audit_response_attachments aa
+             LEFT JOIN employees e ON e.employee_code = aa.uploaded_by
+             WHERE aa.response_id IN ({$ph}) ORDER BY aa.uploaded_at"
         );
         $st->execute($respIds);
         $allAtts = $st->fetchAll(PDO::FETCH_ASSOC);
@@ -632,17 +768,30 @@ function auditAttachmentPath(int $auditId, ?array $auditRow, string $storedName)
 }
 
 // ── File upload helper ─────────────────────────────────
-function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCode): void {
+// $stage says which side of the audit conversation the file belongs to:
+// 'auditor' for the finding, 'store_manager' for the photo of the
+// verified work the SM attaches to their justification. On databases that
+// haven't run 2026-09-11_audit_sm_verification_photos.sql the column
+// doesn't exist yet, so the stage is simply not written — the upload
+// still succeeds and reads back as auditor evidence.
+function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCode, string $stage = 'auditor'): void {
     if (empty($_FILES['attachments']['name'][0])) return;
     $auditRow = auditGetById($auditId);
     if (!$auditRow) return; // can't bucket without template + date
     $dir = auditAttachmentDir($auditRow);
     if (!is_dir($dir)) @mkdir($dir, 0755, true);
     $db = getDb();
-    $st = $db->prepare(
-        'INSERT INTO audit_response_attachments
-          (response_id, filename, stored_name, mime_type, file_size, uploaded_by)
-         VALUES (?, ?, ?, ?, ?, ?)');
+    $hasStage = auditHasAttachmentStageCol();
+    if (!in_array($stage, AUDIT_ATTACHMENT_STAGES, true)) $stage = 'auditor';
+    $st = $hasStage
+        ? $db->prepare(
+            'INSERT INTO audit_response_attachments
+              (response_id, filename, stored_name, mime_type, file_size, uploaded_by, uploaded_stage)
+             VALUES (?, ?, ?, ?, ?, ?, ?)')
+        : $db->prepare(
+            'INSERT INTO audit_response_attachments
+              (response_id, filename, stored_name, mime_type, file_size, uploaded_by)
+             VALUES (?, ?, ?, ?, ?, ?)');
     $files = $_FILES['attachments'];
     for ($i = 0; $i < count($files['name']); $i++) {
         if ($files['error'][$i] !== UPLOAD_ERR_OK) continue;
@@ -656,7 +805,9 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
         if (!in_array($mime, $ok, true)) continue;
         $storedName = uniqid('aud_', true) . '.' . $ext;
         if (move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
-            $st->execute([$responseId, $origName, $storedName, $mime, (int)$files['size'][$i], $uploaderCode]);
+            $args = [$responseId, $origName, $storedName, $mime, (int)$files['size'][$i], $uploaderCode];
+            if ($hasStage) $args[] = $stage;
+            $st->execute($args);
         }
     }
 }
@@ -736,6 +887,22 @@ function auditHasCwSnapshotCols(): bool {
     if ($cached !== null) return $cached;
     try {
         getDb()->query('SELECT actual_weightage FROM audit_category_weights LIMIT 0')->fetch();
+        $cached = true;
+    } catch (Exception $e) {
+        $cached = false;
+    }
+    return $cached;
+}
+
+// Did 2026-09-11_audit_sm_verification_photos.sql run? Gates
+// audit_response_attachments.uploaded_stage — without it every file reads
+// as auditor evidence and the SM's upload box still works, it just can't
+// label what it saved.
+function auditHasAttachmentStageCol(): bool {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    try {
+        getDb()->query('SELECT uploaded_stage FROM audit_response_attachments LIMIT 0')->fetch();
         $cached = true;
     } catch (Exception $e) {
         $cached = false;
