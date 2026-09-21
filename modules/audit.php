@@ -15,17 +15,24 @@
 
 define('AUDIT_UPLOAD_DIR', __DIR__ . '/../uploads/audit/');
 define('AUDIT_MAX_FILE_SIZE', 5 * 1024 * 1024);
-define('AUDIT_ALLOWED_EXT', ['jpg','jpeg','png','gif','webp','pdf']);
 // Which side of the audit an attachment came from — see
 // audit_response_attachments.uploaded_stage.
 define('AUDIT_ATTACHMENT_STAGES', ['auditor', 'store_manager']);
-define('AUDIT_ALLOWED_MIME', [
-    'jpg'  => ['image/jpeg'],
-    'jpeg' => ['image/jpeg'],
-    'png'  => ['image/png'],
-    'gif'  => ['image/gif'],
-    'webp' => ['image/webp'],
-    'pdf'  => ['application/pdf'],
+// What a file actually is decides whether it is accepted and what
+// extension it is stored under — never the name it arrived with. Phones
+// and chat apps hand out names whose extension contradicts the bytes all
+// the time (WhatsApp Web saves plenty of PNGs and WebPs as ".jpeg"), and
+// refusing those is refusing a perfectly good photo. Reading the content
+// is also the safer half of the pair: the stored extension can then never
+// be one the uploader chose.
+define('AUDIT_MIME_EXT', [
+    'image/jpeg'      => 'jpg',
+    'image/pjpeg'     => 'jpg',
+    'image/png'       => 'png',
+    'image/x-png'     => 'png',
+    'image/gif'       => 'gif',
+    'image/webp'      => 'webp',
+    'application/pdf' => 'pdf',
 ]);
 const AUDIT_WEIGHT_TOLERANCE = 0.05; // rounding tolerance for weightage sums
 
@@ -821,28 +828,27 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
             // UPLOAD_ERR_NO_FILE is an empty slot in a multi-file input, not
             // a failure — the user never picked anything there.
             if ($files['error'][$i] !== UPLOAD_ERR_NO_FILE) {
-                $reject($origName, auditUploadErrorReason((int)$files['error'][$i]));
+                $reject($origName, uploadErrorReason((int)$files['error'][$i]));
             }
             continue;
         }
         if ($files['size'][$i] > AUDIT_MAX_FILE_SIZE) {
-            $reject($origName, auditFormatBytes((int)$files['size'][$i]) . ' — over the '
-                . auditFormatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
+            $reject($origName, formatBytes((int)$files['size'][$i]) . ' — over the '
+                . formatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
             continue;
         }
-        $ext = mb_strtolower(pathinfo($origName, PATHINFO_EXTENSION));
-        if (!in_array($ext, AUDIT_ALLOWED_EXT, true)) {
-            $reject($origName, ($ext !== '' ? '.' . $ext . ' files are' : 'that file type is')
-                . ' not accepted — use ' . implode(', ', AUDIT_ALLOWED_EXT));
-            continue;
-        }
+        // Read what the file IS. A name saying .jpeg over PNG bytes is a
+        // photo we want, not a forgery to turn away.
         $finfo = new finfo(FILEINFO_MIME_TYPE);
-        $mime  = $finfo->file($files['tmp_name'][$i]);
-        $ok = AUDIT_ALLOWED_MIME[$ext] ?? [];
-        if (!in_array($mime, $ok, true)) {
-            $reject($origName, 'the contents are not a real .' . $ext . ' file');
+        $mime  = (string)$finfo->file($files['tmp_name'][$i]);
+        $ext   = AUDIT_MIME_EXT[$mime] ?? null;
+        if ($ext === null) {
+            $reject($origName, auditUnsupportedTypeReason($mime));
             continue;
         }
+        // Keep the human-readable name but make its extension tell the
+        // truth, so the file opens in the right app when downloaded.
+        $origName   = nameWithExt($origName, $ext);
         $storedName = uniqid('aud_', true) . '.' . $ext;
         if (!move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
             $reject($origName, 'the server could not store it — please try again');
@@ -856,41 +862,23 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
     return $result;
 }
 
-// Plain-English reason for a PHP upload error code. The size ones name the
-// server's own limit, because that is the number the user has to get under
-// and it is nowhere on screen otherwise.
-function auditUploadErrorReason(int $err): string {
-    switch ($err) {
-        case UPLOAD_ERR_INI_SIZE:
-            $lim = trim((string)ini_get('upload_max_filesize'));
-            return 'bigger than this server accepts in one file'
-                . ($lim !== '' ? ' (' . $lim . ')' : '');
-        case UPLOAD_ERR_FORM_SIZE:  return 'bigger than the form allows';
-        case UPLOAD_ERR_PARTIAL:    return 'the upload was cut off part-way — please try again';
-        case UPLOAD_ERR_NO_TMP_DIR:
-        case UPLOAD_ERR_CANT_WRITE:
-        case UPLOAD_ERR_EXTENSION:  return 'the server could not store it — please try again';
+// Why a file the server can't take was turned away, in words the person
+// holding the phone can act on.
+function auditUnsupportedTypeReason(string $mime): string {
+    // Formats, not extensions — "jpg, jpeg" reads like two different
+    // things to the person being told what to send.
+    $allowed = 'send a JPG, PNG, GIF, WebP or PDF';
+    if (preg_match('#^image/hei[cf]#i', $mime)) {
+        return 'an iPhone HEIC photo, which browsers cannot show — open it in Photos and'
+             . ' share it as JPEG, or retake it with the camera button here';
     }
-    return 'the upload did not complete';
-}
-
-function auditFormatBytes(int $bytes): string {
-    if ($bytes >= 1024 * 1024) return round($bytes / 1024 / 1024, 1) . ' MB';
-    if ($bytes >= 1024)        return round($bytes / 1024) . ' KB';
-    return $bytes . ' B';
-}
-
-// One sentence naming every file that did not make it and why, for the
-// flash the uploader sees. Empty when everything saved.
-function auditRejectedFilesNote(array $rejected): string {
-    if (!$rejected) return '';
-    $parts = [];
-    foreach ($rejected as $r) {
-        $parts[] = $r['name'] . ' (' . $r['reason'] . ')';
+    if ($mime === '' || $mime === 'application/octet-stream') {
+        return 'not a readable image or PDF — it may have been damaged in transfer; ' . $allowed;
     }
-    return count($rejected) === 1
-        ? ' 1 file was NOT saved: ' . $parts[0] . '.'
-        : ' ' . count($rejected) . ' files were NOT saved: ' . implode('; ', $parts) . '.';
+    if (stripos($mime, 'video/') === 0) {
+        return 'a video, and only photos and PDFs can be attached — ' . $allowed;
+    }
+    return 'a ' . $mime . ' file, which is not accepted — ' . $allowed;
 }
 
 // ── History row ────────────────────────────────────────

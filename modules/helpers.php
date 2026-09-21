@@ -767,6 +767,217 @@ function phpEolDate(string $branch): string {
     return $eol[$branch] ?? 'Unknown';
 }
 
+// ── Upload plumbing shared by every module that takes files ──
+// Audits, checklists and event photos all face the same questions
+// about an upload: why the server refused it, what to call it once
+// its contents are known, and how to tell the person who sent it.
+// One answer each, here, rather than one per module.
+
+// Plain-English reason for a PHP upload error code. The size ones name the
+// server's own limit, because that is the number the user has to get under
+// and it is nowhere on screen otherwise.
+function uploadErrorReason(int $err): string {
+    switch ($err) {
+        case UPLOAD_ERR_INI_SIZE:
+            $lim = trim((string)ini_get('upload_max_filesize'));
+            return 'bigger than this server accepts in one file'
+                . ($lim !== '' ? ' (' . $lim . ')' : '');
+        case UPLOAD_ERR_FORM_SIZE:  return 'bigger than the form allows';
+        case UPLOAD_ERR_PARTIAL:    return 'the upload was cut off part-way — please try again';
+        case UPLOAD_ERR_NO_TMP_DIR:
+        case UPLOAD_ERR_CANT_WRITE:
+        case UPLOAD_ERR_EXTENSION:  return 'the server could not store it — please try again';
+    }
+    return 'the upload did not complete';
+}
+
+// Swap a filename's extension for the one its contents call for, leaving
+// the readable part alone. "WhatsApp Image … .jpeg" holding PNG bytes
+// becomes "WhatsApp Image … .png".
+function nameWithExt(string $name, string $ext): string {
+    $base = pathinfo($name, PATHINFO_FILENAME);
+    if ($base === '') $base = 'photo';
+    $had = mb_strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    return ($had === $ext) ? $name : $base . '.' . $ext;
+}
+
+function formatBytes(int $bytes): string {
+    if ($bytes >= 1024 * 1024) return round($bytes / 1024 / 1024, 1) . ' MB';
+    if ($bytes >= 1024)        return round($bytes / 1024) . ' KB';
+    return $bytes . ' B';
+}
+
+// One sentence naming every file that did not make it and why, for the
+// flash the uploader sees. Empty when everything saved.
+function rejectedFilesNote(array $rejected): string {
+    if (!$rejected) return '';
+    $parts = [];
+    foreach ($rejected as $r) {
+        $parts[] = $r['name'] . ' (' . $r['reason'] . ')';
+    }
+    return count($rejected) === 1
+        ? ' 1 file was NOT saved: ' . $parts[0] . '.'
+        : ' ' . count($rejected) . ' files were NOT saved: ' . implode('; ', $parts) . '.';
+}
+
+// ── Client-side image compression for photo uploads ─────
+// Phones produce 4–8 MB photos, and several of them in one submit will
+// exceed post_max_size or upload_max_filesize — limits that do not fail
+// loudly: PHP drops the file before the handler runs, so the photo simply
+// goes missing. Image (jpeg/png/gif/webp/heic) > 600 KB → downscale long
+// edge to 1600 px and re-encode JPEG q=0.75; PDFs and small files pass
+// through. HEIC is converted whatever its size, since no browser but
+// Safari can display it. Submit is gated until every in-flight
+// compression resolves so a heavy original never sneaks into the POST.
+//
+// Shared by every upload form in the app — audits, checklists and event
+// photos — each passing its own form id and the selector its file inputs
+// carry. One copy, so a fix to the rules above reaches all of them.
+function renderPhotoCompressJs(string $formId, string $inputSelector): void {
+    ?>
+    <script>
+    (function () {
+        var form = document.getElementById(<?= json_encode($formId) ?>);
+        if (!form) return;
+        var INPUT_SELECTOR = <?= json_encode($inputSelector) ?>;
+
+        var MAX_EDGE     = 1600;
+        var SKIP_BELOW   = 600 * 1024;
+        var JPEG_QUALITY = 0.75;
+        var IMAGE_RE     = /^image\/(jpeg|png|gif|webp|heic|heif)$/i;
+        var inflight     = 0;
+        var submitBtns   = form.querySelectorAll('button[type="submit"]');
+
+        function fmtSize(b) {
+            if (b < 1024) return b + ' B';
+            if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+            return (b / 1024 / 1024).toFixed(2) + ' MB';
+        }
+        function setSubmitDisabled(disabled) {
+            submitBtns.forEach(function (b) { b.disabled = disabled; });
+        }
+        function statusNodeFor(input) {
+            // One <div> per input, inserted right after it on first use.
+            var node = input.nextElementSibling;
+            if (!node || !node.classList || !node.classList.contains('param-att-status')) {
+                node = document.createElement('div');
+                node.className = 'param-att-status';
+                node.style.cssText = 'font-size:10px;margin-top:2px;color:var(--muted);min-height:12px';
+                input.parentNode.insertBefore(node, input.nextSibling);
+            }
+            return node;
+        }
+
+        function setFiles(input, fileArr) {
+            try {
+                var dt = new DataTransfer();
+                fileArr.forEach(function (f) { dt.items.add(f); });
+                input.files = dt.files;
+                return true;
+            } catch (e) { return false; }
+        }
+        function decode(file) {
+            if (typeof createImageBitmap === 'function') {
+                try { return createImageBitmap(file, { imageOrientation: 'from-image' }); }
+                catch (e) { return createImageBitmap(file); }
+            }
+            return new Promise(function (resolve, reject) {
+                var url = URL.createObjectURL(file);
+                var img = new Image();
+                img.onload  = function () { URL.revokeObjectURL(url); resolve(img); };
+                img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('image decode failed')); };
+                img.src = url;
+            });
+        }
+        // HEIC/HEIF has to be converted whatever its size: no browser but
+        // Safari can display it and the server will not store it, so a
+        // small one passed through untouched is a photo thrown away.
+        function mustConvert(file) { return /^image\/hei[cf]$/i.test(file.type); }
+        function compressOne(file) {
+            if (!IMAGE_RE.test(file.type)) return Promise.resolve(file);
+            if (!mustConvert(file) && file.size <= SKIP_BELOW) return Promise.resolve(file);
+            return decode(file).then(function (bmp) {
+                var w = bmp.width || bmp.naturalWidth;
+                var h = bmp.height || bmp.naturalHeight;
+                if (!w || !h) return file;
+                var scale = Math.min(1, MAX_EDGE / Math.max(w, h));
+                var tw = Math.round(w * scale), th = Math.round(h * scale);
+                var canvas = document.createElement('canvas');
+                canvas.width = tw; canvas.height = th;
+                canvas.getContext('2d').drawImage(bmp, 0, 0, tw, th);
+                return new Promise(function (resolve) {
+                    canvas.toBlob(function (blob) {
+                        // Normally a re-encode that got bigger isn't worth
+                        // keeping — but for HEIC the bigger JPEG is the only
+                        // form that survives the trip at all.
+                        if (!blob || (blob.size >= file.size && !mustConvert(file))) { resolve(file); return; }
+                        var nameBase = (file.name || 'photo').replace(/\.(png|jpe?g|gif|webp|heic|heif)$/i, '');
+                        resolve(new File([blob], nameBase + '.jpg', { type: 'image/jpeg', lastModified: Date.now() }));
+                    }, 'image/jpeg', JPEG_QUALITY);
+                });
+            }).catch(function () { return file; });
+        }
+
+        // Delegated change listener — covers every matching input on the
+        // page without us having to wire each one individually.
+        document.addEventListener('change', function (e) {
+            if (!e.target.matches || !e.target.matches(INPUT_SELECTOR)) return;
+            var input  = e.target;
+            var status = statusNodeFor(input);
+            var files  = Array.from(input.files || []);
+            if (!files.length) { status.textContent = ''; return; }
+
+            var origTotal = files.reduce(function (n, f) { return n + f.size; }, 0);
+            var compressableAny = files.some(function (f) {
+                return IMAGE_RE.test(f.type) && (f.size > SKIP_BELOW || mustConvert(f));
+            });
+            if (!compressableAny) {
+                status.style.color = 'var(--muted)';
+                status.textContent = files.length + ' file(s) — ' + fmtSize(origTotal);
+                return;
+            }
+
+            inflight++;
+            setSubmitDisabled(true);
+            status.style.color = 'var(--muted)';
+            status.textContent = 'Compressing photo(s)…';
+
+            Promise.all(files.map(compressOne)).then(function (out) {
+                var newTotal = out.reduce(function (n, f) { return n + f.size; }, 0);
+                if (!setFiles(input, out)) {
+                    status.style.color = 'var(--yellow)';
+                    status.textContent = 'Could not replace selected files — uploading originals (' + fmtSize(origTotal) + ').';
+                } else if (newTotal < origTotal) {
+                    status.style.color = 'var(--green)';
+                    status.textContent = fmtSize(origTotal) + ' → ' + fmtSize(newTotal)
+                        + ' (' + Math.round((1 - newTotal / origTotal) * 100) + '% smaller).';
+                } else {
+                    status.style.color = 'var(--muted)';
+                    status.textContent = out.length + ' file(s) — ' + fmtSize(newTotal);
+                }
+            }).catch(function (err) {
+                status.style.color = 'var(--yellow)';
+                status.textContent = 'Compression failed — uploading originals (' + fmtSize(origTotal) + '). ' + (err && err.message ? err.message : '');
+            }).then(function () {
+                inflight = Math.max(0, inflight - 1);
+                if (inflight === 0) setSubmitDisabled(false);
+            });
+        }, true);
+
+        // Block submit while any compression is still running. Once
+        // done, the click goes through. Existing form-level handlers
+        // (validation etc.) fire afterward unaffected.
+        form.addEventListener('submit', function (e) {
+            if (inflight > 0) {
+                e.preventDefault();
+                alert('Still compressing photo(s) — please wait a moment and try again.');
+            }
+        }, true);
+    })();
+    </script>
+    <?php
+}
+
 // ── Display Helpers ──────────────────────────────────────
 // Nullable by design: half the columns this escapes are nullable (a task with
 // no section, an answer never given, an optional remark), and a display helper

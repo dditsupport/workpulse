@@ -14,14 +14,21 @@ define('EVENT_PHOTO_UPLOAD_DIR', __DIR__ . '/../uploads/event_photos/');
 define('EVENT_PHOTO_MAX_FILE_SIZE', 10 * 1024 * 1024);
 define('EVENT_PHOTO_PER_PAGE', 60);
 // SVG is deliberately absent: it can carry script and we serve inline.
-define('EVENT_PHOTO_ALLOWED_MIME', [
-    'jpg'  => ['image/jpeg'],
-    'jpeg' => ['image/jpeg'],
-    'png'  => ['image/png'],
-    'gif'  => ['image/gif'],
-    'webp' => ['image/webp'],
-    'heic' => ['image/heic', 'image/heif', 'application/octet-stream'],
-    'heif' => ['image/heif', 'image/heic', 'application/octet-stream'],
+//
+// Keyed by what the file IS, never by the name it arrived with — a phone
+// or chat app will happily hand over a PNG called ".jpeg", and refusing
+// that is refusing a photo someone meant to share. The value is the
+// extension it gets stored under, so that can never be one the uploader
+// chose either.
+define('EVENT_PHOTO_MIME_EXT', [
+    'image/jpeg'  => 'jpg',
+    'image/pjpeg' => 'jpg',
+    'image/png'   => 'png',
+    'image/x-png' => 'png',
+    'image/gif'   => 'gif',
+    'image/webp'  => 'webp',
+    'image/heic'  => 'heic',
+    'image/heif'  => 'heic',
 ]);
 // What a browser can actually paint. HEIC uploads are kept (phones produce
 // them) but listed as a download card rather than a broken <img>.
@@ -48,6 +55,66 @@ function eventPhotoIsRenderable(string $mime): bool {
 }
 
 // ── Upload (txn_event_photo_upload) ───────────────────────
+// Does this file carry a HEIC/HEIF brand in its ISO-BMFF header? Used
+// only when the magic database shrugs and calls it octet-stream: bytes
+// 4..8 are "ftyp" and the brand that follows says which flavour.
+function epLooksLikeHeic(string $path): bool {
+    $fh = @fopen($path, 'rb');
+    if (!$fh) return false;
+    $head = (string)fread($fh, 16);
+    fclose($fh);
+    if (strlen($head) < 12 || substr($head, 4, 4) !== 'ftyp') return false;
+    $brand = mb_strtolower(substr($head, 8, 4));
+    return in_array($brand, ['heic', 'heix', 'heif', 'hevc', 'hevx', 'mif1', 'msf1'], true);
+}
+
+// Turn a stored HEIC into a JPEG beside it when this PHP can read HEIC at
+// all, and return what the row should point at. Imagick only manages it
+// when built against libheif, which plenty of shared hosts are not — so
+// failure is expected and silent: the photo stays HEIC and the gallery
+// falls back to its download card, exactly as before.
+//
+// Returns [storedName, mimeType].
+function epConvertHeicIfPossible(string $dir, string $stored, string $mime): array {
+    if ($mime !== 'image/heic' && $mime !== 'image/heif') return [$stored, $mime];
+    if (!class_exists('Imagick')) return [$stored, $mime];
+    $jpg = preg_replace('/\.[^.]+$/', '', $stored) . '.jpg';
+    try {
+        $im = new Imagick($dir . $stored);
+        $im->setImageFormat('jpeg');
+        $im->setImageCompressionQuality(85);
+        // Phone photos carry their rotation in EXIF; baking it in now means
+        // the gallery does not have to know about orientation at all.
+        if (method_exists($im, 'autoOrient')) $im->autoOrient();
+        $ok = $im->writeImage($dir . $jpg);
+        $im->clear();
+        if (!$ok || !file_exists($dir . $jpg)) return [$stored, $mime];
+    } catch (Throwable $e) {
+        // No HEIC delegate, or a file Imagick cannot read — keep the original.
+        @unlink($dir . $jpg);
+        return [$stored, $mime];
+    }
+    @unlink($dir . $stored);
+    return [$jpg, 'image/jpeg'];
+}
+
+// Why a file this gallery cannot take was turned away. HEIC is accepted
+// here (phones produce it), so the only reasons left are genuinely not
+// pictures.
+function epUnsupportedTypeReason(string $mime): string {
+    $allowed = 'send a JPG, PNG, GIF, WebP or HEIC';
+    if ($mime === '' || $mime === 'application/octet-stream') {
+        return 'not a readable image — it may have been damaged in transfer; ' . $allowed;
+    }
+    if (stripos($mime, 'video/') === 0) {
+        return 'a video, and only photos can be uploaded here — ' . $allowed;
+    }
+    if ($mime === 'application/pdf') {
+        return 'a PDF, and only photos can be uploaded here — ' . $allowed;
+    }
+    return 'a ' . $mime . ' file, which is not a photo — ' . $allowed;
+}
+
 function doUploadEventPhotos(): void {
     $back = 'index.php?page=event_photos';
     if (!canUploadEventPhotos()) {
@@ -75,31 +142,61 @@ function doUploadEventPhotos(): void {
     $saved   = 0; $skipped = 0;
     $n       = count($_FILES['photos']['name']);
 
+    // Nothing is skipped in silence: a photo that does not arrive is the
+    // whole reason someone opened this page, so each one that fails says
+    // which file it was and what to do about it.
+    $rejected = [];
     for ($i = 0; $i < $n; $i++) {
-        if (($_FILES['photos']['error'][$i] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) { $skipped++; continue; }
-        if ($_FILES['photos']['size'][$i] > EVENT_PHOTO_MAX_FILE_SIZE) { $skipped++; continue; }
         $orig = basename((string)$_FILES['photos']['name'][$i]);
-        $ext  = mb_strtolower(pathinfo($orig, PATHINFO_EXTENSION));
-        $ok   = EVENT_PHOTO_ALLOWED_MIME[$ext] ?? null;
-        if (!$ok) { $skipped++; continue; }
-        $mime = $finfo->file($_FILES['photos']['tmp_name'][$i]) ?: 'application/octet-stream';
-        if (!in_array($mime, $ok, true)) { $skipped++; continue; }
-        // Trust the sniffed extension, not the sent one, for octet-stream HEIC.
-        if ($mime === 'application/octet-stream') $mime = 'image/heic';
-
+        if ($orig === '') $orig = 'photo';
+        $err = $_FILES['photos']['error'][$i] ?? UPLOAD_ERR_NO_FILE;
+        if ($err !== UPLOAD_ERR_OK) {
+            if ($err !== UPLOAD_ERR_NO_FILE) {
+                $rejected[] = ['name' => $orig, 'reason' => uploadErrorReason((int)$err)];
+                $skipped++;
+            }
+            continue;
+        }
+        if ($_FILES['photos']['size'][$i] > EVENT_PHOTO_MAX_FILE_SIZE) {
+            $rejected[] = ['name' => $orig, 'reason' =>
+                formatBytes((int)$_FILES['photos']['size'][$i]) . ' — over the '
+                . formatBytes(EVENT_PHOTO_MAX_FILE_SIZE) . ' limit for one photo'];
+            $skipped++; continue;
+        }
+        $mime = (string)($finfo->file($_FILES['photos']['tmp_name'][$i]) ?: '');
+        // iOS sometimes ships HEIC that older magic databases can only call
+        // a blob of bytes. The HEIC brand sits in the file's own header, so
+        // read that rather than trusting the name.
+        if ($mime === 'application/octet-stream' && epLooksLikeHeic($_FILES['photos']['tmp_name'][$i])) {
+            $mime = 'image/heic';
+        }
+        $ext = EVENT_PHOTO_MIME_EXT[$mime] ?? null;
+        if ($ext === null) {
+            $rejected[] = ['name' => $orig, 'reason' => epUnsupportedTypeReason($mime)];
+            $skipped++; continue;
+        }
+        $orig   = nameWithExt($orig, $ext);
         $stored = uniqid('ev_', true) . '.' . $ext;
-        if (!move_uploaded_file($_FILES['photos']['tmp_name'][$i], $dir . $stored)) { $skipped++; continue; }
+        if (!move_uploaded_file($_FILES['photos']['tmp_name'][$i], $dir . $stored)) {
+            $rejected[] = ['name' => $orig, 'reason' => 'the server could not store it — please try again'];
+            $skipped++; continue;
+        }
+        // A HEIC that reached us unconverted (the browser could not decode
+        // it) shows as a download card, not a picture. Convert it here when
+        // the platform can, so the gallery has something to paint.
+        [$stored, $mime] = epConvertHeicIfPossible($dir, $stored, $mime);
         $st->execute([
             ($caption !== '' ? mb_substr($caption, 0, 200) : null),
-            $eventDate, $orig, $stored, $mime, (int)$_FILES['photos']['size'][$i], $me,
+            $eventDate, $orig, $stored, $mime, (int)filesize($dir . $stored), $me,
         ]);
         $saved++;
     }
 
+    $note = rejectedFilesNote($rejected);
     if ($saved > 0) {
-        flash('success', $saved . ' photo(s) uploaded.' . ($skipped ? " {$skipped} skipped (too large or not an image)." : ''));
+        flash($note !== '' ? 'error' : 'success', $saved . ' photo(s) uploaded.' . $note);
     } else {
-        flash('error', 'Nothing uploaded — files must be images under 10 MB.');
+        flash('error', $note !== '' ? ltrim($note) : 'Nothing uploaded — pick at least one photo.');
     }
     header("Location: {$back}"); exit;
 }
@@ -242,13 +339,14 @@ document.addEventListener('keydown', function (e) {
     <div class="ep-modal-content">
         <span class="ep-modal-close" onclick="epCloseUpload()">&times;</span>
         <h4 class="ep-modal-title">Upload photos</h4>
-        <form method="POST" enctype="multipart/form-data">
+        <form method="POST" enctype="multipart/form-data" id="epUploadForm">
             <input type="hidden" name="action" value="upload_event_photos">
             <div style="display:flex;flex-direction:column;gap:12px">
                 <div>
                     <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px">Photos <span class="required">*</span></label>
-                    <input type="file" name="photos[]" class="form-control" accept="image/*" multiple required style="width:100%">
-                    <small class="text-muted">JPG, PNG, GIF, WEBP or HEIC · up to 10 MB each · pick several at once</small>
+                    <input type="file" name="photos[]" class="form-control ep-files" accept="image/*" multiple required style="width:100%">
+                    <small class="text-muted">JPG, PNG, GIF, WEBP or HEIC · up to 10 MB each · pick several at once
+                    · big photos are shrunk and iPhone HEIC is converted before upload</small>
                 </div>
                 <div>
                     <label style="font-size:12px;font-weight:600;color:var(--muted);display:block;margin-bottom:4px">Event date</label>
@@ -267,6 +365,7 @@ document.addEventListener('keydown', function (e) {
         </form>
     </div>
 </div>
+<?php renderPhotoCompressJs('epUploadForm', '.ep-files'); ?>
 <script>
 function epOpenUpload(){document.getElementById('epUploadModal').classList.add('active');}
 function epCloseUpload(e){

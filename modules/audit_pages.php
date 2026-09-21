@@ -979,7 +979,7 @@ function pageAuditEdit(): void {
         <input type="hidden" name="att_id" id="auditAttDelAttId" value="">
     </form>
     <?php renderAuditEditJs(); ?>
-    <?php renderAuditPhotoCompressJs('auditForm'); ?>
+    <?php renderPhotoCompressJs('auditForm', '.param-files'); ?>
     <?php
 }
 
@@ -1429,7 +1429,7 @@ function pageAuditManagerReview(): void {
         <input type="hidden" name="audit_id" id="auditAttDelAuditId" value="">
         <input type="hidden" name="att_id" id="auditAttDelAttId" value="">
     </form>
-    <?php renderAuditPhotoCompressJs('auditManagerReviewForm'); ?>
+    <?php renderPhotoCompressJs('auditManagerReviewForm', '.param-files'); ?>
     <?php
 }
 
@@ -3582,141 +3582,6 @@ function renderAuditManagerReviewTable(array $tree, int $auditId, int $locationI
 // form id — the auditor's edit form and the Store Manager's justify form
 // alike. Both mark their inputs .param-files, which is what the delegated
 // listener below binds to.
-function renderAuditPhotoCompressJs(string $formId): void {
-    ?>
-    <script>
-    (function () {
-        var form = document.getElementById(<?= json_encode($formId) ?>);
-        if (!form) return;
-
-        var MAX_EDGE     = 1600;
-        var SKIP_BELOW   = 600 * 1024;
-        var JPEG_QUALITY = 0.75;
-        var IMAGE_RE     = /^image\/(jpeg|png|gif|webp|heic|heif)$/i;
-        var inflight     = 0;
-        var submitBtns   = form.querySelectorAll('button[type="submit"]');
-
-        function fmtSize(b) {
-            if (b < 1024) return b + ' B';
-            if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
-            return (b / 1024 / 1024).toFixed(2) + ' MB';
-        }
-        function setSubmitDisabled(disabled) {
-            submitBtns.forEach(function (b) { b.disabled = disabled; });
-        }
-        function statusNodeFor(input) {
-            // One <div> per input, inserted right after it on first use.
-            var node = input.nextElementSibling;
-            if (!node || !node.classList || !node.classList.contains('param-att-status')) {
-                node = document.createElement('div');
-                node.className = 'param-att-status';
-                node.style.cssText = 'font-size:10px;margin-top:2px;color:var(--muted);min-height:12px';
-                input.parentNode.insertBefore(node, input.nextSibling);
-            }
-            return node;
-        }
-
-        function setFiles(input, fileArr) {
-            try {
-                var dt = new DataTransfer();
-                fileArr.forEach(function (f) { dt.items.add(f); });
-                input.files = dt.files;
-                return true;
-            } catch (e) { return false; }
-        }
-        function decode(file) {
-            if (typeof createImageBitmap === 'function') {
-                try { return createImageBitmap(file, { imageOrientation: 'from-image' }); }
-                catch (e) { return createImageBitmap(file); }
-            }
-            return new Promise(function (resolve, reject) {
-                var url = URL.createObjectURL(file);
-                var img = new Image();
-                img.onload  = function () { URL.revokeObjectURL(url); resolve(img); };
-                img.onerror = function () { URL.revokeObjectURL(url); reject(new Error('image decode failed')); };
-                img.src = url;
-            });
-        }
-        function compressOne(file) {
-            if (!IMAGE_RE.test(file.type)) return Promise.resolve(file);
-            if (file.size <= SKIP_BELOW)   return Promise.resolve(file);
-            return decode(file).then(function (bmp) {
-                var w = bmp.width || bmp.naturalWidth;
-                var h = bmp.height || bmp.naturalHeight;
-                if (!w || !h) return file;
-                var scale = Math.min(1, MAX_EDGE / Math.max(w, h));
-                var tw = Math.round(w * scale), th = Math.round(h * scale);
-                var canvas = document.createElement('canvas');
-                canvas.width = tw; canvas.height = th;
-                canvas.getContext('2d').drawImage(bmp, 0, 0, tw, th);
-                return new Promise(function (resolve) {
-                    canvas.toBlob(function (blob) {
-                        if (!blob || blob.size >= file.size) { resolve(file); return; }
-                        var nameBase = (file.name || 'photo').replace(/\.(png|jpe?g|gif|webp|heic|heif)$/i, '');
-                        resolve(new File([blob], nameBase + '.jpg', { type: 'image/jpeg', lastModified: Date.now() }));
-                    }, 'image/jpeg', JPEG_QUALITY);
-                });
-            }).catch(function () { return file; });
-        }
-
-        // Delegated change listener — covers every .param-files input on
-        // the page without us having to wire each one individually.
-        document.addEventListener('change', function (e) {
-            if (!e.target.matches || !e.target.matches('.param-files')) return;
-            var input  = e.target;
-            var status = statusNodeFor(input);
-            var files  = Array.from(input.files || []);
-            if (!files.length) { status.textContent = ''; return; }
-
-            var origTotal = files.reduce(function (n, f) { return n + f.size; }, 0);
-            var compressableAny = files.some(function (f) { return IMAGE_RE.test(f.type) && f.size > SKIP_BELOW; });
-            if (!compressableAny) {
-                status.style.color = 'var(--muted)';
-                status.textContent = files.length + ' file(s) — ' + fmtSize(origTotal);
-                return;
-            }
-
-            inflight++;
-            setSubmitDisabled(true);
-            status.style.color = 'var(--muted)';
-            status.textContent = 'Compressing photo(s)…';
-
-            Promise.all(files.map(compressOne)).then(function (out) {
-                var newTotal = out.reduce(function (n, f) { return n + f.size; }, 0);
-                if (!setFiles(input, out)) {
-                    status.style.color = 'var(--yellow)';
-                    status.textContent = 'Could not replace selected files — uploading originals (' + fmtSize(origTotal) + ').';
-                } else if (newTotal < origTotal) {
-                    status.style.color = 'var(--green)';
-                    status.textContent = fmtSize(origTotal) + ' → ' + fmtSize(newTotal)
-                        + ' (' + Math.round((1 - newTotal / origTotal) * 100) + '% smaller).';
-                } else {
-                    status.style.color = 'var(--muted)';
-                    status.textContent = out.length + ' file(s) — ' + fmtSize(newTotal);
-                }
-            }).catch(function (err) {
-                status.style.color = 'var(--yellow)';
-                status.textContent = 'Compression failed — uploading originals (' + fmtSize(origTotal) + '). ' + (err && err.message ? err.message : '');
-            }).then(function () {
-                inflight = Math.max(0, inflight - 1);
-                if (inflight === 0) setSubmitDisabled(false);
-            });
-        }, true);
-
-        // Block submit while any compression is still running. Once
-        // done, the click goes through. Existing form-level handlers
-        // (validation etc.) fire afterward unaffected.
-        form.addEventListener('submit', function (e) {
-            if (inflight > 0) {
-                e.preventDefault();
-                alert('Still compressing photo(s) — please wait a moment and try again.');
-            }
-        }, true);
-    })();
-    </script>
-    <?php
-}
-
 function renderAuditEditJs(): void {
     ?>
     <script>
