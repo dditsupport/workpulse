@@ -14,6 +14,21 @@
 // sequence slots are only consumed by audits that the user actually
 // commits to. The token in the URL keeps multiple parallel drafts (e.g.
 // two browser tabs) isolated.
+// '' when this employee code belongs to an active employee, otherwise the
+// sentence to put in front of whoever filed the form.
+function auditInactiveEmployeeNote(PDO $db, string $code, string $role): string {
+    $st = $db->prepare('SELECT full_name, is_active FROM employees WHERE employee_code = ? LIMIT 1');
+    $st->execute([$code]);
+    $row = $st->fetch(PDO::FETCH_ASSOC);
+    if (!$row) {
+        return $role . ' ' . $code . ' is not on the employee list — pick someone from the suggestions.';
+    }
+    if ((int)$row['is_active'] === 1) return '';
+    return $role . ' ' . (string)$row['full_name'] . ' (' . $code . ') is marked inactive and cannot be'
+         . ' used on a new audit. Pick an active employee — and if this store filled the name in by'
+         . ' itself, its Store Manager Mapping needs updating.';
+}
+
 function doCreateAudit(): void {
     if (!auditCanCreate()) { header('Location: ?page=audit_list'); return; }
     $tpl    = (int)($_POST['template_id'] ?? 0);
@@ -40,16 +55,16 @@ function doCreateAudit(): void {
         flash('error', 'Store not found.');
         header('Location: ?page=audit_new'); return;
     }
-    $smOk = $db->prepare('SELECT 1 FROM employees WHERE employee_code = ? AND is_active = 1 LIMIT 1');
-    $smOk->execute([$smCode]);
-    if (!$smOk->fetchColumn()) {
-        flash('error', 'Store Manager must be an active employee.');
+    // Name who was refused. "Must be an active employee" leaves the auditor
+    // guessing which of the two names on the form is the problem — and when
+    // the culprit is a stale store mapping that filled the field for them,
+    // it reads as if they did something wrong.
+    if (($why = auditInactiveEmployeeNote($db, $smCode, 'Store Manager')) !== '') {
+        flash('error', $why);
         header('Location: ?page=audit_new'); return;
     }
-    $seOk = $db->prepare('SELECT 1 FROM employees WHERE employee_code = ? AND is_active = 1 LIMIT 1');
-    $seOk->execute([$seCode]);
-    if (!$seOk->fetchColumn()) {
-        flash('error', 'Present Store Executive must be an active employee.');
+    if (($why = auditInactiveEmployeeNote($db, $seCode, 'Present Store Executive')) !== '') {
+        flash('error', $why);
         header('Location: ?page=audit_new'); return;
     }
 

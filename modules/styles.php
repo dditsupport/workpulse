@@ -236,6 +236,15 @@ tr.audit-cat-row.cat-score-green {border-left-color:var(--green)!important;backg
 .sm-proof-upload span{display:block;font-size:11px;color:var(--muted);margin-bottom:4px}
 .sm-proof-upload input[type=file]{font-size:11px}
 
+/* A mapping that points at someone who has left. Shown under the Store
+   Manager picker on Create Audit, and beside the name on the mapping
+   screen — the same warning in both places it matters. */
+.lm-inactive-note{margin-top:6px;padding:8px 10px;background:rgba(255,180,40,.10);
+  border:1px solid rgba(255,180,40,.32);border-radius:6px;color:#ffce6b;font-size:12px;line-height:1.5}
+.lm-inactive-tag{display:inline-flex;align-items:center;gap:4px;margin-left:6px;padding:1px 6px;
+  border-radius:3px;background:rgba(220,64,64,.18);border:1px solid rgba(220,64,64,.45);
+  color:#ff9a9a;font-size:10.5px;font-weight:600;white-space:nowrap}
+
 .btn-ghost-x{background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:12px;padding:0 4px}
 .btn-ghost-x:hover{color:var(--red)}
 /* Checklist: the clarification half of a task description ("Task name |
