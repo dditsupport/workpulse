@@ -877,11 +877,13 @@ function rejectedFilesNote(array $rejected): string {
 // photos — each passing its own form id and the selector its file inputs
 // carry. One copy, so a fix to the rules above reaches all of them.
 // $opts: allow_pdf (default true), allow_video (default false),
+//        allow_docs (Word/Excel, default false),
 //        max_bytes / max_video_bytes (0 = leave it to the server),
 //        max_post_bytes (the whole submit's ceiling, 0 = do not check).
 function renderPhotoCompressJs(string $formId, string $inputSelector, array $opts = []): void {
     $allowPdf      = (bool)($opts['allow_pdf']   ?? true);
     $allowVideo    = (bool)($opts['allow_video'] ?? false);
+    $allowDocs     = (bool)($opts['allow_docs']  ?? false);
     $maxBytes      = (int)($opts['max_bytes']       ?? 0);
     $maxVideoBytes = (int)($opts['max_video_bytes'] ?? 0);
     $maxPostBytes  = (int)($opts['max_post_bytes']  ?? 0);
@@ -893,12 +895,23 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
         var INPUT_SELECTOR = <?= json_encode($inputSelector) ?>;
         var ALLOW_PDF      = <?= $allowPdf ? 'true' : 'false' ?>;
         var ALLOW_VIDEO    = <?= $allowVideo ? 'true' : 'false' ?>;
+        var ALLOW_DOCS     = <?= $allowDocs ? 'true' : 'false' ?>;
         var MAX_BYTES      = <?= (int)$maxBytes ?>;
         var MAX_VIDEO      = <?= (int)$maxVideoBytes ?>;
         var MAX_POST       = <?= (int)$maxPostBytes ?>;
         var VIDEO_RE       = /^video\//i;
-        var ACCEPT_LABEL   = ALLOW_VIDEO ? 'photos, PDFs and video'
-                           : (ALLOW_PDF ? 'photos and PDFs' : 'photos');
+        // Word/Excel are judged by extension, not by type: the same .xlsx
+        // arrives as the openxml type on one machine, as application/zip,
+        // x-zip-compressed or a bare octet-stream on the next, so no type
+        // list gets them all. The extension is what the server checks too,
+        // and it reads the real bytes with finfo before storing anything.
+        var DOC_EXT_RE     = /\.(docx?|xlsx?)$/i;
+        var ACCEPT_LABEL   = [
+            'photos',
+            ALLOW_PDF   ? 'PDFs'              : '',
+            ALLOW_DOCS  ? 'Word/Excel files'  : '',
+            ALLOW_VIDEO ? 'video'             : ''
+        ].filter(function (s) { return s; }).join(', ').replace(/, ([^,]*)$/, ' and $1');
 
         var MAX_EDGE     = 1600;
         var SKIP_BELOW   = 600 * 1024;
@@ -1000,6 +1013,7 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
                 if (IMAGE_RE.test(f.type)) return true;
                 if (ALLOW_PDF && f.type === 'application/pdf') return true;
                 if (ALLOW_VIDEO && VIDEO_RE.test(f.type)) return true;
+                if (ALLOW_DOCS && DOC_EXT_RE.test(f.name || '')) return true;
                 return false;
             }
             function tooBig(f) {

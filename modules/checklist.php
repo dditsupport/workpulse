@@ -555,10 +555,20 @@ define('CHECKLIST_ALLOWED_MIME', [
     'heic' => ['image/heic','image/heif','application/octet-stream'],
     'heif' => ['image/heif','image/heic','application/octet-stream'],
     'pdf'  => ['application/pdf'],
-    'doc'  => ['application/msword','application/octet-stream'],
-    'docx' => ['application/vnd.openxmlformats-officedocument.wordprocessingml.document','application/octet-stream','application/zip'],
-    'xls'  => ['application/vnd.ms-excel','application/octet-stream'],
-    'xlsx' => ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet','application/octet-stream','application/zip'],
+    // Office files are one format read by several libmagic versions: a .doc
+    // or .xls is an OLE2 container, which older magic files only name as
+    // CDFV2 / x-ole-storage, and a .docx or .xlsx is a zip, which magic
+    // without the OOXML rules reports as application/zip. Every spelling is
+    // listed, else a valid workbook is dropped on some servers and stored
+    // on others.
+    'doc'  => ['application/msword','application/vnd.ms-office','application/octet-stream',
+               'application/CDFV2','application/CDFV2-unknown','application/x-ole-storage'],
+    'docx' => ['application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+               'application/octet-stream','application/zip','application/x-zip-compressed'],
+    'xls'  => ['application/vnd.ms-excel','application/vnd.ms-office','application/octet-stream',
+               'application/CDFV2','application/CDFV2-unknown','application/x-ole-storage'],
+    'xlsx' => ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+               'application/octet-stream','application/zip','application/x-zip-compressed'],
 ]);
 
 // Month bucket ("YYYY-MM") a log date's uploads roll up under.
@@ -633,9 +643,11 @@ function checklistResponseId(int $checklistId, int $locationId, int $itemId, str
 }
 
 // Persist files uploaded for one item under name="attachments[ITEM_ID][]".
-// Skips silently on size/extension/mime mismatches so a single bad file
-// doesn't derail the whole submit.
-function checklistSaveAttachments(int $responseId, int $locationId, string $logDate, int $itemId, string $uploaderCode, int $checklistId = 0): int {
+// A bad file is skipped rather than failing the submit, but never silently:
+// each one is appended to $rejected as ['name' => ..., 'reason' => ...] so
+// the caller can name it in the flash. A file that vanishes without a word
+// reads as the page losing work.
+function checklistSaveAttachments(int $responseId, int $locationId, string $logDate, int $itemId, string $uploaderCode, int $checklistId = 0, array &$rejected = []): int {
     if (empty($_FILES['attachments']['name'][$itemId]) || !is_array($_FILES['attachments']['name'][$itemId])) {
         return 0;
     }
@@ -657,21 +669,63 @@ function checklistSaveAttachments(int $responseId, int $locationId, string $logD
     $finfo = new finfo(FILEINFO_MIME_TYPE);
     $n = count($files['name']);
     for ($i = 0; $i < $n; $i++) {
-        if (($files['error'][$i] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) continue;
-        if ($files['size'][$i] > CHECKLIST_MAX_FILE_SIZE) continue;
-        $origName = basename((string)$files['name'][$i]);
+        $origName = basename((string)($files['name'][$i] ?? ''));
+        $err = $files['error'][$i] ?? UPLOAD_ERR_NO_FILE;
+        // An untouched input still posts one empty slot — not a rejection.
+        if ($err === UPLOAD_ERR_NO_FILE || $origName === '') continue;
+        $reject = function (string $reason) use (&$rejected, $origName) {
+            $rejected[] = ['name' => $origName, 'reason' => $reason];
+        };
+        if ($err !== UPLOAD_ERR_OK) {
+            $reject(in_array($err, [UPLOAD_ERR_INI_SIZE, UPLOAD_ERR_FORM_SIZE], true)
+                ? 'too large for this server'
+                : 'upload failed, error ' . (int)$err);
+            continue;
+        }
+        if ($files['size'][$i] > CHECKLIST_MAX_FILE_SIZE) {
+            $reject(formatBytes((int)$files['size'][$i]) . ', over the '
+                    . formatBytes(CHECKLIST_MAX_FILE_SIZE) . ' limit');
+            continue;
+        }
         $ext = mb_strtolower(pathinfo($origName, PATHINFO_EXTENSION));
-        if (!in_array($ext, CHECKLIST_ALLOWED_EXT, true)) continue;
+        if (!in_array($ext, CHECKLIST_ALLOWED_EXT, true)) {
+            $reject(($ext === '' ? 'no file extension' : '.' . $ext . ' files')
+                    . ' cannot be attached');
+            continue;
+        }
         $mime = $finfo->file($files['tmp_name'][$i]) ?: 'application/octet-stream';
-        $ok = CHECKLIST_ALLOWED_MIME[$ext] ?? [];
-        if (!in_array($mime, $ok, true)) continue;
+        // Case-insensitively: libmagic spells some types in caps
+        // (application/CDFV2), and the casing varies by magic file.
+        $ok = array_map('strtolower', CHECKLIST_ALLOWED_MIME[$ext] ?? []);
+        if (!in_array(strtolower($mime), $ok, true)) {
+            $reject('does not look like a .' . $ext . ' file inside (' . $mime . ')');
+            continue;
+        }
         $storedName = uniqid('chk_', true) . '.' . $ext;
         if (move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
             $st->execute([$responseId, $origName, $storedName, $mime, (int)$files['size'][$i], $uploaderCode]);
             $saved++;
+        } else {
+            $reject('could not be saved on the server');
         }
     }
     return $saved;
+}
+
+// Names of the files the browser actually posted for one item. Used to name
+// files in a message when the submit never gets as far as storing them —
+// an unanswered task or a closed section — since the uploader otherwise
+// watches a chosen file disappear with no word about it.
+function checklistPostedFileNames(int $itemId): array {
+    $names = $_FILES['attachments']['name'][$itemId] ?? null;
+    if (!is_array($names)) return [];
+    $out = [];
+    foreach ($names as $i => $nm) {
+        if (($_FILES['attachments']['error'][$itemId][$i] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) continue;
+        $nm = basename((string)$nm);
+        if ($nm !== '') $out[] = $nm;
+    }
+    return $out;
 }
 
 // Fetch all attachments for a given (checklist, location, date) grouped by item_id.
@@ -1093,20 +1147,37 @@ function doSaveChecklist(): void {
         $attachItemIds = array_values(array_filter($attachItemIds, fn($i) => $i > 0));
         chkLoadItemMeta($checklistId, $attachItemIds, $allSections, $ownItems, $secByItem);
         $attSaved = 0;
+        $attRejected = [];
         foreach ($attachItemIds as $itemId) {
             if (empty($ownItems[$itemId])) continue;
             $sec = $secByItem[$itemId] ?? null;
-            if (!checklistSectionEditable($sec, $day, $cl)) continue;
+            $rejectItemFiles = function (string $reason) use ($itemId, &$attRejected) {
+                foreach (checklistPostedFileNames($itemId) as $nm) {
+                    $attRejected[] = ['name' => $nm, 'reason' => $reason];
+                }
+            };
+            if (!checklistSectionEditable($sec, $day, $cl)) {
+                $rejectItemFiles('the section is outside its allowed time window');
+                continue;
+            }
             // The file hangs off the row for this task's own cycle, not the day.
             $itemLog = chkItemLogDate($sec, $cl, $day);
             $respId  = checklistResponseId($checklistId, $locationId, $itemId, $itemLog, $empCode);
-            if ($respId === null) continue; // no answer yet → ignore file
-            $attSaved += checklistSaveAttachments($respId, $locationId, $itemLog, $itemId, $empCode, $checklistId);
+            if ($respId === null) {
+                // No answer row to hang it on — tick the task or enter
+                // minutes and attach again, rather than lose it in silence.
+                $rejectItemFiles('the task has no answer yet — tick it or enter minutes, then attach');
+                continue;
+            }
+            $attSaved += checklistSaveAttachments($respId, $locationId, $itemLog, $itemId, $empCode, $checklistId, $attRejected);
         }
-        if ($attSaved > 0) {
+        if ($attSaved > 0 || $attRejected) {
             $prev = $_SESSION['flash'] ?? null;
             $prevMsg = ($prev && ($prev['type'] ?? '') === 'success') ? rtrim((string)$prev['msg']) . ' ' : '';
-            flash('success', $prevMsg . "{$attSaved} file(s) attached.");
+            $note = rejectedFilesNote($attRejected);
+            $msg  = $attSaved > 0 ? "{$attSaved} file(s) attached." : 'No file attached.';
+            // A rejection is the headline when nothing made it through.
+            flash($attSaved > 0 ? 'success' : 'error', $prevMsg . $msg . $note);
         }
     }
 
@@ -2992,8 +3063,12 @@ if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
     <input type="hidden" name="location_id" value="<?= $locationId ?>">
     <input type="hidden" name="log_date" value="<?= h($displayDate) ?>">
 </form>
-<?php renderPhotoCompressJs('chkForm', '.chk-files',
-    ['max_bytes' => min(CHECKLIST_MAX_FILE_SIZE, uploadLimitBytes()),
+<?php // allow_docs: the inputs above accept .doc/.docx/.xls/.xlsx and
+      // checklistSaveAttachments() stores them, so the client-side gate has
+      // to let them through as well.
+renderPhotoCompressJs('chkForm', '.chk-files',
+    ['allow_docs' => true,
+     'max_bytes' => min(CHECKLIST_MAX_FILE_SIZE, uploadLimitBytes()),
      'max_post_bytes' => postLimitBytes()]); ?>
 <?php else: ?>
 <div class="alert alert-error">No active checklist tasks found. Add tasks via Manage Tasks.</div>
