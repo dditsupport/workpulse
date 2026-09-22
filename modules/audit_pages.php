@@ -624,12 +624,28 @@ function pageAuditNew(): void {
     $empMapJson = json_encode($empMap, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
 
     // Location → mapped store manager (for the auto-fill on store pick).
+    //
+    // The map carries whether that person is still employed here. A store
+    // whose mapped manager has been deactivated used to auto-fill them
+    // anyway: they are in no department's list, so the page widened the
+    // department filter to "All" hunting for them, found nothing, and
+    // filled the field from the mapping regardless — leaving the auditor
+    // with a name they cannot use and a filter they did not choose, and
+    // the refusal only arriving on submit.
     $empNameByCode = [];
     foreach ($allEmpLite as $e) $empNameByCode[(string)$e['employee_code']] = (string)$e['full_name'];
+    $activeCodes = [];
+    foreach ($allEmployees as $e) $activeCodes[(string)$e['employee_code']] = true;
     $locManagerMap = [];
     if (function_exists('getLocationManagerMap')) {
         foreach (getLocationManagerMap() as $lid => $code) {
-            $locManagerMap[(string)$lid] = ['code' => (string)$code, 'name' => ($empNameByCode[(string)$code] ?? (string)$code)];
+            $code = (string)$code;
+            $locManagerMap[(string)$lid] = [
+                'code'   => $code,
+                'name'   => ($empNameByCode[$code] ?? $code),
+                'active' => isset($activeCodes[$code]),
+                'known'  => array_key_exists($code, $empNameByCode),
+            ];
         }
     }
     $locManagerMapJson = json_encode($locManagerMap, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
@@ -683,6 +699,7 @@ function pageAuditNew(): void {
                     <div class="combo-dropdown" id="smDropdown" role="listbox"></div>
                 </div>
                 <input type="hidden" name="store_manager_code" id="smCode">
+                <div id="smMappingNote" class="lm-inactive-note" hidden></div>
             </div>
             <div class="form-group">
                 <label>Present Store Executive <span class="required">*</span></label>
@@ -867,23 +884,53 @@ function pageAuditNew(): void {
         // store is picked. Switch the dept filter to "All" so the mapped manager
         // is always present in the list (keeps resolve()/validation happy). Stays
         // editable — the auditor can change it afterwards.
+        var smNote = document.getElementById('smMappingNote');
+        function setSmNote(html) {
+            if (!smNote) return;
+            smNote.innerHTML = html || '';
+            smNote.hidden = !html;
+        }
+        function clearSm() {
+            var smPicker = document.getElementById('smPicker');
+            smPicker.value = '';
+            document.getElementById('smCode').value = '';
+            var w = smPicker.closest('.combo-wrap'); if (w) w.classList.remove('has-value');
+        }
+
         document.getElementById('storePicker').addEventListener('combo:picked', function () {
             var lid = document.getElementById('storeId').value;
             var m = locManagerMap[lid];
-            if (m && m.code) {
-                // Keep the current department (defaults to Retail Sales). Only
-                // widen to "All" if the mapped manager isn't in that department,
-                // so the value still resolves on submit.
-                var curKey = String(parseInt(deptSel.value, 10) || 0);
-                var inDept = (empMap[curKey] || []).some(function (e) { return e.code === m.code; });
-                if (!inDept) deptSel.value = '0';
-                smCombo.rebuild();
-                execCombo.rebuild();
-                var smPicker = document.getElementById('smPicker');
-                smPicker.value = m.name + ' (' + m.code + ')';
-                document.getElementById('smCode').value = m.code;
-                var w = smPicker.closest('.combo-wrap'); if (w) w.classList.add('has-value');
+            setSmNote('');
+            if (!m || !m.code) { clearSm(); return; }
+
+            // A mapped manager who has left, or was deactivated, cannot be
+            // the Store Manager on a new audit — the server refuses them,
+            // and they could not open the Justify step anyway. Say so here,
+            // leave the field empty for a real choice, and do not touch the
+            // department filter: widening it cannot surface someone who is
+            // in no list.
+            if (!m.active) {
+                clearSm();
+                var who = m.known ? (m.name + ' (' + m.code + ')') : ('employee code ' + m.code);
+                setSmNote('<strong>⚠ This store\'s mapped Store Manager is '
+                    + (m.known ? 'inactive' : 'no longer on record') + ':</strong> ' + who
+                    + '. Pick an active Store Manager below for this audit, and have the store mapping '
+                    + 'updated (Store Manager Mapping) so the next one fills in by itself.');
+                return;
             }
+
+            // Keep the current department (defaults to Retail Sales). Only
+            // widen to "All" if the mapped manager isn't in that department,
+            // so the value still resolves on submit.
+            var curKey = String(parseInt(deptSel.value, 10) || 0);
+            var inDept = (empMap[curKey] || []).some(function (e) { return e.code === m.code; });
+            if (!inDept) deptSel.value = '0';
+            smCombo.rebuild();
+            execCombo.rebuild();
+            var smPicker = document.getElementById('smPicker');
+            smPicker.value = m.name + ' (' + m.code + ')';
+            document.getElementById('smCode').value = m.code;
+            var w = smPicker.closest('.combo-wrap'); if (w) w.classList.add('has-value');
         });
 
         window.auditNewValidate = function () {
@@ -894,7 +941,10 @@ function pageAuditNew(): void {
                 alert('Please pick a Store from the suggestions.'); document.getElementById('storePicker').focus(); return false;
             }
             if (!document.getElementById('smCode').value) {
-                alert('Please pick a Store Manager from the suggestions.'); document.getElementById('smPicker').focus(); return false;
+                alert(smNote && !smNote.hidden
+                    ? 'This store\'s mapped Store Manager is no longer active. Pick an active Store Manager from the suggestions.'
+                    : 'Please pick a Store Manager from the suggestions.');
+                document.getElementById('smPicker').focus(); return false;
             }
             if (!document.getElementById('execCode').value) {
                 alert('Please pick a Present Store Executive from the suggestions.'); document.getElementById('execPicker').focus(); return false;

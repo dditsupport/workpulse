@@ -106,8 +106,10 @@ function getLocationOperationManagerMap(): array {
 // still shows something the user can act on.
 function locMgrMappings(): array {
     $hasOps = locMgrHasOpsColumn();
-    $sql = 'SELECT lm.location_id, lm.store_manager_code, sm.full_name AS sm_name, sm.phone AS sm_phone'
-         . ($hasOps ? ', lm.operation_manager_code, om.full_name AS om_name, om.phone AS om_phone' : '')
+    $sql = 'SELECT lm.location_id, lm.store_manager_code, sm.full_name AS sm_name, sm.phone AS sm_phone,
+                   sm.is_active AS sm_active'
+         . ($hasOps ? ', lm.operation_manager_code, om.full_name AS om_name, om.phone AS om_phone,
+                   om.is_active AS om_active' : '')
          . ' FROM location_managers lm
             LEFT JOIN employees sm ON sm.employee_code = lm.store_manager_code'
          . ($hasOps ? ' LEFT JOIN employees om ON om.employee_code = lm.operation_manager_code' : '');
@@ -120,13 +122,21 @@ function locMgrMappings(): array {
     foreach ($rows as $r) {
         $sm = trim((string)$r['store_manager_code']);
         $om = trim((string)($r['operation_manager_code'] ?? ''));
+        // A mapping outlives the person it names: deactivate the employee
+        // and the row still points at them, which is how a store ends up
+        // auto-filling an unusable Store Manager onto a new audit. NULL
+        // from the LEFT JOIN means no such employee at all.
         $mapped[(int)$r['location_id']] = [
-            'sm'       => $sm,
-            'sm_name'  => $sm === '' ? '' : ((string)($r['sm_name'] ?? '') ?: $sm),
-            'sm_phone' => $sm === '' ? '' : trim((string)($r['sm_phone'] ?? '')),
-            'om'       => $om,
-            'om_name'  => $om === '' ? '' : ((string)($r['om_name'] ?? '') ?: $om),
-            'om_phone' => $om === '' ? '' : trim((string)($r['om_phone'] ?? '')),
+            'sm'        => $sm,
+            'sm_name'   => $sm === '' ? '' : ((string)($r['sm_name'] ?? '') ?: $sm),
+            'sm_phone'  => $sm === '' ? '' : trim((string)($r['sm_phone'] ?? '')),
+            'sm_active' => $sm === '' ? true : ($r['sm_name'] !== null && (int)($r['sm_active'] ?? 0) === 1),
+            'sm_known'  => $sm === '' ? true : ($r['sm_name'] !== null),
+            'om'        => $om,
+            'om_name'   => $om === '' ? '' : ((string)($r['om_name'] ?? '') ?: $om),
+            'om_phone'  => $om === '' ? '' : trim((string)($r['om_phone'] ?? '')),
+            'om_active' => $om === '' ? true : (($r['om_name'] ?? null) !== null && (int)($r['om_active'] ?? 0) === 1),
+            'om_known'  => $om === '' ? true : (($r['om_name'] ?? null) !== null),
         ];
     }
     return $mapped;
@@ -558,12 +568,20 @@ function pageLocationManagers(): void {
 
     // One person in the tree: name, code, and the mobile the page exists to
     // surface. Phone is optional on employees, so say so rather than leave a gap.
-    $personHtml = function (string $name, string $code, string $phone): string {
+    $personHtml = function (string $name, string $code, string $phone,
+                            bool $active = true, bool $known = true): string {
         if ($code === '') return '<span class="text-muted">— not set —</span>';
-        return h($name) . ' <span class="text-muted">(' . h($code) . ')</span>'
+        // An inactive mapping still does work downstream — Create Audit
+        // reads it — so it is flagged here rather than left to surprise
+        // whoever files the next audit for this store.
+        $tag = $active ? '' : '<span class="lm-inactive-tag">'
+             . ($known ? 'INACTIVE' : 'NO SUCH EMPLOYEE') . '</span>';
+        return h($name) . ' <span class="text-muted">(' . h($code) . ')</span>' . $tag
              . '<div class="text-muted" style="font-size:11px">'
              . ($phone !== '' ? '📱 ' . h($phone) : 'no mobile on file')
-             . '</div>';
+             . '</div>'
+             . ($active ? '' : '<div class="lm-inactive-note">This person is no longer active, so a new'
+                 . ' audit for this store cannot use them. Map an active employee here.</div>');
     };
 ?>
 <style>
@@ -679,7 +697,8 @@ function lmToggleImport() {
             <tr>
                 <td><?= h($l['location_name']) ?></td>
                 <td>
-                    <?= $personHtml($m['sm_name'] ?? '', $m['sm'] ?? '', $m['sm_phone'] ?? '') ?>
+                    <?= $personHtml($m['sm_name'] ?? '', $m['sm'] ?? '', $m['sm_phone'] ?? '',
+                                    (bool)($m['sm_active'] ?? true), (bool)($m['sm_known'] ?? true)) ?>
                     <?php if ($hasExec): ?>
                         <?php if ($rowExecs): ?>
                         <div class="text-muted lm-tree-label">Store Executives (<?= count($rowExecs) ?>)</div>
@@ -694,7 +713,8 @@ function lmToggleImport() {
                     <?php endif; ?>
                 </td>
                 <?php if ($hasOps): ?>
-                <td><?= $personHtml($m['om_name'] ?? '', $m['om'] ?? '', $m['om_phone'] ?? '') ?></td>
+                <td><?= $personHtml($m['om_name'] ?? '', $m['om'] ?? '', $m['om_phone'] ?? '',
+                                    (bool)($m['om_active'] ?? true), (bool)($m['om_known'] ?? true)) ?></td>
                 <?php endif; ?>
                 <?php if ($canEdit): ?>
                 <td style="white-space:nowrap">
