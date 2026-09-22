@@ -979,7 +979,9 @@ function pageAuditEdit(): void {
         <input type="hidden" name="att_id" id="auditAttDelAttId" value="">
     </form>
     <?php renderAuditEditJs(); ?>
-    <?php renderPhotoCompressJs('auditForm', '.param-files'); ?>
+    <?php renderPhotoCompressJs('auditForm', '.param-files',
+        ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(),
+         'max_video_bytes' => auditMaxVideoBytes(), 'max_post_bytes' => postLimitBytes()]); ?>
     <?php
 }
 
@@ -1429,7 +1431,9 @@ function pageAuditManagerReview(): void {
         <input type="hidden" name="audit_id" id="auditAttDelAuditId" value="">
         <input type="hidden" name="att_id" id="auditAttDelAttId" value="">
     </form>
-    <?php renderPhotoCompressJs('auditManagerReviewForm', '.param-files'); ?>
+    <?php renderPhotoCompressJs('auditManagerReviewForm', '.param-files',
+        ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(),
+         'max_video_bytes' => auditMaxVideoBytes(), 'max_post_bytes' => postLimitBytes()]); ?>
     <?php
 }
 
@@ -2881,7 +2885,8 @@ function renderAuditEditTable(array $tree, int $auditId, bool $readonly, int $lo
                     <td class="wide-cell" data-label="Documents">
                         <?php renderAuditAttachmentChips(auditAttachmentsForStage($p['attachments'] ?? [], 'auditor'), $auditId, $readonly, 'auditor'); ?>
                         <?php if (!$readonly): ?>
-                            <input type="file" class="form-control param-files" name="param_files[<?= (int)$p['id'] ?>][]" accept="image/*,application/pdf" multiple capture="environment" style="font-size:11px;margin-top:4px">
+                            <input type="file" class="form-control param-files" name="param_files[<?= (int)$p['id'] ?>][]" accept="image/*,video/*,application/pdf" multiple capture="environment" style="font-size:11px;margin-top:4px">
+                            <div class="hint" style="font-size:10px;margin-top:2px">Photos, PDFs, or video up to <?= h(formatBytes(auditMaxVideoBytes())) ?></div>
                         <?php endif; ?>
                     </td>
                 </tr>
@@ -3429,6 +3434,7 @@ function renderAuditAttachmentChips(array $attachments, int $auditId, bool $read
     <div class="att-list" style="margin-top:6px">
     <?php foreach ($attachments as $att):
         $isImg     = isset($att['mime_type']) && stripos((string)$att['mime_type'], 'image/') === 0;
+        $isVideo   = isset($att['mime_type']) && stripos((string)$att['mime_type'], 'video/') === 0;
         $pinsOpen  = (int)($att['pins_open']  ?? 0);
         $pinsTotal = (int)($att['pins_total'] ?? 0);
         $stage     = auditAttachmentStage($att);
@@ -3443,6 +3449,7 @@ function renderAuditAttachmentChips(array $attachments, int $auditId, bool $read
         $who  = (string)($att['uploader_name'] ?? $att['uploaded_by'] ?? '');
         $when = !empty($att['uploaded_at']) ? date('d M, h:i A', strtotime((string)$att['uploaded_at'])) : '';
         $byLine = trim(($isSm ? 'Store Manager proof' : 'Auditor evidence')
+            . ($isVideo ? ' · video' : '')
             . ($who !== '' ? ' · ' . $who : '') . ($when !== '' ? ' · ' . $when : ''));
         $pinLine = $pinsTotal > 0
             ? ($pinsOpen . ' open / ' . $pinsTotal . ' total pin' . ($pinsTotal === 1 ? '' : 's'))
@@ -3451,6 +3458,7 @@ function renderAuditAttachmentChips(array $attachments, int $auditId, bool $read
         <a class="att-chip<?= $chipCls ?><?= $isSm ? ' is-sm-proof' : '' ?>" href="?page=download_audit_attachment&audit_id=<?= $auditId ?>&att_id=<?= (int)$att['id'] ?>" target="_blank"
            title="<?= h($byLine . ' · ' . $pinLine) ?>">
             <?php if ($isSm): ?><span class="att-stage-tag" aria-hidden="true">SM</span><?php endif; ?>
+            <?php if ($isVideo): ?><span aria-hidden="true">▶</span><?php endif; ?>
             <?= h($att['filename']) ?>
         </a>
         <?php if ($isImg): ?>
@@ -3551,9 +3559,9 @@ function renderAuditManagerReviewTable(array $tree, int $auditId, int $locationI
                         ?>
                         <?php if ($r): ?>
                             <label class="sm-proof-upload">
-                                <span>📷 Attach photo of verified work</span>
+                                <span>📷 Attach photo or video of verified work</span>
                                 <input type="file" class="form-control param-files" name="sm_files[<?= (int)$p['id'] ?>][]"
-                                       accept="image/*,application/pdf" multiple capture="environment">
+                                       accept="image/*,video/*,application/pdf" multiple capture="environment">
                             </label>
                         <?php endif; ?>
                     </td>

@@ -2992,7 +2992,9 @@ if ($graceDate !== null && !$onGraceDay && $displayDate === $effectiveDate) {
     <input type="hidden" name="location_id" value="<?= $locationId ?>">
     <input type="hidden" name="log_date" value="<?= h($displayDate) ?>">
 </form>
-<?php renderPhotoCompressJs('chkForm', '.chk-files'); ?>
+<?php renderPhotoCompressJs('chkForm', '.chk-files',
+    ['max_bytes' => min(CHECKLIST_MAX_FILE_SIZE, uploadLimitBytes()),
+     'max_post_bytes' => postLimitBytes()]); ?>
 <?php else: ?>
 <div class="alert alert-error">No active checklist tasks found. Add tasks via Manage Tasks.</div>
 <?php endif; ?>

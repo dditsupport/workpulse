@@ -769,6 +769,47 @@ function phpEolDate(string $branch): string {
     return $eol[$branch] ?? 'Unknown';
 }
 
+// ── What this server will actually take ─────────────────
+// An app limit above the server's own is a promise we cannot keep: PHP
+// discards an over-sized upload before any handler runs, so the only
+// honest cap is the smaller of the two, and it is the number the screen
+// should show.
+
+// "8M", "512K", "1G", "1048576" → bytes. 0 or -1 in php.ini means
+// unlimited, which we report as PHP_INT_MAX so min() picks the other side.
+function iniBytes(string $value): int {
+    $value = trim($value);
+    if ($value === '') return 0;
+    $unit = mb_strtolower(substr($value, -1));
+    $n    = (int)$value;
+    if ($n <= 0) return PHP_INT_MAX; // 0 / -1 → no limit
+    switch ($unit) {
+        case 'g': return $n * 1024 * 1024 * 1024;
+        case 'm': return $n * 1024 * 1024;
+        case 'k': return $n * 1024;
+    }
+    return $n;
+}
+
+// The largest whole request PHP will accept here, less a little room for
+// the form's own fields. post_max_size covers every file in one submit
+// added together, which is a separate ceiling from the per-file one and
+// the one people trip over when attaching a video and photos at once.
+function postLimitBytes(): int {
+    $perPost = iniBytes((string)ini_get('post_max_size'));
+    return $perPost === PHP_INT_MAX ? PHP_INT_MAX : max(0, $perPost - 256 * 1024);
+}
+
+// The largest single file that can reach PHP here. post_max_size caps the
+// whole request, so a file can never exceed it either — and a form carries
+// a little text besides, hence the small allowance.
+function uploadLimitBytes(): int {
+    $perFile = iniBytes((string)ini_get('upload_max_filesize'));
+    $perPost = iniBytes((string)ini_get('post_max_size'));
+    if ($perPost !== PHP_INT_MAX) $perPost = max(0, $perPost - 64 * 1024);
+    return min($perFile, $perPost);
+}
+
 // ── Upload plumbing shared by every module that takes files ──
 // Audits, checklists and event photos all face the same questions
 // about an upload: why the server refused it, what to call it once
@@ -835,13 +876,29 @@ function rejectedFilesNote(array $rejected): string {
 // Shared by every upload form in the app — audits, checklists and event
 // photos — each passing its own form id and the selector its file inputs
 // carry. One copy, so a fix to the rules above reaches all of them.
-function renderPhotoCompressJs(string $formId, string $inputSelector): void {
+// $opts: allow_pdf (default true), allow_video (default false),
+//        max_bytes / max_video_bytes (0 = leave it to the server),
+//        max_post_bytes (the whole submit's ceiling, 0 = do not check).
+function renderPhotoCompressJs(string $formId, string $inputSelector, array $opts = []): void {
+    $allowPdf      = (bool)($opts['allow_pdf']   ?? true);
+    $allowVideo    = (bool)($opts['allow_video'] ?? false);
+    $maxBytes      = (int)($opts['max_bytes']       ?? 0);
+    $maxVideoBytes = (int)($opts['max_video_bytes'] ?? 0);
+    $maxPostBytes  = (int)($opts['max_post_bytes']  ?? 0);
     ?>
     <script>
     (function () {
         var form = document.getElementById(<?= json_encode($formId) ?>);
         if (!form) return;
         var INPUT_SELECTOR = <?= json_encode($inputSelector) ?>;
+        var ALLOW_PDF      = <?= $allowPdf ? 'true' : 'false' ?>;
+        var ALLOW_VIDEO    = <?= $allowVideo ? 'true' : 'false' ?>;
+        var MAX_BYTES      = <?= (int)$maxBytes ?>;
+        var MAX_VIDEO      = <?= (int)$maxVideoBytes ?>;
+        var MAX_POST       = <?= (int)$maxPostBytes ?>;
+        var VIDEO_RE       = /^video\//i;
+        var ACCEPT_LABEL   = ALLOW_VIDEO ? 'photos, PDFs and video'
+                           : (ALLOW_PDF ? 'photos and PDFs' : 'photos');
 
         var MAX_EDGE     = 1600;
         var SKIP_BELOW   = 600 * 1024;
@@ -929,50 +986,127 @@ function renderPhotoCompressJs(string $formId, string $inputSelector): void {
             var files  = Array.from(input.files || []);
             if (!files.length) { status.textContent = ''; return; }
 
+            // Weed out what this form cannot take before it costs anyone a
+            // long upload on mobile data. Too big is as final as the wrong
+            // type: PHP discards an over-sized request before any handler
+            // runs, and that takes the files beside it down too.
+            //
+            // Photos are judged after compression, not here — the whole
+            // point of the next step is that they come down. An empty type
+            // tells us nothing (some browsers say nothing for HEIC), so
+            // those go up and the server decides on the bytes.
+            function accepts(f) {
+                if (!f.type) return true;
+                if (IMAGE_RE.test(f.type)) return true;
+                if (ALLOW_PDF && f.type === 'application/pdf') return true;
+                if (ALLOW_VIDEO && VIDEO_RE.test(f.type)) return true;
+                return false;
+            }
+            function tooBig(f) {
+                if (!f.type || IMAGE_RE.test(f.type)) return 0; // judged after compression
+                var cap = VIDEO_RE.test(f.type) ? MAX_VIDEO : MAX_BYTES;
+                return (cap > 0 && f.size > cap) ? cap : 0;
+            }
+            var keep = [], dropped = [];
+            files.forEach(function (f) {
+                if (!accepts(f)) {
+                    dropped.push(f.name + ' — only ' + ACCEPT_LABEL + ' can be attached');
+                    return;
+                }
+                var cap = tooBig(f);
+                if (cap) {
+                    dropped.push(f.name + ' — ' + fmtSize(f.size) + ', over the ' + fmtSize(cap) + ' limit');
+                    return;
+                }
+                keep.push(f);
+            });
+            var note = '';
+            if (dropped.length) {
+                if (setFiles(input, keep)) {
+                    note  = 'Not attached: ' + dropped.join('; ') + '. ';
+                    files = keep;
+                } else {
+                    note = 'Cannot be attached: ' + dropped.join('; ') + '. ';
+                }
+            }
+            function say(color, text) {
+                var over = overPostLimit();
+                var warn = over
+                    ? ' ⚠ ' + fmtSize(over) + ' attached in total — over this server\'s '
+                      + fmtSize(MAX_POST) + ' limit for one submit; remove one and save in two rounds.'
+                    : '';
+                status.style.color = (note || warn) ? 'var(--yellow)' : color;
+                status.textContent = note + text + warn;
+            }
+            if (!files.length) { say('var(--muted)', ''); return; }
+
             var origTotal = files.reduce(function (n, f) { return n + f.size; }, 0);
             var compressableAny = files.some(function (f) {
                 return IMAGE_RE.test(f.type) && (f.size > SKIP_BELOW || mustConvert(f));
             });
             if (!compressableAny) {
-                status.style.color = 'var(--muted)';
-                status.textContent = files.length + ' file(s) — ' + fmtSize(origTotal);
+                say('var(--muted)', files.length + ' file(s) — ' + fmtSize(origTotal));
                 return;
             }
 
             inflight++;
             setSubmitDisabled(true);
-            status.style.color = 'var(--muted)';
-            status.textContent = 'Compressing photo(s)…';
+            say('var(--muted)', 'Compressing photo(s)…');
 
             Promise.all(files.map(compressOne)).then(function (out) {
                 var newTotal = out.reduce(function (n, f) { return n + f.size; }, 0);
                 if (!setFiles(input, out)) {
-                    status.style.color = 'var(--yellow)';
-                    status.textContent = 'Could not replace selected files — uploading originals (' + fmtSize(origTotal) + ').';
+                    say('var(--yellow)', 'Could not replace selected files — uploading originals (' + fmtSize(origTotal) + ').');
                 } else if (newTotal < origTotal) {
-                    status.style.color = 'var(--green)';
-                    status.textContent = fmtSize(origTotal) + ' → ' + fmtSize(newTotal)
-                        + ' (' + Math.round((1 - newTotal / origTotal) * 100) + '% smaller).';
+                    say('var(--green)', fmtSize(origTotal) + ' → ' + fmtSize(newTotal)
+                        + ' (' + Math.round((1 - newTotal / origTotal) * 100) + '% smaller).');
                 } else {
-                    status.style.color = 'var(--muted)';
-                    status.textContent = out.length + ' file(s) — ' + fmtSize(newTotal);
+                    say('var(--muted)', out.length + ' file(s) — ' + fmtSize(newTotal));
                 }
             }).catch(function (err) {
-                status.style.color = 'var(--yellow)';
-                status.textContent = 'Compression failed — uploading originals (' + fmtSize(origTotal) + '). ' + (err && err.message ? err.message : '');
+                say('var(--yellow)', 'Compression failed — uploading originals (' + fmtSize(origTotal) + '). ' + (err && err.message ? err.message : ''));
             }).then(function () {
                 inflight = Math.max(0, inflight - 1);
                 if (inflight === 0) setSubmitDisabled(false);
             });
         }, true);
 
-        // Block submit while any compression is still running. Once
-        // done, the click goes through. Existing form-level handlers
-        // (validation etc.) fire afterward unaffected.
+        // post_max_size caps the whole request, not each file — so a
+        // video that fits on its own can still sink the submit once
+        // photos ride along, and PHP throws the lot away before anything
+        // here runs: every remark typed on the page goes with it. Add the
+        // selection up across the form and say so while there is still
+        // something to remove.
+        function totalPicked() {
+            var total = 0;
+            form.querySelectorAll(INPUT_SELECTOR).forEach(function (el) {
+                Array.prototype.forEach.call(el.files || [], function (f) { total += f.size; });
+            });
+            return total;
+        }
+        function overPostLimit() {
+            if (MAX_POST <= 0) return 0;
+            var t = totalPicked();
+            return t > MAX_POST ? t : 0;
+        }
+
+        // Block submit while any compression is still running, or while
+        // the selection cannot fit in one request. Once neither holds, the
+        // click goes through and existing form-level handlers (validation
+        // etc.) fire afterward unaffected.
         form.addEventListener('submit', function (e) {
             if (inflight > 0) {
                 e.preventDefault();
                 alert('Still compressing photo(s) — please wait a moment and try again.');
+                return;
+            }
+            var over = overPostLimit();
+            if (over) {
+                e.preventDefault();
+                alert('Too much attached to send at once: ' + fmtSize(over)
+                    + ' against this server\'s ' + fmtSize(MAX_POST) + ' limit for one submit.\n\n'
+                    + 'Remove a file and save, then attach the rest — nothing typed will be lost. '
+                    + 'Sending it as it stands would lose the whole page.');
             }
         }, true);
     })();
