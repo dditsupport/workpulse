@@ -980,7 +980,8 @@ function pageAuditEdit(): void {
     </form>
     <?php renderAuditEditJs(); ?>
     <?php renderPhotoCompressJs('auditForm', '.param-files',
-        ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(), 'max_video_bytes' => auditMaxVideoBytes()]); ?>
+        ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(),
+         'max_video_bytes' => auditMaxVideoBytes(), 'max_post_bytes' => postLimitBytes()]); ?>
     <?php
 }
 
@@ -1431,7 +1432,8 @@ function pageAuditManagerReview(): void {
         <input type="hidden" name="att_id" id="auditAttDelAttId" value="">
     </form>
     <?php renderPhotoCompressJs('auditManagerReviewForm', '.param-files',
-        ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(), 'max_video_bytes' => auditMaxVideoBytes()]); ?>
+        ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(),
+         'max_video_bytes' => auditMaxVideoBytes(), 'max_post_bytes' => postLimitBytes()]); ?>
     <?php
 }
 

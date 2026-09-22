@@ -366,7 +366,8 @@ document.addEventListener('keydown', function (e) {
     </div>
 </div>
 <?php renderPhotoCompressJs('epUploadForm', '.ep-files',
-    ['allow_pdf' => false, 'max_bytes' => min(EVENT_PHOTO_MAX_FILE_SIZE, uploadLimitBytes())]); ?>
+    ['allow_pdf' => false, 'max_bytes' => min(EVENT_PHOTO_MAX_FILE_SIZE, uploadLimitBytes()),
+     'max_post_bytes' => postLimitBytes()]); ?>
 <script>
 function epOpenUpload(){document.getElementById('epUploadModal').classList.add('active');}
 function epCloseUpload(e){
