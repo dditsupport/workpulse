@@ -1170,10 +1170,65 @@ function downloadAuditAttachment(): void {
     // Track the open before streaming the bytes — the file leaves the
     // server regardless of whether the browser inlines it or saves it.
     auditLogView($auditId, 'attachment', $attId);
-    header('Content-Type: ' . $att['mime_type']);
-    header('Content-Disposition: inline; filename="' . $att['filename'] . '"');
-    header('Content-Length: ' . $att['file_size']);
-    readfile($path);
+    streamAttachment($path, (string)$att['mime_type'], (string)$att['filename']);
+}
+
+// Send a stored file, honouring a Range request.
+//
+// Videos need this. A player asks for a few bytes first to read the header
+// and then seeks by asking for byte ranges; a server that answers every
+// request with the whole file and a 200 leaves the scrub bar dead, and
+// Safari refuses to start playing at all. Photos and PDFs are unaffected —
+// nothing asks them for a range, and they take the plain path below.
+//
+// Content-Length comes from the file on disk rather than the stored size,
+// because that is the number of bytes actually about to be written.
+function streamAttachment(string $path, string $mime, string $downloadName): void {
+    $size = (int)@filesize($path);
+    $fh   = @fopen($path, 'rb');
+    if (!$fh || $size <= 0) { http_response_code(404); echo 'File missing'; return; }
+
+    header('Content-Type: ' . $mime);
+    header('Content-Disposition: inline; filename="' . str_replace('"', '', $downloadName) . '"');
+    header('Accept-Ranges: bytes');
+    // A big file streamed in chunks must not be buffered whole in memory,
+    // and must not be gzipped (that breaks the byte offsets).
+    while (ob_get_level() > 0) ob_end_clean();
+
+    $start = 0;
+    $end   = $size - 1;
+    $range = (string)($_SERVER['HTTP_RANGE'] ?? '');
+    if ($range !== '' && preg_match('/^bytes=(\d*)-(\d*)$/', trim($range), $m)) {
+        $reqStart = $m[1] === '' ? null : (int)$m[1];
+        $reqEnd   = $m[2] === '' ? null : (int)$m[2];
+        if ($reqStart === null && $reqEnd !== null) {
+            // "bytes=-500" — the last 500 bytes.
+            $start = max(0, $size - $reqEnd);
+        } else {
+            $start = (int)$reqStart;
+            if ($reqEnd !== null) $end = min($reqEnd, $size - 1);
+        }
+        if ($start > $end || $start >= $size) {
+            http_response_code(416);
+            header('Content-Range: bytes */' . $size);
+            fclose($fh);
+            return;
+        }
+        http_response_code(206);
+        header('Content-Range: bytes ' . $start . '-' . $end . '/' . $size);
+    }
+
+    header('Content-Length: ' . ($end - $start + 1));
+    if ($start > 0) fseek($fh, $start);
+    $remaining = $end - $start + 1;
+    while ($remaining > 0 && !feof($fh)) {
+        $chunk = fread($fh, (int)min(256 * 1024, $remaining));
+        if ($chunk === false || $chunk === '') break;
+        echo $chunk;
+        $remaining -= strlen($chunk);
+        flush();
+    }
+    fclose($fh);
     exit;
 }
 

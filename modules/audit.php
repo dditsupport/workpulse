@@ -15,6 +15,22 @@
 
 define('AUDIT_UPLOAD_DIR', __DIR__ . '/../uploads/audit/');
 define('AUDIT_MAX_FILE_SIZE', 5 * 1024 * 1024);
+// Video gets its own, far larger cap. A photo arrives already shrunk by
+// the browser, so 5 MB is generous; a video cannot be re-encoded in the
+// page and comes off the phone at tens of megabytes, so holding it to the
+// photo limit is the same as not allowing video at all.
+define('AUDIT_MAX_VIDEO_SIZE', 64 * 1024 * 1024);
+// The caps as this server can actually honour them. Never quote
+// AUDIT_MAX_VIDEO_SIZE to anyone directly: if php.ini stops at 32M, 64
+// is a number that will only waste someone's upload.
+function auditMaxVideoBytes(): int { return min(AUDIT_MAX_VIDEO_SIZE, uploadLimitBytes()); }
+function auditMaxFileBytes():  int { return min(AUDIT_MAX_FILE_SIZE,  uploadLimitBytes()); }
+
+// Is this one of the video types an audit accepts?
+function auditIsVideoMime(string $mime): bool {
+    return array_key_exists($mime, AUDIT_VIDEO_MIME_EXT);
+}
+
 // Which side of the audit an attachment came from — see
 // audit_response_attachments.uploaded_stage.
 define('AUDIT_ATTACHMENT_STAGES', ['auditor', 'store_manager']);
@@ -25,6 +41,16 @@ define('AUDIT_ATTACHMENT_STAGES', ['auditor', 'store_manager']);
 // refusing those is refusing a perfectly good photo. Reading the content
 // is also the safer half of the pair: the stored extension can then never
 // be one the uploader chose.
+// Video the phones in the field actually produce: Android records MP4,
+// iPhone records QuickTime .mov, older handsets 3GP. WebM is here because
+// it is the one a browser is certain to play back.
+define('AUDIT_VIDEO_MIME_EXT', [
+    'video/mp4'        => 'mp4',
+    'video/quicktime'  => 'mov',
+    'video/3gpp'       => '3gp',
+    'video/webm'       => 'webm',
+    'video/x-m4v'      => 'm4v',
+]);
 define('AUDIT_MIME_EXT', [
     'image/jpeg'      => 'jpg',
     'image/pjpeg'     => 'jpg',
@@ -840,14 +866,18 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
         // bytes decide, not the name.
         $finfo = new finfo(FILEINFO_MIME_TYPE);
         $mime  = (string)$finfo->file($files['tmp_name'][$i]);
-        $ext   = AUDIT_MIME_EXT[$mime] ?? null;
+        $isVideo = auditIsVideoMime($mime);
+        $ext   = $isVideo ? AUDIT_VIDEO_MIME_EXT[$mime] : (AUDIT_MIME_EXT[$mime] ?? null);
         if ($ext === null) {
             $reject($origName, auditUnsupportedTypeReason($mime));
             continue;
         }
-        if ($files['size'][$i] > AUDIT_MAX_FILE_SIZE) {
+        // Video carries its own allowance, and both are held to whatever
+        // this server will really accept.
+        $cap = $isVideo ? auditMaxVideoBytes() : auditMaxFileBytes();
+        if ($files['size'][$i] > $cap) {
             $reject($origName, formatBytes((int)$files['size'][$i]) . ' — over the '
-                . formatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
+                . formatBytes($cap) . ' limit for one ' . ($isVideo ? 'video' : 'file'));
             continue;
         }
         // Keep the human-readable name but make its extension tell the
@@ -871,16 +901,18 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
 function auditUnsupportedTypeReason(string $mime): string {
     // Formats, not extensions — "jpg, jpeg" reads like two different
     // things to the person being told what to send.
-    $allowed = 'send a JPG, PNG, GIF, WebP or PDF';
+    $allowed = 'send a JPG, PNG, GIF, WebP, PDF, or an MP4 / MOV video';
     if (preg_match('#^image/hei[cf]#i', $mime)) {
         return 'an iPhone HEIC photo, which browsers cannot show — open it in Photos and'
              . ' share it as JPEG, or retake it with the camera button here';
     }
     if ($mime === '' || $mime === 'application/octet-stream') {
-        return 'not a readable image or PDF — it may have been damaged in transfer; ' . $allowed;
+        return 'not a readable image, video or PDF — it may have been damaged in transfer; ' . $allowed;
     }
     if (stripos($mime, 'video/') === 0) {
-        return 'a video, and only photos and PDFs can be attached — ' . $allowed;
+        // Video is welcome; this particular container is not one anything
+        // can be relied on to play.
+        return 'a ' . $mime . ' video, which browsers cannot play — record or export it as MP4';
     }
     return 'a ' . $mime . ' file, which is not accepted — ' . $allowed;
 }
