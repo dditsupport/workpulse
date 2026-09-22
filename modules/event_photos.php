@@ -157,12 +157,6 @@ function doUploadEventPhotos(): void {
             }
             continue;
         }
-        if ($_FILES['photos']['size'][$i] > EVENT_PHOTO_MAX_FILE_SIZE) {
-            $rejected[] = ['name' => $orig, 'reason' =>
-                formatBytes((int)$_FILES['photos']['size'][$i]) . ' — over the '
-                . formatBytes(EVENT_PHOTO_MAX_FILE_SIZE) . ' limit for one photo'];
-            $skipped++; continue;
-        }
         $mime = (string)($finfo->file($_FILES['photos']['tmp_name'][$i]) ?: '');
         // iOS sometimes ships HEIC that older magic databases can only call
         // a blob of bytes. The HEIC brand sits in the file's own header, so
@@ -173,6 +167,12 @@ function doUploadEventPhotos(): void {
         $ext = EVENT_PHOTO_MIME_EXT[$mime] ?? null;
         if ($ext === null) {
             $rejected[] = ['name' => $orig, 'reason' => epUnsupportedTypeReason($mime)];
+            $skipped++; continue;
+        }
+        if ($_FILES['photos']['size'][$i] > EVENT_PHOTO_MAX_FILE_SIZE) {
+            $rejected[] = ['name' => $orig, 'reason' =>
+                formatBytes((int)$_FILES['photos']['size'][$i]) . ' — over the '
+                . formatBytes(EVENT_PHOTO_MAX_FILE_SIZE) . ' limit for one photo'];
             $skipped++; continue;
         }
         $orig   = nameWithExt($orig, $ext);
@@ -365,7 +365,7 @@ document.addEventListener('keydown', function (e) {
         </form>
     </div>
 </div>
-<?php renderPhotoCompressJs('epUploadForm', '.ep-files'); ?>
+<?php renderPhotoCompressJs('epUploadForm', '.ep-files', false); ?>
 <script>
 function epOpenUpload(){document.getElementById('epUploadModal').classList.add('active');}
 function epCloseUpload(e){

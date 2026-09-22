@@ -833,13 +833,15 @@ function rejectedFilesNote(array $rejected): string {
 // Shared by every upload form in the app — audits, checklists and event
 // photos — each passing its own form id and the selector its file inputs
 // carry. One copy, so a fix to the rules above reaches all of them.
-function renderPhotoCompressJs(string $formId, string $inputSelector): void {
+function renderPhotoCompressJs(string $formId, string $inputSelector, bool $allowPdf = true): void {
     ?>
     <script>
     (function () {
         var form = document.getElementById(<?= json_encode($formId) ?>);
         if (!form) return;
         var INPUT_SELECTOR = <?= json_encode($inputSelector) ?>;
+        var ALLOW_PDF      = <?= $allowPdf ? 'true' : 'false' ?>;
+        var ACCEPT_LABEL   = ALLOW_PDF ? 'photos and PDFs' : 'photos';
 
         var MAX_EDGE     = 1600;
         var SKIP_BELOW   = 600 * 1024;
@@ -927,37 +929,58 @@ function renderPhotoCompressJs(string $formId, string $inputSelector): void {
             var files  = Array.from(input.files || []);
             if (!files.length) { status.textContent = ''; return; }
 
+            // Drop what this form can never accept before it costs anyone a
+            // long upload on mobile data. A 29 MB video is not just refused
+            // at the far end — it can push the whole submit past
+            // post_max_size, and then the photos beside it are lost too.
+            // An empty type tells us nothing (some browsers say nothing for
+            // HEIC), so those go up and the server decides on the bytes.
+            var keep = [], dropped = [];
+            files.forEach(function (f) {
+                if (!f.type || IMAGE_RE.test(f.type) || (ALLOW_PDF && f.type === 'application/pdf')) keep.push(f);
+                else dropped.push(f);
+            });
+            var note = '';
+            if (dropped.length) {
+                var names = dropped.map(function (f) { return f.name; }).join(', ');
+                if (setFiles(input, keep)) {
+                    note  = names + ' removed — only ' + ACCEPT_LABEL + ' can be attached. ';
+                    files = keep;
+                } else {
+                    note = names + ' cannot be attached — only ' + ACCEPT_LABEL + '. ';
+                }
+            }
+            function say(color, text) {
+                status.style.color = note ? 'var(--yellow)' : color;
+                status.textContent = note + text;
+            }
+            if (!files.length) { say('var(--muted)', ''); return; }
+
             var origTotal = files.reduce(function (n, f) { return n + f.size; }, 0);
             var compressableAny = files.some(function (f) {
                 return IMAGE_RE.test(f.type) && (f.size > SKIP_BELOW || mustConvert(f));
             });
             if (!compressableAny) {
-                status.style.color = 'var(--muted)';
-                status.textContent = files.length + ' file(s) — ' + fmtSize(origTotal);
+                say('var(--muted)', files.length + ' file(s) — ' + fmtSize(origTotal));
                 return;
             }
 
             inflight++;
             setSubmitDisabled(true);
-            status.style.color = 'var(--muted)';
-            status.textContent = 'Compressing photo(s)…';
+            say('var(--muted)', 'Compressing photo(s)…');
 
             Promise.all(files.map(compressOne)).then(function (out) {
                 var newTotal = out.reduce(function (n, f) { return n + f.size; }, 0);
                 if (!setFiles(input, out)) {
-                    status.style.color = 'var(--yellow)';
-                    status.textContent = 'Could not replace selected files — uploading originals (' + fmtSize(origTotal) + ').';
+                    say('var(--yellow)', 'Could not replace selected files — uploading originals (' + fmtSize(origTotal) + ').');
                 } else if (newTotal < origTotal) {
-                    status.style.color = 'var(--green)';
-                    status.textContent = fmtSize(origTotal) + ' → ' + fmtSize(newTotal)
-                        + ' (' + Math.round((1 - newTotal / origTotal) * 100) + '% smaller).';
+                    say('var(--green)', fmtSize(origTotal) + ' → ' + fmtSize(newTotal)
+                        + ' (' + Math.round((1 - newTotal / origTotal) * 100) + '% smaller).');
                 } else {
-                    status.style.color = 'var(--muted)';
-                    status.textContent = out.length + ' file(s) — ' + fmtSize(newTotal);
+                    say('var(--muted)', out.length + ' file(s) — ' + fmtSize(newTotal));
                 }
             }).catch(function (err) {
-                status.style.color = 'var(--yellow)';
-                status.textContent = 'Compression failed — uploading originals (' + fmtSize(origTotal) + '). ' + (err && err.message ? err.message : '');
+                say('var(--yellow)', 'Compression failed — uploading originals (' + fmtSize(origTotal) + '). ' + (err && err.message ? err.message : ''));
             }).then(function () {
                 inflight = Math.max(0, inflight - 1);
                 if (inflight === 0) setSubmitDisabled(false);

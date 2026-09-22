@@ -832,18 +832,22 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
             }
             continue;
         }
-        if ($files['size'][$i] > AUDIT_MAX_FILE_SIZE) {
-            $reject($origName, formatBytes((int)$files['size'][$i]) . ' — over the '
-                . formatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
-            continue;
-        }
-        // Read what the file IS. A name saying .jpeg over PNG bytes is a
-        // photo we want, not a forgery to turn away.
+        // What the file IS comes first. Told "28.9 MB — over the 5 MB
+        // limit", someone will go and compress a video that was never
+        // going to be accepted at any size; the type is the reason, and
+        // the size is only worth raising about a file we could have taken.
+        // A name saying .jpeg over PNG bytes is a photo we want, so the
+        // bytes decide, not the name.
         $finfo = new finfo(FILEINFO_MIME_TYPE);
         $mime  = (string)$finfo->file($files['tmp_name'][$i]);
         $ext   = AUDIT_MIME_EXT[$mime] ?? null;
         if ($ext === null) {
             $reject($origName, auditUnsupportedTypeReason($mime));
+            continue;
+        }
+        if ($files['size'][$i] > AUDIT_MAX_FILE_SIZE) {
+            $reject($origName, formatBytes((int)$files['size'][$i]) . ' — over the '
+                . formatBytes(AUDIT_MAX_FILE_SIZE) . ' limit for one file');
             continue;
         }
         // Keep the human-readable name but make its extension tell the
