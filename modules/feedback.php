@@ -234,14 +234,15 @@ function fbFilesByResolution(int $feedbackId): array {
     return $out;
 }
 
-// Ticket import (2026-09-25_feedback_ticket_import.sql) arrived after the
-// module did, so its table and columns are probed rather than assumed.
-function fbImportReady(): bool {
+// The old Customer Complaint tickets are brought in by SQL
+// (2026-09-25_feedback_ticket_import.sql), which arrived after the module
+// did, so its table and columns are probed rather than assumed.
+function fbHistoryReady(): bool {
     static $ready = null;
     if ($ready !== null) return $ready;
     try {
         getDb()->query('SELECT legacy_ticket_id FROM fb_feedback LIMIT 0')->fetch();
-        getDb()->query('SELECT note_id FROM fb_files LIMIT 0')->fetch();
+        getDb()->query('SELECT note_id, legacy_path FROM fb_files LIMIT 0')->fetch();
         getDb()->query('SELECT 1 FROM fb_notes LIMIT 0')->fetch();
         $ready = true;
     } catch (Exception $e) {
@@ -253,7 +254,7 @@ function fbImportReady(): bool {
 // The comment thread a complaint brought with it from Tickets, oldest
 // first, each comment with the files that were attached to it.
 function fbNotes(int $feedbackId): array {
-    if (!fbImportReady()) return [];
+    if (!fbHistoryReady()) return [];
     $st = getDb()->prepare(
         'SELECT n.*, e.full_name AS author_name
            FROM fb_notes n
@@ -787,6 +788,31 @@ function doFbCloseDirect(): void {
     header("Location: {$back}"); exit;
 }
 
+// Where a file row lives on disk, or null when it is not there. A file
+// brought over from a ticket was never moved: it stays in the ticket's
+// folder under uploads/issues/, and legacy_path is its place in there
+// ("{ticket}/[comments/{comment}/]{stored name}"). That folder is either
+// bucketed ("1-500/118/…") or, for older tickets, not, so both are tried
+// — the same fallback issueAttachmentDir() uses.
+function fbFilePath(array $row): ?string {
+    $legacy = trim((string)($row['legacy_path'] ?? ''));
+    if ($legacy === '') {
+        $path = fbFileDir((int)$row['feedback_id']) . basename((string)$row['stored_name']);
+        return is_file($path) ? $path : null;
+    }
+    $base = realpath(__DIR__ . '/../uploads/issues');
+    if ($base === false) return null;
+    $tid  = (int)strtok($legacy, '/');
+    $size = 500;   // ISSUE_ATT_BUCKET_SIZE in modules/issues.php
+    $from = intdiv(max(1, $tid) - 1, $size) * $size + 1;
+    foreach ([$base . '/' . $from . '-' . ($from + $size - 1) . '/' . $legacy, $base . '/' . $legacy] as $try) {
+        $real = realpath($try);
+        // Never outside uploads/issues, whatever the row says.
+        if ($real !== false && str_starts_with($real, $base . DIRECTORY_SEPARATOR) && is_file($real)) return $real;
+    }
+    return null;
+}
+
 // ── Download / play a proof file ────────────────────────
 function fbServeFile(): void {
     if (!fbSchemaReady()) { http_response_code(404); echo 'Not found'; return; }
@@ -796,8 +822,8 @@ function fbServeFile(): void {
     if (!$row) { http_response_code(404); echo 'Not found'; return; }
     $fb = fbGet((int)$row['feedback_id']);
     if (!$fb || !fbCanSee($fb)) { http_response_code(403); echo 'Not allowed'; return; }
-    $path = fbFileDir((int)$row['feedback_id']) . basename((string)$row['stored_name']);
-    if (!is_file($path)) { http_response_code(404); echo 'File missing'; return; }
+    $path = fbFilePath($row);
+    if ($path === null) { http_response_code(404); echo 'File missing'; return; }
 
     // ?inline=1 on something a browser can play or show is the page's own
     // player / preview; anything else downloads. nosniff keeps a mislabelled
@@ -995,14 +1021,9 @@ function pageFeedbackList(): void {
 ?>
 <div class="page-header" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
     <h2 style="margin:0">Negative Feedback</h2>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <?php if (function_exists('fbImportCanUse') && fbImportCanUse() && ($pendingImport = fbImportPendingCount()) > 0): ?>
-        <a href="?page=feedback_import" class="btn btn-secondary btn-sm">Import <?= $pendingImport ?> complaint ticket(s)</a>
-        <?php endif; ?>
-        <?php if (fbCanEnter()): ?>
-        <a href="?page=feedback_new" class="btn btn-primary btn-sm">+ Log Feedback</a>
-        <?php endif; ?>
-    </div>
+    <?php if (fbCanEnter()): ?>
+    <a href="?page=feedback_new" class="btn btn-primary btn-sm">+ Log Feedback</a>
+    <?php endif; ?>
 </div>
 
 <p class="text-muted" style="font-size:12px;margin:-4px 0 14px">

@@ -25,7 +25,7 @@ require_once __DIR__ . '/modules/attendance.php';
 require_once __DIR__ . '/modules/settings.php';
 
 // Conditionally load modules (graceful if not yet created)
-foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos','store_performance','data_collection','employee_docs','feedback','feedback_import'] as $mod) {
+foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos','store_performance','data_collection','employee_docs','feedback'] as $mod) {
     $f = __DIR__ . '/modules/' . $mod . '.php';
     if (file_exists($f)) require_once $f;
 }
@@ -311,6 +311,5 @@ function routePost(string $a): void {
         case 'fb_verify':        if (function_exists('doFbVerify'))       doFbVerify();       break;
         case 'fb_close_direct':  if (function_exists('doFbCloseDirect'))  doFbCloseDirect();  break;
         case 'fb_save_closers':  if (function_exists('doFbSaveClosers'))  doFbSaveClosers();  break;
-        case 'fb_import_tickets': if (function_exists('doFbImportTickets')) doFbImportTickets(); break;
     }
 }
