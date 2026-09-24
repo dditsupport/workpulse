@@ -304,11 +304,12 @@ function routePost(string $a): void {
         case 'dc_discard':       if (function_exists('doDcDiscard'))      doDcDiscard();      break;
         // Negative Feedback — every gate lives in the handler: intake needs
         // txn_feedback_entry, resolving needs the outlet (or
-        // txn_feedback_view), verifying and closing need a closer's
-        // employee ID (fbCanClose).
+        // txn_feedback_view), verifying and closing need an employee ID in
+        // FeedbackCloserCodes, which only the superadmin edits.
         case 'fb_save':          if (function_exists('doFbSave'))         doFbSave();         break;
         case 'fb_resolve':       if (function_exists('doFbResolve'))      doFbResolve();      break;
         case 'fb_verify':        if (function_exists('doFbVerify'))       doFbVerify();       break;
         case 'fb_close_direct':  if (function_exists('doFbCloseDirect'))  doFbCloseDirect();  break;
+        case 'fb_save_closers':  if (function_exists('doFbSaveClosers'))  doFbSaveClosers();  break;
     }
 }

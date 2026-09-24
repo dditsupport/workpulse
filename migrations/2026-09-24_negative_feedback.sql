@@ -13,9 +13,11 @@
 --                        └─(closer sends back, reason)──▶ Open
 --   Open / Resolution submitted ──(closer, duplicate/spam/…)──▶ Closed
 --
--- "Closer" is by EMPLOYEE ID, not by role: the outlet's Operation Manager
--- in Manager Mapping, plus every code listed in the FeedbackCloserCodes
--- setting below. Nobody else can approve, send back or close.
+-- "Closer" is by EMPLOYEE ID and nothing else: the codes listed in the
+-- FeedbackCloserCodes setting below. Nobody else can approve, send back
+-- or close — not the outlet's Operation Manager (who submits remarks like
+-- the Store Manager), not a role flag. Only the superadmin edits the list,
+-- on the Negative Feedback page; the Settings page does not show it.
 --
 -- Three tables:
 --   fb_feedback     — one customer complaint, from intake to closure.
@@ -116,8 +118,9 @@ CREATE TABLE IF NOT EXISTS `fb_files` (
 -- txn_feedback_view  — the operations team: see every outlet's
 --                      complaints and submit a resolution on any of them.
 -- The outlet's Store Manager and Operation Manager (Manager Mapping) see
--- and resolve their own outlets' complaints with no flag. Approving,
--- sending back and closing are NOT a flag: see FeedbackCloserCodes.
+-- and resolve (remark on) their own outlets' complaints with no flag.
+-- Approving, sending back and closing are NOT a flag: see
+-- FeedbackCloserCodes.
 ALTER TABLE `roles`
   ADD COLUMN IF NOT EXISTS `txn_feedback_entry` tinyint(1) NOT NULL DEFAULT 0,
   ADD COLUMN IF NOT EXISTS `txn_feedback_view`  tinyint(1) NOT NULL DEFAULT 0;
@@ -125,11 +128,17 @@ ALTER TABLE `roles`
 -- ── Settings ────────────────────────────────────────────
 INSERT IGNORE INTO `system_settings` (`setting_key`, `setting_value`, `description`) VALUES
   ('FeedbackCloserCodes', '',
-   'Employee IDs (comma-separated) who may approve, send back or close negative feedback for every outlet. The outlet''s mapped Operation Manager always can.'),
+   'Employee IDs who may approve, send back or close negative feedback. Edited on the Negative Feedback page by the superadmin.'),
   ('FeedbackNotifyEmails', '',
    'Operations team emails (comma-separated) told when negative feedback is logged or sent back.'),
   ('FeedbackEscalateHours', '24',
    'Hours a complaint may wait without a resolution before the closers are emailed. 0 turns escalation off.');
+
+-- A database that ran an earlier draft of this file carries the old
+-- wording, which said the Operation Manager could close. Correct it.
+UPDATE `system_settings`
+   SET `description` = 'Employee IDs who may approve, send back or close negative feedback. Edited on the Negative Feedback page by the superadmin.'
+ WHERE `setting_key` = 'FeedbackCloserCodes';
 
 -- Check afterwards:
 --   SHOW TABLES LIKE 'fb\_%';
