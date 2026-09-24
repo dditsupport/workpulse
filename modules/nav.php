@@ -50,6 +50,9 @@ function buildNav(): array {
             ['page' => 'manage_categories', 'icon' => navIcon('categories'),  'label' => 'Ticket Categories'],
             ['page' => 'delete_issues',     'icon' => navIcon('alert'),       'label' => 'Delete Tickets'],
         ]],
+        ['group' => 'Customer Feedback', 'items' => [
+            ['page' => 'feedback',          'icon' => navIcon('feedback'),    'label' => function_exists('fbNavLabel') ? fbNavLabel() : 'Negative Feedback'],
+        ]],
         ['group' => 'Discount', 'items' => [
             ['page' => 'offer',             'icon' => navIcon('offer'),       'label' => 'Offer Coupon'],
             ['page' => 'coupon_redeemed',   'icon' => navIcon('coupon_used'), 'label' => 'Coupon Redeemed'],
@@ -162,6 +165,15 @@ function buildNav(): array {
     }
     if (hasTxn('manage_categories')) $issues[] = ['page' => 'manage_categories', 'icon' => navIcon('categories'),  'label' => 'Ticket Categories'];
     if (hasTxn('ticket_scheduler'))  $issues[] = ['page' => 'ticket_schedules',  'icon' => navIcon('clock'),       'label' => 'Ticket Scheduler'];
+
+    // Negative Feedback — its own module, no longer a ticket category. The
+    // operations team and intake staff reach it by flag; a Store Manager or
+    // Operation Manager reaches it through Manager Mapping, and the label
+    // carries what is waiting on them.
+    $feedback = [];
+    if (function_exists('fbCanUsePage') && fbCanUsePage()) {
+        $feedback[] = ['page' => 'feedback', 'icon' => navIcon('feedback'), 'label' => fbNavLabel()];
+    }
 
     $discount = [];
     if (hasTxn('offer'))             $discount[] = ['page' => 'offer',             'icon' => navIcon('offer'),       'label' => 'Offer Coupon'];
@@ -283,6 +295,7 @@ function buildNav(): array {
     $groups[]      =          ['group' => 'Time Tracking',      'items' => $timeTrack];
     if ($hrms)     $groups[] = ['group' => 'HRMS',              'items' => $hrms];
     if ($issues)   $groups[] = ['group' => 'Tickets',           'items' => $issues];
+    if ($feedback) $groups[] = ['group' => 'Customer Feedback', 'items' => $feedback];
     if ($discount) $groups[] = ['group' => 'Discount',          'items' => $discount];
     if ($tasks)    $groups[] = ['group' => 'Checklists',   'items' => $tasks];
     if ($audit)    $groups[] = ['group' => 'Audit and Performance', 'items' => $audit];
@@ -488,6 +501,14 @@ function allowedPages(): array {
     }
     if (function_exists('dcCanManage') && dcCanManage()) {
         $pages[] = 'data_collection_new';
+    }
+    // Negative Feedback — the detail page and its file stream re-check the
+    // outlet server-side (fbCanSee), so naming them grants no data.
+    if (function_exists('fbCanUsePage') && fbCanUsePage()) {
+        $pages = array_merge($pages, ['feedback', 'feedback_view', 'feedback_file']);
+    }
+    if (function_exists('fbCanEnter') && fbCanEnter()) {
+        $pages[] = 'feedback_new';
     }
     $pages[] = 'sl_image';
     if (isSuperadmin() || hasTxn('shelf_life_upload')) {
@@ -1022,6 +1043,10 @@ function dispatchPage(string $page): void {
         case 'data_collection':     if (function_exists('pageDataCollection'))     pageDataCollection();     break;
         case 'data_collection_new': if (function_exists('pageDataCollectionForm')) pageDataCollectionForm(); break;
         case 'dc_file':             if (function_exists('dcServeFile'))            dcServeFile();            break;
+        case 'feedback':            if (function_exists('pageFeedbackList'))       pageFeedbackList();       break;
+        case 'feedback_new':        if (function_exists('pageFeedbackForm'))       pageFeedbackForm();       break;
+        case 'feedback_view':       if (function_exists('pageFeedbackView'))       pageFeedbackView();       break;
+        case 'feedback_file':       if (function_exists('fbServeFile'))            fbServeFile();            break;
         case 'dc_sample':           if (function_exists('dcServeSample'))          dcServeSample();          break;
         case 'dc_download_zip':     if (function_exists('dcDownloadZip'))          dcDownloadZip();          break;
         case 'dc_export_answers':   if (function_exists('dcExportAnswers'))        dcExportAnswers();        break;

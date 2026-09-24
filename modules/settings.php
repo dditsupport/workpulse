@@ -85,6 +85,7 @@ function pageSettings(): void {
         'Policy' => ['sms_policy_otp_flow_id','sms_policy_otp_template','sms_policy_otp_dlt_id','OtpMaxVerifyAttempts'],
         'Price Variation' => ['PriceSlotsActive','PriceVariationNotifyEmails','InwardBarcodeNotifyEmails'],
         'Punch Requests' => ['PunchRequestNotifyHR','PunchRequestNotifyOps'],
+        'Negative Feedback' => ['FeedbackCloserCodes','FeedbackNotifyEmails','FeedbackEscalateHours'],
         'Location'       => ['LocationClaimRequiresPunch'],
         'General'        => ['AppTimezone'],
     ];

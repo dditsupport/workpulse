@@ -25,7 +25,7 @@ require_once __DIR__ . '/modules/attendance.php';
 require_once __DIR__ . '/modules/settings.php';
 
 // Conditionally load modules (graceful if not yet created)
-foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos','store_performance','data_collection','employee_docs'] as $mod) {
+foreach (['dashboard','issues','issue_user','issue_edit','offer','checklist','checklist_reports','passwords','punch_requests','outlet_directory','shelf_life','store_hours','dependencies','audit','price_tags','violations','price_variations','inward_items','transactions','transactions_report','policies','time_tracking','ticket_scheduler','location_managers','event_photos','store_performance','data_collection','employee_docs','feedback'] as $mod) {
     $f = __DIR__ . '/modules/' . $mod . '.php';
     if (file_exists($f)) require_once $f;
 }
@@ -66,7 +66,7 @@ if (!isLoggedIn()) { renderLogin(); exit; }
 $page  = $_GET['page'] ?? defaultPage();
 
 // CSV exports must run BEFORE any HTML output
-if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_odd_punches','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_sample','dc_download_zip','dc_export_answers','employee_doc_file','past_employees_sample'])) {
+if (in_array($page, ['export_attendance','export_mypunches','export_issues','export_checklist_report','download_pr_attachment','download_issue_attachment','download_checklist_attachment','sl_image','sl_export','export_attendance_report','export_odd_punches','export_employees_csv','export_store_hours','download_dependency','export_audit_register','download_audit_attachment','price_tags_app','audit_param_history','price_list_export','export_price_variations','download_pv_attachment','export_inward_items','inward_sample_csv','export_transactions_report','download_txn_attachment','export_audit_summary','export_audit_templates','policy_pdf','audit_annotation_serve','audit_annotation_thread','export_time_report','event_photo','export_location_managers','perf_sample_csv','export_perf_review','dc_file','dc_sample','dc_download_zip','dc_export_answers','employee_doc_file','past_employees_sample','feedback_file'])) {
     if (in_array($page, allowedPages())) {
         dispatchPage($page);
     }
@@ -302,5 +302,13 @@ function routePost(string $a): void {
         case 'dc_reopen':        if (function_exists('doDcReopen'))       doDcReopen();       break;
         case 'dc_delete_file':   if (function_exists('doDcDeleteFile'))   doDcDeleteFile();   break;
         case 'dc_discard':       if (function_exists('doDcDiscard'))      doDcDiscard();      break;
+        // Negative Feedback — every gate lives in the handler: intake needs
+        // txn_feedback_entry, resolving needs the outlet (or
+        // txn_feedback_view), verifying and closing need a closer's
+        // employee ID (fbCanClose).
+        case 'fb_save':          if (function_exists('doFbSave'))         doFbSave();         break;
+        case 'fb_resolve':       if (function_exists('doFbResolve'))      doFbResolve();      break;
+        case 'fb_verify':        if (function_exists('doFbVerify'))       doFbVerify();       break;
+        case 'fb_close_direct':  if (function_exists('doFbCloseDirect'))  doFbCloseDirect();  break;
     }
 }
