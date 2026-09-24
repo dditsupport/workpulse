@@ -510,6 +510,10 @@ function allowedPages(): array {
     if (function_exists('fbCanEnter') && fbCanEnter()) {
         $pages[] = 'feedback_new';
     }
+    // One-off move of the old Customer Complaint tickets — superadmin only.
+    if (function_exists('fbImportCanUse') && fbImportCanUse()) {
+        $pages[] = 'feedback_import';
+    }
     $pages[] = 'sl_image';
     if (isSuperadmin() || hasTxn('shelf_life_upload')) {
         $pages[] = 'sl_export';
@@ -1047,6 +1051,7 @@ function dispatchPage(string $page): void {
         case 'feedback_new':        if (function_exists('pageFeedbackForm'))       pageFeedbackForm();       break;
         case 'feedback_view':       if (function_exists('pageFeedbackView'))       pageFeedbackView();       break;
         case 'feedback_file':       if (function_exists('fbServeFile'))            fbServeFile();            break;
+        case 'feedback_import':     if (function_exists('pageFeedbackImport'))     pageFeedbackImport();     break;
         case 'dc_sample':           if (function_exists('dcServeSample'))          dcServeSample();          break;
         case 'dc_download_zip':     if (function_exists('dcDownloadZip'))          dcDownloadZip();          break;
         case 'dc_export_answers':   if (function_exists('dcExportAnswers'))        dcExportAnswers();        break;

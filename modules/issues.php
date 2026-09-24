@@ -1866,6 +1866,29 @@ function issuesRmRf(string $dir): void {
     @rmdir($real);
 }
 
+// Delete one ticket for good: its attachment files on disk, its
+// participants, then the row — FK CASCADE takes attachments, comments and
+// status logs with it — and finally its now-empty folders. Shared by the
+// bulk delete page and the Negative Feedback importer. Throws on a
+// database error; missing files are not an error.
+function issuesDeleteOne(int $issueId): void {
+    $db = getDb();
+    // Read the file names FIRST — the CASCADE below drops the rows.
+    $ast = $db->prepare('SELECT stored_name, comment_id FROM issue_attachments WHERE issue_id = ?');
+    $ast->execute([$issueId]);
+    foreach ($ast->fetchAll(PDO::FETCH_ASSOC) as $a) {
+        $cid  = $a['comment_id'] ? (int)$a['comment_id'] : null;
+        $path = issueAttachmentDir($issueId, $cid, false) . $a['stored_name'];
+        if (is_file($path)) @unlink($path);
+    }
+    // No FK CASCADE on this table.
+    $db->prepare('DELETE FROM issue_participants WHERE issue_id = ?')->execute([$issueId]);
+    $db->prepare('DELETE FROM issues WHERE id = ?')->execute([$issueId]);
+    // Empty bucketed + legacy dirs (no-op when already gone).
+    issuesRmRf(UPLOAD_DIR . issueBucketDir($issueId) . '/' . $issueId);
+    issuesRmRf(UPLOAD_DIR . $issueId);
+}
+
 function pageDeleteIssues(): void {
     if (!isSuperadmin()) { echo '<p>Access denied.</p>'; return; }
 ?>
@@ -1936,30 +1959,7 @@ function doDeleteIssuesBulk(): void {
             $row = $st->fetch(PDO::FETCH_ASSOC);
             if (!$row) { $missing[] = $issueId; continue; }
 
-            // 1) Wipe attachment files from disk — read names FIRST
-            // (the FK CASCADE on the DELETE below will drop the rows
-            // before we get a chance to scan them).
-            $ast = $db->prepare('SELECT stored_name, comment_id FROM issue_attachments WHERE issue_id = ?');
-            $ast->execute([$issueId]);
-            $atts = $ast->fetchAll(PDO::FETCH_ASSOC);
-            foreach ($atts as $a) {
-                $cid  = $a['comment_id'] ? (int)$a['comment_id'] : null;
-                $dir  = issueAttachmentDir($issueId, $cid, false);
-                $path = $dir . $a['stored_name'];
-                if (is_file($path)) @unlink($path);
-            }
-
-            // 2) Issue participants — no FK CASCADE on this table.
-            $db->prepare('DELETE FROM issue_participants WHERE issue_id = ?')->execute([$issueId]);
-
-            // 3) The row itself — FK CASCADE wipes attachments,
-            //    comments, and status logs in one go.
-            $db->prepare('DELETE FROM issues WHERE id = ?')->execute([$issueId]);
-
-            // 4) Empty bucketed + legacy issue dirs (no-op if files
-            //    were already gone or the dir doesn't exist).
-            issuesRmRf(UPLOAD_DIR . issueBucketDir($issueId) . '/' . $issueId);
-            issuesRmRf(UPLOAD_DIR . $issueId);
+            issuesDeleteOne($issueId);
 
             $deleted[] = 'WP-' . $issueId;
         } catch (Exception $e) {
