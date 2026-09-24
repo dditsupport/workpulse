@@ -224,13 +224,45 @@ function fbResolutions(int $feedbackId): array {
     return $st->fetchAll(PDO::FETCH_ASSOC);
 }
 
-// [resolution_id => [file rows]]
+// [resolution_id => [file rows]]. Files imported from a ticket belong to
+// no resolution and land under key 0; fbTicketHistory() sorts them out.
 function fbFilesByResolution(int $feedbackId): array {
     $st = getDb()->prepare('SELECT * FROM fb_files WHERE feedback_id = ? ORDER BY kind, id');
     $st->execute([$feedbackId]);
     $out = [];
     foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $f) $out[(int)$f['resolution_id']][] = $f;
     return $out;
+}
+
+// The old Customer Complaint tickets are brought in by SQL
+// (2026-09-25_feedback_ticket_import.sql), which arrived after the module
+// did, so its table and columns are probed rather than assumed.
+function fbHistoryReady(): bool {
+    static $ready = null;
+    if ($ready !== null) return $ready;
+    try {
+        getDb()->query('SELECT legacy_ticket_id FROM fb_feedback LIMIT 0')->fetch();
+        getDb()->query('SELECT note_id, legacy_path FROM fb_files LIMIT 0')->fetch();
+        getDb()->query('SELECT 1 FROM fb_notes LIMIT 0')->fetch();
+        $ready = true;
+    } catch (Exception $e) {
+        $ready = false;
+    }
+    return $ready;
+}
+
+// The comment thread a complaint brought with it from Tickets, oldest
+// first, each comment with the files that were attached to it.
+function fbNotes(int $feedbackId): array {
+    if (!fbHistoryReady()) return [];
+    $st = getDb()->prepare(
+        'SELECT n.*, e.full_name AS author_name
+           FROM fb_notes n
+           LEFT JOIN employees e ON e.employee_code = n.author_code
+          WHERE n.feedback_id = ?
+          ORDER BY n.created_at, n.id');
+    $st->execute([$feedbackId]);
+    return $st->fetchAll(PDO::FETCH_ASSOC);
 }
 
 function fbPendingResolution(int $feedbackId): ?array {
@@ -756,6 +788,31 @@ function doFbCloseDirect(): void {
     header("Location: {$back}"); exit;
 }
 
+// Where a file row lives on disk, or null when it is not there. A file
+// brought over from a ticket was never moved: it stays in the ticket's
+// folder under uploads/issues/, and legacy_path is its place in there
+// ("{ticket}/[comments/{comment}/]{stored name}"). That folder is either
+// bucketed ("1-500/118/…") or, for older tickets, not, so both are tried
+// — the same fallback issueAttachmentDir() uses.
+function fbFilePath(array $row): ?string {
+    $legacy = trim((string)($row['legacy_path'] ?? ''));
+    if ($legacy === '') {
+        $path = fbFileDir((int)$row['feedback_id']) . basename((string)$row['stored_name']);
+        return is_file($path) ? $path : null;
+    }
+    $base = realpath(__DIR__ . '/../uploads/issues');
+    if ($base === false) return null;
+    $tid  = (int)strtok($legacy, '/');
+    $size = 500;   // ISSUE_ATT_BUCKET_SIZE in modules/issues.php
+    $from = intdiv(max(1, $tid) - 1, $size) * $size + 1;
+    foreach ([$base . '/' . $from . '-' . ($from + $size - 1) . '/' . $legacy, $base . '/' . $legacy] as $try) {
+        $real = realpath($try);
+        // Never outside uploads/issues, whatever the row says.
+        if ($real !== false && str_starts_with($real, $base . DIRECTORY_SEPARATOR) && is_file($real)) return $real;
+    }
+    return null;
+}
+
 // ── Download / play a proof file ────────────────────────
 function fbServeFile(): void {
     if (!fbSchemaReady()) { http_response_code(404); echo 'Not found'; return; }
@@ -765,8 +822,8 @@ function fbServeFile(): void {
     if (!$row) { http_response_code(404); echo 'Not found'; return; }
     $fb = fbGet((int)$row['feedback_id']);
     if (!$fb || !fbCanSee($fb)) { http_response_code(403); echo 'Not allowed'; return; }
-    $path = fbFileDir((int)$row['feedback_id']) . basename((string)$row['stored_name']);
-    if (!is_file($path)) { http_response_code(404); echo 'File missing'; return; }
+    $path = fbFilePath($row);
+    if ($path === null) { http_response_code(404); echo 'File missing'; return; }
 
     // ?inline=1 on something a browser can play or show is the page's own
     // player / preview; anything else downloads. nosniff keeps a mislabelled
@@ -1157,6 +1214,27 @@ function pageFeedbackForm(): void {
 <?php
 }
 
+// One attachment: its kind, an inline player or thumbnail when the
+// browser can show it, and the download link.
+function fbRenderFileRow(array $f): void {
+    $url  = '?page=feedback_file&id=' . (int)$f['id'];
+    $mime = (string)$f['mime_type'];
+    $kind = ['recording' => ['badge-blue', 'Call recording'], 'receipt' => ['badge-purple', 'Receipt'],
+             'ticket' => ['badge-grey', 'From ticket']][$f['kind']] ?? ['badge-grey', 'File'];
+?>
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px">
+                <span class="badge <?= $kind[0] ?>"><?= $kind[1] ?></span>
+                <?php if (str_starts_with($mime, 'audio/') && in_array($mime, FB_INLINE, true)): ?>
+                <audio controls preload="none" src="<?= h($url) ?>&inline=1" style="height:32px;max-width:100%"></audio>
+                <?php elseif (in_array($mime, ['image/jpeg', 'image/png', 'image/webp'], true)): ?>
+                <a href="<?= h($url) ?>&inline=1" target="_blank" rel="noopener"><img src="<?= h($url) ?>&inline=1" alt="" style="height:60px;border-radius:4px;border:1px solid var(--border)"></a>
+                <?php endif; ?>
+                <a href="<?= h($url) ?>"><?= h($f['original_name']) ?></a>
+                <span class="text-muted"><?= number_format(max(1, (int)ceil((int)$f['size_bytes'] / 1024))) ?> KB</span>
+            </div>
+<?php
+}
+
 // ── Page: detail ────────────────────────────────────────
 function pageFeedbackView(): void {
     if (!fbSchemaReady()) {
@@ -1191,7 +1269,9 @@ function pageFeedbackView(): void {
     };
 ?>
 <div class="page-header" style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-    <h2 style="margin:0"><?= fbRef($id) ?> · <?= h($fb['location_name']) ?></h2>
+    <h2 style="margin:0"><?= fbRef($id) ?> · <?= h($fb['location_name']) ?>
+        <?php if (!empty($fb['legacy_ticket_id'])): ?><span class="badge badge-grey" style="vertical-align:middle">from ticket WP-<?= (int)$fb['legacy_ticket_id'] ?></span><?php endif; ?>
+    </h2>
     <a href="?page=feedback" class="btn btn-sm btn-ghost">← All feedback</a>
 </div>
 
@@ -1219,7 +1299,8 @@ function pageFeedbackView(): void {
             $kv('Closed', h(fbFmt($fb['closed_at'])));
             $kv('Total resolution time', '<strong>' . h(fbDuration(max(0, strtotime((string)$fb['closed_at']) - strtotime((string)$fb['created_at'])))) . '</strong>'
                 . '<div class="text-muted" style="font-size:11px">from logged to closed</div>');
-            $kv('Closed as', $fb['close_reason'] === 'approved' ? 'Resolution approved' : h(FB_CLOSE_REASONS[$fb['close_reason']] ?? (string)$fb['close_reason']));
+            $kv('Closed as', ['approved' => 'Resolution approved', 'migrated' => 'Closed in Tickets'][$fb['close_reason']]
+                ?? h(FB_CLOSE_REASONS[$fb['close_reason']] ?? (string)$fb['close_reason']));
         } else {
             $kv('Waiting', h(fbDuration(max(0, time() - strtotime((string)$fb['open_since'])))));
         }
@@ -1249,21 +1330,7 @@ function pageFeedbackView(): void {
         <div style="margin-top:6px;white-space:pre-wrap;font-size:13px"><?= h($r['remark']) ?></div>
         <?php if ($rFiles): ?>
         <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
-            <?php foreach ($rFiles as $f):
-                $url  = '?page=feedback_file&id=' . (int)$f['id'];
-                $mime = (string)$f['mime_type'];
-            ?>
-            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-size:12px">
-                <span class="badge <?= $f['kind'] === 'recording' ? 'badge-blue' : 'badge-purple' ?>"><?= $f['kind'] === 'recording' ? 'Call recording' : 'Receipt' ?></span>
-                <?php if (str_starts_with($mime, 'audio/') && in_array($mime, FB_INLINE, true)): ?>
-                <audio controls preload="none" src="<?= h($url) ?>&inline=1" style="height:32px;max-width:100%"></audio>
-                <?php elseif (in_array($mime, ['image/jpeg', 'image/png', 'image/webp'], true)): ?>
-                <a href="<?= h($url) ?>&inline=1" target="_blank" rel="noopener"><img src="<?= h($url) ?>&inline=1" alt="" style="height:60px;border-radius:4px;border:1px solid var(--border)"></a>
-                <?php endif; ?>
-                <a href="<?= h($url) ?>"><?= h($f['original_name']) ?></a>
-                <span class="text-muted"><?= number_format(max(1, (int)ceil((int)$f['size_bytes'] / 1024))) ?> KB</span>
-            </div>
-            <?php endforeach; ?>
+            <?php foreach ($rFiles as $f) fbRenderFileRow($f); ?>
         </div>
         <?php endif; ?>
         <?php if ($r['decision'] !== 'pending'): ?>
@@ -1271,6 +1338,41 @@ function pageFeedbackView(): void {
             <strong><?= $r['decision'] === 'sent_back' ? 'Sent back' : 'Approved' ?></strong>
             by <?= h(fbWho($r['decided_by_name'], $r['decided_by'])) ?> · <?= h(fbFmt($r['decided_at'])) ?>
             <?php if ($r['decision_note']): ?><div style="white-space:pre-wrap;margin-top:4px"><?= h($r['decision_note']) ?></div><?php endif; ?>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endforeach; ?>
+</div>
+<?php endif; ?>
+
+<?php
+    // What the complaint brought with it from Tickets: files on the ticket
+    // itself, then the comment thread with each comment's own files.
+    $notes       = fbNotes($id);
+    $looseFiles  = $files[0] ?? [];
+    $noteFiles   = [];
+    $ticketFiles = [];
+    foreach ($looseFiles as $f) {
+        if (!empty($f['note_id'])) $noteFiles[(int)$f['note_id']][] = $f;
+        else                        $ticketFiles[] = $f;
+    }
+    if ($notes || $ticketFiles):
+?>
+<div class="form-card" style="max-width:900px;margin-bottom:16px">
+    <div class="form-section-title" style="margin-top:0">Ticket History<?= !empty($fb['legacy_ticket_id']) ? ' · WP-' . (int)$fb['legacy_ticket_id'] : '' ?></div>
+    <?php if ($ticketFiles): ?>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px">
+        <?php foreach ($ticketFiles as $f) fbRenderFileRow($f); ?>
+    </div>
+    <?php endif; ?>
+    <?php foreach ($notes as $i => $n): ?>
+    <div style="padding:10px 0;<?= ($i || $ticketFiles) ? 'border-top:1px solid var(--border)' : '' ?>">
+        <div style="font-size:12px"><strong><?= h(fbWho($n['author_name'], $n['author_code'])) ?></strong>
+            <span class="text-muted"><?= h(fbFmt($n['created_at'])) ?></span></div>
+        <div style="margin-top:4px;white-space:pre-wrap;font-size:13px"><?= h($n['body']) ?></div>
+        <?php if (!empty($noteFiles[(int)$n['id']])): ?>
+        <div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+            <?php foreach ($noteFiles[(int)$n['id']] as $f) fbRenderFileRow($f); ?>
         </div>
         <?php endif; ?>
     </div>
