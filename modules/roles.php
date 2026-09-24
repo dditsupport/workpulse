@@ -25,6 +25,10 @@ $txnGroups = [
                            'txn_edit_issue' => 'Edit Ticket', 'txn_issue_summary' => 'Ticket Summary',
                            'txn_issue_comments' => 'Comments Feed', 'txn_manage_categories' => 'Ticket Categories',
                            'txn_ticket_scheduler' => 'Ticket Scheduler'],
+    // Approving / closing negative feedback is not a flag: it goes by
+    // employee ID (FeedbackCloserCodes + the outlet's Operation Manager).
+    'Customer Feedback' => ['txn_feedback_entry' => 'Log Negative Feedback',
+                           'txn_feedback_view'  => 'Negative Feedback · All Outlets & Resolve'],
     'Discount'         => ['txn_offer' => 'Offer Coupon', 'txn_coupon_redeemed' => 'Coupon Redeemed',
                            'txn_generate_coupons' => 'Generate Coupons', 'txn_generate_vouchers' => 'Generate Vouchers'],
     'Task Management'  => ['txn_checklist' => 'Store Checklist',
