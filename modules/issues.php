@@ -349,6 +349,15 @@ function issueStatusFilter(): array {
     return array_values(array_intersect(ISSUE_STATUSES_ALL, $raw));
 }
 
+// Resolve the category filter from $_GET: the checked boxes (cat[]) of
+// the grouped checkbox dropdown, or the older single category_id that
+// deep links (Ticket Overview) still carry. [] means every category.
+function issueCategoryFilter(): array {
+    $raw = $_GET['cat'] ?? (isset($_GET['category_id']) ? [$_GET['category_id']] : []);
+    $raw = is_array($raw) ? $raw : [$raw];
+    return array_values(array_unique(array_filter(array_map('intval', $raw), fn($n) => $n > 0)));
+}
+
 function pageIssues(): void {
     $db = getDb();
 
@@ -390,9 +399,9 @@ function pageIssues(): void {
             $where[] = "i.priority = ?";
             $params[] = $_GET['priority'];
         }
-        if (!empty($_GET['category_id'])) {
-            $where[] = "i.category_id = ?";
-            $params[] = (int)$_GET['category_id'];
+        if ($categoryFilter = issueCategoryFilter()) {
+            $where[] = 'i.category_id IN (' . implode(',', array_fill(0, count($categoryFilter), '?')) . ')';
+            foreach ($categoryFilter as $cid) $params[] = $cid;
         }
         if (!empty($_GET['dept_id'])) {
             $where[] = "EXISTS (SELECT 1 FROM issue_participants ip WHERE ip.issue_id = i.id AND ip.department_id = ?)";
@@ -521,21 +530,45 @@ function pageIssues(): void {
             <option value="<?= $p ?>" <?= ($_GET['priority'] ?? '') === $p ? 'selected' : '' ?>><?= ucfirst($p) ?></option>
             <?php endforeach; ?>
         </select>
-        <select name="category_id" class="form-control" style="width:200px">
-            <option value="">All Categories</option>
-            <?php
-            $groupLabels = ['hr_issue'=>'HR Issue','service_type'=>'Service Type','advance_maintenance'=>'Advance Maintenance','incident'=>'Incident'];
-            $curGroup = null;
-            foreach ($categories as $cat):
-                if ($cat['category_group'] !== $curGroup):
-                    if ($curGroup !== null) echo '</optgroup>';
-                    $curGroup = $cat['category_group'];
-                    echo '<optgroup label="' . h($groupLabels[$curGroup] ?? ucfirst(str_replace('_',' ',$curGroup))) . '">';
-                endif;
-            ?>
-            <option value="<?= $cat['id'] ?>" <?= ($_GET['category_id'] ?? '') == $cat['id'] ? 'selected' : '' ?>><?= h($cat['category_name']) ?></option>
-            <?php endforeach; if ($curGroup !== null) echo '</optgroup>'; ?>
-        </select>
+        <?php
+        // Category checkbox-dropdown, grouped. A group box ticks or clears
+        // every category under it; categories can still be picked one by
+        // one, and the group box then shows as partly checked. Nothing
+        // ticked = every category, like the old "All Categories".
+        $groupLabels = ['hr_issue'=>'HR Issue','service_type'=>'Service Type','advance_maintenance'=>'Advance Maintenance','incident'=>'Incident'];
+        $catChecked  = array_flip(issueCategoryFilter());
+        $catGroups   = [];
+        foreach ($categories as $cat) $catGroups[$cat['category_group']][] = $cat;
+        ?>
+        <div style="position:relative">
+            <button type="button" id="iss-cat-btn" class="form-control"
+                    style="width:200px;text-align:left;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:6px">
+                <span id="iss-cat-label" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">All Categories</span>
+                <span style="color:var(--muted);font-size:10px">▾</span>
+            </button>
+            <div id="iss-cat-panel"
+                 style="display:none;position:absolute;top:calc(100% + 4px);left:0;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:6px 0;z-index:100;min-width:280px;max-height:420px;overflow-y:auto;box-shadow:0 8px 20px rgba(0,0,0,.35)">
+                <div style="display:flex;align-items:center;gap:8px;padding:4px 12px 8px;border-bottom:1px solid var(--border)">
+                    <input type="text" id="iss-cat-search" class="form-control" placeholder="Find category" style="height:30px;font-size:12px">
+                    <button type="button" id="iss-cat-clear" class="btn btn-ghost btn-sm" style="white-space:nowrap">Clear</button>
+                </div>
+                <?php foreach ($catGroups as $grp => $cats): ?>
+                <div class="iss-cat-group">
+                    <label style="display:flex;align-items:center;gap:8px;padding:7px 12px 4px;cursor:pointer;font-size:13px;font-weight:600">
+                        <input type="checkbox" class="iss-cat-grp">
+                        <span><?= h($groupLabels[$grp] ?? ucfirst(str_replace('_', ' ', $grp))) ?></span>
+                    </label>
+                    <?php foreach ($cats as $cat): ?>
+                    <label class="iss-cat-item" style="display:flex;align-items:center;gap:8px;padding:4px 12px 4px 34px;cursor:pointer;font-size:13px">
+                        <input type="checkbox" class="iss-cat-cb" name="cat[]" value="<?= (int)$cat['id'] ?>"
+                               <?= isset($catChecked[(int)$cat['id']]) ? 'checked' : '' ?>>
+                        <span><?= h($cat['category_name']) ?></span>
+                    </label>
+                    <?php endforeach; ?>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        </div>
         <select name="dept_id" class="form-control" style="width:170px">
             <option value="">All Departments</option>
             <?php foreach ($departments as $dept): ?>
@@ -590,6 +623,84 @@ function pageIssues(): void {
         syncLabel();
     });
     boxes.forEach(function (b) { b.addEventListener('change', syncLabel); });
+    syncLabel();
+})();
+// Category checkbox-dropdown. A group box drives its categories; a
+// category change recomputes its group (checked / partly / clear). The
+// label names what is picked: one category, one whole group, or a count.
+(function () {
+    var btn    = document.getElementById('iss-cat-btn');
+    var panel  = document.getElementById('iss-cat-panel');
+    var label  = document.getElementById('iss-cat-label');
+    var search = document.getElementById('iss-cat-search');
+    var clear  = document.getElementById('iss-cat-clear');
+    if (!btn || !panel || !label) return;
+    var groups = panel.querySelectorAll('.iss-cat-group');
+    var all    = panel.querySelectorAll('.iss-cat-cb');
+
+    function syncGroup(g) {
+        var gb  = g.querySelector('.iss-cat-grp');
+        var cbs = g.querySelectorAll('.iss-cat-cb');
+        var n = 0;
+        cbs.forEach(function (c) { if (c.checked) n++; });
+        gb.checked       = n > 0 && n === cbs.length;
+        gb.indeterminate = n > 0 && n < cbs.length;
+    }
+    function syncLabel() {
+        var picked = [], full = null, fullCount = 0;
+        groups.forEach(function (g) {
+            var cbs = g.querySelectorAll('.iss-cat-cb'), n = 0;
+            cbs.forEach(function (c) { if (c.checked) { n++; picked.push(c); } });
+            if (n > 0 && n === cbs.length) { full = g; fullCount++; }
+        });
+        if (picked.length === 0 || picked.length === all.length) label.textContent = 'All Categories';
+        else if (picked.length === 1) label.textContent = picked[0].nextElementSibling.textContent;
+        else if (fullCount === 1 && picked.length === full.querySelectorAll('.iss-cat-cb').length)
+            label.textContent = full.querySelector('.iss-cat-grp').nextElementSibling.textContent;
+        else label.textContent = picked.length + ' categories';
+    }
+    groups.forEach(function (g) {
+        var gb = g.querySelector('.iss-cat-grp');
+        gb.addEventListener('change', function () {
+            g.querySelectorAll('.iss-cat-cb').forEach(function (c) { c.checked = gb.checked; });
+            gb.indeterminate = false;
+            syncLabel();
+        });
+        g.querySelectorAll('.iss-cat-cb').forEach(function (c) {
+            c.addEventListener('change', function () { syncGroup(g); syncLabel(); });
+        });
+        syncGroup(g);
+    });
+    btn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        panel.style.display = (panel.style.display === 'block') ? 'none' : 'block';
+        if (panel.style.display === 'block' && search) search.focus();
+    });
+    panel.addEventListener('click', function (e) { e.stopPropagation(); });
+    document.addEventListener('click', function () { panel.style.display = 'none'; });
+    if (clear) clear.addEventListener('click', function () {
+        all.forEach(function (c) { c.checked = false; });
+        groups.forEach(syncGroup);
+        syncLabel();
+    });
+    // Find: hide categories that do not match; a group whose own name
+    // matches keeps all of its categories. Enter must not submit the form.
+    if (search) {
+        search.addEventListener('keydown', function (e) { if (e.key === 'Enter') e.preventDefault(); });
+        search.addEventListener('input', function () {
+            var q = search.value.trim().toLowerCase();
+            groups.forEach(function (g) {
+                var gName = g.querySelector('.iss-cat-grp').nextElementSibling.textContent.toLowerCase();
+                var groupHit = q === '' || gName.indexOf(q) !== -1, shown = 0;
+                g.querySelectorAll('.iss-cat-item').forEach(function (it) {
+                    var hit = groupHit || it.textContent.toLowerCase().indexOf(q) !== -1;
+                    it.style.display = hit ? 'flex' : 'none';
+                    if (hit) shown++;
+                });
+                g.style.display = shown ? '' : 'none';
+            });
+        });
+    }
     syncLabel();
 })();
 </script>
@@ -1690,7 +1801,10 @@ function exportIssues(): void {
         $where[] = '1=0';
     }
     if (!empty($_GET['priority']))    { $where[] = "i.priority = ?";    $params[] = $_GET['priority']; }
-    if (!empty($_GET['category_id'])) { $where[] = "i.category_id = ?"; $params[] = (int)$_GET['category_id']; }
+    if ($categoryFilter = issueCategoryFilter()) {
+        $where[] = 'i.category_id IN (' . implode(',', array_fill(0, count($categoryFilter), '?')) . ')';
+        foreach ($categoryFilter as $cid) $params[] = $cid;
+    }
     if (!empty($_GET['dept_id']))     { $where[] = "EXISTS (SELECT 1 FROM issue_participants ip WHERE ip.issue_id = i.id AND ip.department_id = ?)"; $params[] = (int)$_GET['dept_id']; }
     if (!empty($_GET['location_id'])) { $where[] = "i.location_id = ?"; $params[] = (int)$_GET['location_id']; }
     // Keyword search
