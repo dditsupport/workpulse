@@ -3,6 +3,13 @@
 // System Settings CRUD + page renderer
 // =========================================================
 
+// Keys that live in system_settings but are edited on their own module's
+// page, under a stricter gate than txn_settings. The Settings page neither
+// shows them nor saves them.
+//   FeedbackCloserCodes — who may close negative feedback; superadmin only,
+//                         on the Negative Feedback page.
+const SETTINGS_MANAGED_ELSEWHERE = ['FeedbackCloserCodes'];
+
 function doTestSmtp(): void {
     ob_start();
     try {
@@ -46,7 +53,7 @@ function doSaveSettings(): void {
         foreach ($keys as $i => $key) {
             $key = trim($key);
             $val = trim($vals[$i] ?? '');
-            if ($key === '') continue;
+            if ($key === '' || in_array($key, SETTINGS_MANAGED_ELSEWHERE, true)) continue;
             $st->execute([$val, $key]);
             $saved++;
         }
@@ -56,7 +63,10 @@ function doSaveSettings(): void {
 }
 
 function getSystemSettings(): array {
-    try { return getDb()->query('SELECT id, setting_key, setting_value, description FROM system_settings ORDER BY id')->fetchAll(); }
+    try {
+        $rows = getDb()->query('SELECT id, setting_key, setting_value, description FROM system_settings ORDER BY id')->fetchAll();
+        return array_values(array_filter($rows, fn($r) => !in_array($r['setting_key'], SETTINGS_MANAGED_ELSEWHERE, true)));
+    }
     catch (Exception $e) { return []; }
 }
 
@@ -85,7 +95,9 @@ function pageSettings(): void {
         'Policy' => ['sms_policy_otp_flow_id','sms_policy_otp_template','sms_policy_otp_dlt_id','OtpMaxVerifyAttempts'],
         'Price Variation' => ['PriceSlotsActive','PriceVariationNotifyEmails','InwardBarcodeNotifyEmails'],
         'Punch Requests' => ['PunchRequestNotifyHR','PunchRequestNotifyOps'],
-        'Negative Feedback' => ['FeedbackCloserCodes','FeedbackNotifyEmails','FeedbackEscalateHours'],
+        // FeedbackCloserCodes is deliberately absent: the superadmin edits it
+        // on the Negative Feedback page (SETTINGS_MANAGED_ELSEWHERE below).
+        'Negative Feedback' => ['FeedbackNotifyEmails','FeedbackEscalateHours'],
         'Location'       => ['LocationClaimRequiresPunch'],
         'General'        => ['AppTimezone'],
     ];

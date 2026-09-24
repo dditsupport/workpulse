@@ -14,15 +14,19 @@
 //   · Open — the outlet's Store Manager, its Operation Manager and the
 //     operations team (txn_feedback_view) are emailed and can see it.
 //   · Resolution submitted — any of them writes a remark (mandatory) and
-//     may attach proof: call recordings and/or receipts.
+//     may attach proof: call recordings and/or receipts. The Operation
+//     Manager's part ends here: they resolve, they do not close.
 //   · Verification — a CLOSER approves it (Closed) or sends it back with
 //     a mandatory reason (Open again, both sides emailed).
 //   · A closer can also close an open complaint without a resolution:
 //     duplicate, spam, not actionable.
 //
-// Closers are named by employee ID, not by role: the outlet's Operation
-// Manager in Manager Mapping, plus everyone in the FeedbackCloserCodes
-// setting. Nobody verifies their own resolution — someone else must.
+// Closers are named by employee ID and nothing else: the employees listed
+// in the FeedbackCloserCodes setting, for every outlet. Only the superadmin
+// edits that list, from the Negative Feedback page itself — it is not on
+// the Settings page. Being an outlet's Operation Manager, holding a flag,
+// or being the superadmin (who has no employee ID) does not make anyone a
+// closer. Nobody verifies their own resolution — another closer must.
 //
 // A complaint left open longer than FeedbackEscalateHours is escalated:
 // the closers are emailed once per wait. That runs lazily from the list
@@ -130,16 +134,20 @@ function fbCloserCodes(): array {
     return $codes;
 }
 
-// May close any outlet's complaint — superadmin or named in the setting.
-function fbIsGlobalCloser(): bool {
-    if (isSuperadmin()) return true;
+// Named in FeedbackCloserCodes — the only way to approve, send back or
+// close. Deliberately not superadmin: closing records an employee ID.
+function fbIsCloser(): bool {
     $me = myCode();
     return $me !== '' && isset(fbCloserCodes()[$me]);
 }
 
+function fbCanManageClosers(): bool {
+    return isSuperadmin();
+}
+
 // Sees every outlet: the operations team, intake staff and global closers.
 function fbSeesAll(): bool {
-    return isSuperadmin() || hasTxn('feedback_view') || hasTxn('feedback_entry') || fbIsGlobalCloser();
+    return isSuperadmin() || hasTxn('feedback_view') || hasTxn('feedback_entry') || fbIsCloser();
 }
 
 // [location_id => 'sm'|'om'|'both'] — the outlets Manager Mapping puts this
@@ -174,11 +182,10 @@ function fbCanSee(array $fb): bool {
 }
 
 // The one definition of "may approve, send back or close this complaint":
-// a global closer, or the Operation Manager mapped to its outlet.
+// an employee listed in FeedbackCloserCodes. The outlet's Operation
+// Manager is not one by virtue of the mapping — they submit remarks.
 function fbCanClose(array $fb): bool {
-    if (fbIsGlobalCloser()) return true;
-    $role = fbMyLocations()[(int)$fb['location_id']] ?? '';
-    return $role === 'om' || $role === 'both';
+    return fbIsCloser();
 }
 
 // Submitting a resolution: the outlet's Store Manager or Operation
@@ -302,7 +309,9 @@ function fbSettingEmails(string $key): array {
 //   opened / sent_back — Store Manager, Operation Manager, the outlet's own
 //                        address, the operations team (and on a send-back
 //                        whoever submitted the rejected resolution)
-//   submitted / escalated — the closers: Operation Manager + closer codes
+//   submitted          — the closers (FeedbackCloserCodes)
+//   escalated          — the closers, and the Operation Manager so they
+//                        can chase the store for a remark
 //   closed             — Store Manager, the resolver, the operations team
 function fbNotify(int $feedbackId, string $event, string $note = '', string $extraCode = ''): void {
     if (!function_exists('sendSmtpEmailQuiet')) return;
@@ -329,7 +338,7 @@ function fbNotify(int $feedbackId, string $event, string $note = '', string $ext
                 $heading = 'Resolution sent back';
                 break;
             case 'submitted':
-                $codes   = array_merge([$om], array_keys(fbCloserCodes()));
+                $codes   = array_keys(fbCloserCodes());
                 $heading = 'Resolution waiting for verification';
                 break;
             case 'escalated':
@@ -419,31 +428,23 @@ function fbRunEscalation(): int {
 }
 
 // ── Sidebar count ───────────────────────────────────────
-// What is waiting on this user: complaints to verify if they close for an
-// outlet, otherwise open complaints at the outlets they run.
+// What is waiting on this user: resolutions to verify if they are a
+// closer, plus open complaints at the outlets they run (Store Manager or
+// Operation Manager — both owe a remark).
 function fbNavLabel(): string {
     $n = 0;
     if (fbSchemaReady()) {
         try {
-            $mine = fbMyLocations();
+            $mine = array_keys(fbMyLocations());
             $db   = getDb();
-            if (fbIsGlobalCloser()) {
+            if (fbIsCloser()) {
                 $n = (int)$db->query("SELECT COUNT(*) FROM fb_feedback WHERE status = 'submitted'")->fetchColumn();
-            } elseif ($mine) {
-                $omLocs = array_keys(array_filter($mine, fn($r) => $r !== 'sm'));
-                $smLocs = array_keys(array_filter($mine, fn($r) => $r !== 'om'));
-                if ($omLocs) {
-                    $ph = implode(',', array_fill(0, count($omLocs), '?'));
-                    $st = $db->prepare("SELECT COUNT(*) FROM fb_feedback WHERE status = 'submitted' AND location_id IN ({$ph})");
-                    $st->execute($omLocs);
-                    $n += (int)$st->fetchColumn();
-                }
-                if ($smLocs) {
-                    $ph = implode(',', array_fill(0, count($smLocs), '?'));
-                    $st = $db->prepare("SELECT COUNT(*) FROM fb_feedback WHERE status = 'open' AND location_id IN ({$ph})");
-                    $st->execute($smLocs);
-                    $n += (int)$st->fetchColumn();
-                }
+            }
+            if ($mine) {
+                $ph = implode(',', array_fill(0, count($mine), '?'));
+                $st = $db->prepare("SELECT COUNT(*) FROM fb_feedback WHERE status = 'open' AND location_id IN ({$ph})");
+                $st->execute($mine);
+                $n += (int)$st->fetchColumn();
             }
         } catch (Exception $e) {
             $n = 0;
@@ -653,7 +654,7 @@ function doFbVerify(): void {
         header('Location: index.php?page=feedback'); exit;
     }
     if (!fbCanClose($fb)) {
-        flash('error', 'Only the outlet\'s Operation Manager or an employee listed as a feedback closer can verify.');
+        flash('error', 'Only an employee listed as a feedback closer can verify.');
         header("Location: {$back}"); exit;
     }
     $res = fbPendingResolution($id);
@@ -661,9 +662,8 @@ function doFbVerify(): void {
         flash('error', 'There is no resolution waiting for verification.');
         header("Location: {$back}"); exit;
     }
-    // Nobody signs off their own work. Superadmin is the escape hatch for
-    // an outlet whose only closer is also the one who resolved it.
-    if ((string)$res['submitted_by'] === myCode() && !isSuperadmin()) {
+    // Nobody signs off their own work — another closer has to.
+    if ((string)$res['submitted_by'] === myCode()) {
         flash('error', 'You submitted this resolution, so someone else has to verify it.');
         header("Location: {$back}"); exit;
     }
@@ -732,7 +732,7 @@ function doFbCloseDirect(): void {
         header('Location: index.php?page=feedback'); exit;
     }
     if (!fbCanClose($fb)) {
-        flash('error', 'Only the outlet\'s Operation Manager or an employee listed as a feedback closer can close it.');
+        flash('error', 'Only an employee listed as a feedback closer can close it.');
         header("Location: {$back}"); exit;
     }
     if (!isset(FB_CLOSE_REASONS[$reason])) {
@@ -781,6 +781,121 @@ function fbServeFile(): void {
     header('Cache-Control: private, max-age=300');
     readfile($path);
     exit;
+}
+
+// ── Closers: who may approve, send back and close ───────
+// Kept in system_settings (FeedbackCloserCodes) but edited only here, and
+// only by the superadmin — the Settings page does not list it, and
+// doSaveSettings() refuses it from anyone else. Every code must be an
+// active employee, so a typo cannot silently leave nobody able to close.
+
+// [code => ['name' => …, 'active' => bool]] for the listed codes, in the
+// order they were listed. A code with no employees row comes back with an
+// empty name so the panel can flag it.
+function fbCloserDetails(): array {
+    $codes = array_keys(fbCloserCodes());
+    if (!$codes) return [];
+    $ph = implode(',', array_fill(0, count($codes), '?'));
+    $st = getDb()->prepare("SELECT employee_code, full_name, is_active FROM employees WHERE employee_code IN ({$ph})");
+    $st->execute($codes);
+    $found = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $found[mb_strtoupper((string)$r['employee_code'])] = $r;
+    }
+    $out = [];
+    foreach ($codes as $c) {
+        $r = $found[mb_strtoupper($c)] ?? null;
+        $out[$c] = ['name' => (string)($r['full_name'] ?? ''), 'active' => $r && (int)$r['is_active'] === 1];
+    }
+    return $out;
+}
+
+function doFbSaveClosers(): void {
+    $back = 'index.php?page=feedback';
+    if (!fbCanManageClosers() || !fbSchemaReady()) {
+        flash('error', 'Only the superadmin can change who closes negative feedback.');
+        header("Location: {$back}"); exit;
+    }
+    $raw   = (string)($_POST['closer_codes'] ?? '');
+    $codes = [];
+    foreach (preg_split('/[\s,;]+/', $raw) ?: [] as $c) {
+        $c = trim($c);
+        if ($c !== '') $codes[mb_strtoupper($c)] = $c;
+    }
+    $db = getDb();
+    $canonical = [];
+    if ($codes) {
+        $ph = implode(',', array_fill(0, count($codes), '?'));
+        $st = $db->prepare("SELECT employee_code FROM employees WHERE is_active = 1 AND employee_code IN ({$ph})");
+        $st->execute(array_values($codes));
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) as $code) $canonical[mb_strtoupper((string)$code)] = (string)$code;
+        $unknown = array_diff_key($codes, $canonical);
+        if ($unknown) {
+            flash('error', 'Not saved — no active employee with ID: ' . implode(', ', $unknown) . '.');
+            header("Location: {$back}"); exit;
+        }
+    }
+    // Keep the order they were typed in, with the ID as the employee
+    // master spells it.
+    $value = implode(',', array_map(fn($k) => $canonical[$k], array_keys($codes)));
+    try {
+        $has = $db->prepare('SELECT COUNT(*) FROM system_settings WHERE setting_key = ?');
+        $has->execute(['FeedbackCloserCodes']);
+        if ((int)$has->fetchColumn() > 0) {
+            $db->prepare('UPDATE system_settings SET setting_value = ? WHERE setting_key = ?')
+               ->execute([$value, 'FeedbackCloserCodes']);
+        } else {
+            $db->prepare('INSERT IGNORE INTO system_settings (setting_key, setting_value, description) VALUES (?,?,?)')
+               ->execute(['FeedbackCloserCodes', $value, 'Employee IDs who may approve, send back or close negative feedback. Edited on the Negative Feedback page by the superadmin.']);
+        }
+    } catch (Exception $e) {
+        flash('error', 'Could not save: ' . $e->getMessage());
+        header("Location: {$back}"); exit;
+    }
+    flash('success', $value === ''
+        ? 'Closer list cleared — nobody can close negative feedback until an employee ID is added.'
+        : 'Feedback closers saved: ' . str_replace(',', ', ', $value) . '.');
+    header("Location: {$back}"); exit;
+}
+
+// Everyone sees who the closers are; only the superadmin gets the form.
+function fbRenderClosersPanel(): void {
+    $closers = fbCloserDetails();
+    $manage  = fbCanManageClosers();
+    if (!$closers && !$manage) {
+        echo '<div class="alert alert-error" style="font-size:13px">No feedback closer is set yet, so nothing can be closed. Ask the superadmin to add one.</div>';
+        return;
+    }
+?>
+<div class="form-card" style="max-width:none;padding:12px 16px;margin-bottom:14px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:13px">
+        <strong>Closers:</strong>
+        <?php if (!$closers): ?>
+            <span class="badge badge-red">None set — nothing can be closed</span>
+        <?php endif; ?>
+        <?php foreach ($closers as $code => $c): ?>
+            <span class="badge <?= $c['active'] ? 'badge-blue' : 'badge-red' ?>" title="<?= $c['active'] ? '' : 'Not an active employee' ?>">
+                <?= h(fbWho($c['name'], $code)) ?><?= $c['active'] ? '' : ' · inactive' ?>
+            </span>
+        <?php endforeach; ?>
+        <?php if ($manage): ?>
+        <button type="button" class="btn btn-sm btn-secondary" style="margin-left:auto"
+                onclick="var f=document.getElementById('fbClosersForm');f.style.display=f.style.display==='none'?'':'none'">Edit</button>
+        <?php endif; ?>
+    </div>
+    <?php if ($manage): ?>
+    <form method="POST" id="fbClosersForm" style="display:none;margin-top:10px">
+        <input type="hidden" name="action" value="fb_save_closers">
+        <div class="form-group" style="margin-bottom:8px">
+            <label>Employee IDs<span class="hint"> — comma-separated. Only these employees can approve, send back or close negative feedback, for every outlet.</span></label>
+            <input type="text" name="closer_codes" class="form-control" autocomplete="off"
+                   value="<?= h(implode(', ', array_keys($closers))) ?>" placeholder="e.g. EMP101, EMP204">
+        </div>
+        <button type="submit" class="btn btn-primary btn-sm">Save Closers</button>
+    </form>
+    <?php endif; ?>
+</div>
+<?php
 }
 
 // ── Page: list ──────────────────────────────────────────
@@ -855,9 +970,11 @@ function pageFeedbackList(): void {
 </div>
 
 <p class="text-muted" style="font-size:12px;margin:-4px 0 14px">
-    Open → Resolution submitted → Closed. The outlet's Store Manager or the operations team submits a resolution;
-    the outlet's Operation Manager or a listed closer approves it or sends it back.
+    Open → Resolution submitted → Closed. The outlet's Store Manager, its Operation Manager or the operations team
+    submits a resolution; only the employees listed as closers approve it, send it back or close it.
 </p>
+
+<?php fbRenderClosersPanel(); ?>
 
 <div class="filter-bar" style="gap:6px">
     <?php $total = array_sum($counts); ?>
@@ -1061,7 +1178,7 @@ function pageFeedbackView(): void {
 
     $canResolve = fbCanResolve($fb);
     $canClose   = fbCanClose($fb);
-    $ownPending = $pending && (string)$pending['submitted_by'] === myCode() && !isSuperadmin();
+    $ownPending = $pending && (string)$pending['submitted_by'] === myCode();
 
     $smMap = function_exists('getLocationManagerMap') ? getLocationManagerMap() : [];
     $omMap = function_exists('getLocationOperationManagerMap') ? getLocationOperationManagerMap() : [];
@@ -1220,7 +1337,7 @@ function pageFeedbackView(): void {
     <?php elseif ($canClose && $ownPending): ?>
 <div class="alert alert-info" style="max-width:900px">You submitted this resolution, so another closer has to verify it.</div>
     <?php else: ?>
-<div class="alert alert-info" style="max-width:900px">Waiting for verification by the outlet's Operation Manager<?= $omCode !== '' ? ' (' . h($omCode) . ')' : '' ?> or a feedback closer.</div>
+<div class="alert alert-info" style="max-width:900px">Waiting for verification by a feedback closer.</div>
     <?php endif; ?>
 <?php endif; ?>
 
