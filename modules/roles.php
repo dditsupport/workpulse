@@ -19,6 +19,8 @@ $txnGroups = [
                            // sheet — kept after the employee leaves. Deliberately
                            // separate from txn_employees.
                            'txn_employee_docs' => 'Employee Documents',
+                           // Size register + uniform stock received / issued.
+                           'txn_uniforms' => 'Uniforms',
                            'txn_locations' => 'Locations', 'txn_attendance' => 'Attendance',
                            'txn_approve_punches' => 'Approve Punches', 'txn_failed_punches' => 'Punch Issues'],
     'Ticket Management' => ['txn_issues' => 'View Tickets', 'txn_create_issue' => 'Create Ticket',
