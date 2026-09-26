@@ -36,6 +36,7 @@ function buildNav(): array {
             ['page' => 'departments',       'icon' => navIcon('departments'), 'label' => 'Departments'],
             ['page' => 'employees',         'icon' => navIcon('employees'),   'label' => 'Employees'],
             ['page' => 'employee_docs',     'icon' => navIcon('folder'),      'label' => 'Employee Documents'],
+            ['page' => 'uniforms',          'icon' => navIcon('uniform'),     'label' => 'Uniforms'],
             ['page' => 'locations',         'icon' => navIcon('locations'),   'label' => 'Locations'],
             ['page' => 'attendance',        'icon' => navIcon('attendance'),  'label' => 'Attendance'],
             ['page' => 'odd_punches',       'icon' => navIcon('alert'),       'label' => 'Odd Punch Report'],
@@ -146,6 +147,8 @@ function buildNav(): array {
     // flag, not txn_employees: it is a narrower thing than the employee
     // master, and it keeps reading after the employee has left.
     if (hasTxn('employee_docs')) $hrms[] = ['page' => 'employee_docs', 'icon' => navIcon('folder'), 'label' => 'Employee Documents'];
+    // Staff uniforms: size register, stock received and issued.
+    if (hasTxn('uniforms'))      $hrms[] = ['page' => 'uniforms',      'icon' => navIcon('uniform'), 'label' => 'Uniforms'];
     if (hasTxn('locations'))       $hrms[] = ['page' => 'locations',       'icon' => navIcon('locations'),   'label' => 'Locations'];
     // Odd Punch Report reads the same punches as Attendance, so it rides the
     // same transaction instead of needing a new flag on every role.
@@ -339,6 +342,12 @@ function allowedPages(): array {
     if (function_exists('empDocCanView') && empDocCanView()) {
         $pages = array_merge($pages, ['employee_docs','employee_doc_upload','employee_doc_file',
             'past_employees','past_employee_form','past_employees_sample']);
+    }
+    // Uniforms — Stock is the nav entry; the other tabs, the movement form
+    // and the CSVs are its sub-pages, each re-checking the flag itself.
+    if (function_exists('uniCanManage') && uniCanManage()) {
+        $pages = array_merge($pages, ['uniforms','uniform_staff','uniform_move','uniform_ledger',
+            'uniform_requests','uniform_items','export_uniform_staff','export_uniform_ledger','uniform_sizes_sample']);
     }
     if (hasTxn('locations')) {
         $pages = array_merge($pages, ['add_location','edit_location']);
@@ -898,6 +907,15 @@ function dispatchPage(string $page): void {
         case 'past_employees':      if (function_exists('pagePastEmployees'))     pagePastEmployees();     break;
         case 'past_employee_form':  if (function_exists('pagePastEmployeeForm')) pagePastEmployeeForm(); break;
         case 'past_employees_sample': if (function_exists('doPastEmployeesSampleCsv')) doPastEmployeesSampleCsv(); break;
+        case 'uniforms':              if (function_exists('pageUniforms'))            pageUniforms();            break;
+        case 'uniform_staff':         if (function_exists('pageUniformStaff'))        pageUniformStaff();        break;
+        case 'uniform_move':          if (function_exists('pageUniformMove'))         pageUniformMove();         break;
+        case 'uniform_ledger':        if (function_exists('pageUniformLedger'))       pageUniformLedger();       break;
+        case 'uniform_requests':      if (function_exists('pageUniformRequests'))     pageUniformRequests();     break;
+        case 'uniform_items':         if (function_exists('pageUniformItems'))        pageUniformItems();        break;
+        case 'export_uniform_staff':  if (function_exists('exportUniformStaffCsv'))   exportUniformStaffCsv();   break;
+        case 'export_uniform_ledger': if (function_exists('exportUniformLedgerCsv'))  exportUniformLedgerCsv();  break;
+        case 'uniform_sizes_sample':  if (function_exists('doUniformSizesSampleCsv')) doUniformSizesSampleCsv(); break;
         case 'attendance':      pageAttendance(); break;
         case 'odd_punches':     pageOddPunches(); break;
         case 'mypunches':       pageMyPunches();  break;
