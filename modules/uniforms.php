@@ -857,6 +857,130 @@ function doUniformSaveItem(): void {
     header("Location: {$back}"); exit;
 }
 
+// Turns every <select data-searchable> on the page into a type-to-search
+// box — a few hundred staff are too many to scroll. Every word typed must
+// appear somewhere in the option (code, name or outlet, any order), so
+// "7001", "tushar" and "maninagar raj" all narrow it down.
+//
+// The <select> stays in the form, hidden, and still carries the value:
+// picking sets it and fires its change event, so the scripts that listen
+// on it (size defaults, stock hints) keep working untouched. The search
+// box takes over "required", since the browser cannot point at a hidden
+// field — typing without picking leaves it invalid.
+function uniSearchableSelectScript(): void {
+    static $done = false;
+    if ($done) return;
+    $done = true;
+?>
+<script>
+(function () {
+    document.querySelectorAll('select[data-searchable]').forEach(function (sel) {
+        var opts = Array.prototype.filter.call(sel.options, function (o) { return o.value !== ''; })
+            .map(function (o) { return { value: o.value, label: o.textContent.replace(/\s+/g, ' ').trim() }; });
+
+        var wrap = document.createElement('div');
+        wrap.className = 'combo-wrap';
+        var input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'form-control combo-input';
+        input.placeholder = sel.dataset.searchable || 'Search…';
+        input.autocomplete = 'off';
+        var clear = document.createElement('button');
+        clear.type = 'button';
+        clear.className = 'combo-clear';
+        clear.setAttribute('aria-label', 'Clear');
+        clear.innerHTML = '&times;';
+        var list = document.createElement('div');
+        list.className = 'combo-dropdown';
+        list.setAttribute('role', 'listbox');
+        wrap.appendChild(input); wrap.appendChild(clear); wrap.appendChild(list);
+        sel.parentNode.insertBefore(wrap, sel);
+        sel.style.display = 'none';
+        if (sel.required) { sel.required = false; input.required = true; }
+
+        var shown = [], active = -1;
+        function current() {
+            var o = sel.options[sel.selectedIndex];
+            return o && o.value !== '' ? o.textContent.replace(/\s+/g, ' ').trim() : '';
+        }
+        function validate() {
+            input.setCustomValidity(input.value && !sel.value ? 'Pick an employee from the list.' : '');
+            wrap.classList.toggle('has-value', !!input.value);
+        }
+        function render() {
+            var words = input.value.toLowerCase().split(/\s+/).filter(Boolean);
+            shown = opts.filter(function (o) {
+                var l = o.label.toLowerCase();
+                return words.every(function (w) { return l.indexOf(w) !== -1; });
+            }).slice(0, 100);
+            list.innerHTML = '';
+            if (!shown.length) {
+                var e = document.createElement('div');
+                e.className = 'combo-option empty';
+                e.textContent = 'No matches';
+                list.appendChild(e);
+            }
+            shown.forEach(function (o, i) {
+                var d = document.createElement('div');
+                d.className = 'combo-option';
+                d.setAttribute('role', 'option');
+                d.textContent = o.label;
+                d.addEventListener('mousedown', function (ev) { ev.preventDefault(); pick(i); });
+                list.appendChild(d);
+            });
+            active = -1;
+            list.classList.add('open');
+        }
+        function pick(i) {
+            var o = shown[i];
+            if (!o) return;
+            sel.value = o.value;
+            input.value = o.label;
+            list.classList.remove('open');
+            validate();
+            sel.dispatchEvent(new Event('change'));
+        }
+        function highlight(i) {
+            var nodes = list.querySelectorAll('.combo-option:not(.empty)');
+            if (!nodes.length) return;
+            active = (i + nodes.length) % nodes.length;
+            nodes.forEach(function (n, k) { n.classList.toggle('active', k === active); });
+            nodes[active].scrollIntoView({ block: 'nearest' });
+        }
+
+        input.value = current();
+        validate();
+        input.addEventListener('focus', function () { input.select(); render(); });
+        input.addEventListener('input', function () {
+            if (sel.value !== '') { sel.value = ''; sel.dispatchEvent(new Event('change')); }
+            validate();
+            render();
+        });
+        input.addEventListener('keydown', function (e) {
+            if (e.key === 'ArrowDown')      { e.preventDefault(); if (!list.classList.contains('open')) render(); highlight(active + 1); }
+            else if (e.key === 'ArrowUp')   { e.preventDefault(); highlight(active - 1); }
+            else if (e.key === 'Enter' && list.classList.contains('open')) {
+                // Enter picks the highlighted row, or the only match —
+                // never submits the form half-filled.
+                e.preventDefault();
+                pick(active >= 0 ? active : (shown.length === 1 ? 0 : -1));
+            }
+            else if (e.key === 'Escape')    { list.classList.remove('open'); }
+        });
+        input.addEventListener('blur', function () { list.classList.remove('open'); });
+        clear.addEventListener('mousedown', function (e) {
+            e.preventDefault();
+            input.value = '';
+            if (sel.value !== '') { sel.value = ''; sel.dispatchEvent(new Event('change')); }
+            validate();
+            input.focus();
+        });
+    });
+})();
+</script>
+<?php
+}
+
 // =========================================================
 // Pages
 // =========================================================
@@ -1293,7 +1417,7 @@ function pageUniformMove(): void {
         <?php if ($needsEmp): ?>
         <div class="form-group">
             <label>Employee <span class="required">*</span></label>
-            <select name="employee_id" id="uniEmp" class="form-control" required>
+            <select name="employee_id" id="uniEmp" class="form-control" required data-searchable="Type code, name or outlet…">
                 <option value="">— Select —</option>
                 <?php foreach ($emps as $e): ?>
                 <option value="<?= (int)$e['id'] ?>" <?= $empId === (int)$e['id'] ? 'selected' : '' ?>>
@@ -1366,6 +1490,7 @@ function pageUniformMove(): void {
 </form>
 </div>
 
+<?php if ($needsEmp) uniSearchableSelectScript(); ?>
 <?php if ($type !== 'receive'): ?>
 <script>
 (function () {
@@ -1672,7 +1797,7 @@ function pageUniformRequests(): void {
     <div class="form-grid">
         <div class="form-group">
             <label>Employee <span class="required">*</span></label>
-            <select name="employee_id" class="form-control" required>
+            <select name="employee_id" class="form-control" required data-searchable="Type code, name or outlet…">
                 <option value="">— Select —</option>
                 <?php foreach ($emps as $e): ?>
                 <option value="<?= (int)$e['id'] ?>" <?= $preEmp === (int)$e['id'] ? 'selected' : '' ?>>
@@ -1730,6 +1855,7 @@ function pageUniformRequests(): void {
     sync();
 })();
 </script>
+<?php uniSearchableSelectScript(); ?>
 <?php endif; ?>
 
 <div class="table-wrap" data-stack>
