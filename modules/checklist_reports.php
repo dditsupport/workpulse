@@ -63,6 +63,53 @@ function chkReportSelectorHtml(int $selected, string $page, array $hidden = []):
 }
 
 // ── Export Monthly Checklist Report as CSV ─────────────────
+// Days of the month on which a task with no answer reads as "No" rather than
+// a blank. A blank used to cover both "not due yet" and "never done", so a
+// missed day looked the same as tomorrow. Only a cycle that is over counts:
+// its anchor day (the day itself, the week's Sunday, the month's 1st — the
+// date answers are stored under), once the cycle's last day has passed and
+// any grace window with it, or today's daily band once its deadline is gone.
+// Days before the task existed stay blank; it was not asked then.
+function chkReportMissedDays(array $cl, ?array $section, string $itemCreated, int $year, int $month): array {
+    $freq    = chkItemFreq($section, $cl);
+    $today   = checklistEffectiveDate($cl);
+    $grace   = checklistGraceDate($cl);
+    $created = $itemCreated !== '' ? substr($itemCreated, 0, 10) : '';
+    $now     = time();
+    $out     = [];
+    $days    = cal_days_in_month(CAL_GREGORIAN, $month, $year);
+    for ($d = 1; $d <= $days; $d++) {
+        $day = sprintf('%04d-%02d-%02d', $year, $month, $d);
+        if (chkPeriodStart($freq, $day) !== $day) continue; // not an anchor
+        $end = chkPeriodEnd($freq, $day);
+        if ($created !== '' && $end < $created) continue;   // task not there yet
+        if ($end === $grace) continue;                      // still fillable
+        if ($end < $today) { $out[$d] = true; continue; }
+        if ($end === $today && $freq === 'daily' && $section !== null
+            && !empty($cl['time_gated'])
+            && $now > checklistSectionDeadlineTs($section, $day)) {
+            $out[$d] = true;
+        }
+    }
+    return $out;
+}
+
+// Per-item missed-day sets for one checklist and month, keyed by item id.
+function chkReportMissedByItem(int $checklistId, array $questions, int $year, int $month): array {
+    $cl = chkGetChecklist($checklistId);
+    if (!$cl) return [];
+    $sections = chkGetSections($checklistId);
+    $out = [];
+    foreach ($questions as $q) {
+        // A retired task only shows for the answers it has; the days after
+        // it was retired were never asked, and nothing records when that was.
+        if (empty($q['is_active'])) continue;
+        $sec = $sections[(int)($q['section_id'] ?? 0)] ?? null;
+        $out[(int)$q['id']] = chkReportMissedDays($cl, $sec, (string)($q['created_at'] ?? ''), $year, $month);
+    }
+    return $out;
+}
+
 function exportChecklistReport(): void {
     $db = getDb();
     $selectedMonth = (int)($_GET['month'] ?? date('m'));
@@ -74,10 +121,11 @@ function exportChecklistReport(): void {
     if (!$empMode && $locationId < 1) { echo 'Location required.'; exit; }
 
     $daysInMonth = cal_days_in_month(CAL_GREGORIAN, $selectedMonth, $selectedYear);
-    $qs = $db->prepare("SELECT id, task_description, section_name, is_active FROM chk_items
+    $qs = $db->prepare("SELECT id, task_description, section_name, section_id, is_active, created_at FROM chk_items
                         WHERE checklist_id = ? ORDER BY section_name, id ASC");
     $qs->execute([$checklistId]);
     $questions = $qs->fetchAll(PDO::FETCH_ASSOC);
+    $missed    = chkReportMissedByItem($checklistId, $questions, $selectedYear, $selectedMonth);
 
     // The day cell carries the answer and, when the filler left one, their
     // remark in brackets — one column per day either way, so the file stays a
@@ -174,7 +222,8 @@ function exportChecklistReport(): void {
             $q['task_description'] . (!$q['is_active'] ? ' (Retired)' : ''),
         ];
         for ($d = 1; $d <= $daysInMonth; $d++) {
-            $row[] = $responses[$q['id']][$d] ?? '';
+            $cell  = (string)($responses[$q['id']][$d] ?? '');
+            $row[] = ($cell === '' && !empty($missed[(int)$q['id']][$d])) ? 'No' : $cell;
         }
         fputcsv($out, $row, escape: '');
     }
@@ -196,10 +245,11 @@ function pageChecklistReport(): void {
 
     $daysInMonth = cal_days_in_month(CAL_GREGORIAN, $selectedMonth, $selectedYear);
     $locations   = getActiveLocations();
-    $qs = $db->prepare("SELECT id, task_description, section_name, is_active FROM chk_items
+    $qs = $db->prepare("SELECT id, task_description, section_name, section_id, is_active, created_at FROM chk_items
                         WHERE checklist_id = ? ORDER BY section_name, id ASC");
     $qs->execute([$checklistId]);
     $questions = $qs->fetchAll(PDO::FETCH_ASSOC);
+    $missed    = $haveScope ? chkReportMissedByItem($checklistId, $questions, $selectedYear, $selectedMonth) : [];
 
     $responses = [];
     $valByItemDay = [];   // [item_id][day] => 'done' | 'not_done' (operation validation)
@@ -400,7 +450,10 @@ function pageChecklistReport(): void {
                     echo chkTaskHtml($q['task_description'], $rowExtra); ?>
                 </td>
                 <?php for ($d = 1; $d <= $daysInMonth; $d++):
-                    $val = $responses[$q['id']][$d] ?? '';
+                    $val = (string)($responses[$q['id']][$d] ?? '');
+                    // No answer once the cycle is over reads as "No"; a blank
+                    // is left for cycles that are still open or not yet due.
+                    if ($val === '' && !empty($missed[(int)$q['id']][$d])) $val = 'No';
                     $style = 'text-align:center;font-size:11px';
                     if (mb_strtolower($val) === 'yes')     $style .= ';background:rgba(39,174,96,.2);color:var(--green);font-weight:700';
                     elseif (mb_strtolower($val) === 'no')  $style .= ';background:rgba(220,64,64,.2);color:var(--red);font-weight:700';

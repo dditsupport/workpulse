@@ -931,15 +931,59 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
             submitBtns.forEach(function (b) { b.disabled = disabled; });
         }
         function statusNodeFor(input) {
-            // One <div> per input, inserted right after it on first use.
+            // One <div> per input, inserted right after it on first use: the
+            // text, plus a × that drops the selection. A file input has no
+            // way of its own to un-pick a file, so without it a wrong pick
+            // could only be undone by reloading the page and losing
+            // everything else typed on it.
             var node = input.nextElementSibling;
             if (!node || !node.classList || !node.classList.contains('param-att-status')) {
                 node = document.createElement('div');
                 node.className = 'param-att-status';
                 node.style.cssText = 'font-size:10px;margin-top:2px;color:var(--muted);min-height:12px';
+                var txt = document.createElement('span');
+                txt.className = 'param-att-text';
+                var clr = document.createElement('button');
+                clr.type = 'button';
+                clr.className = 'param-att-clear';
+                clr.title = 'Remove the selected file(s)';
+                clr.setAttribute('aria-label', 'Remove the selected file(s)');
+                clr.textContent = '×';
+                clr.style.cssText = 'display:none;margin-left:4px;border:none;background:transparent;color:var(--red,#e5534b);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;vertical-align:middle';
+                clr.addEventListener('click', function (e) {
+                    e.preventDefault();
+                    clearPick(input);
+                });
+                node.appendChild(txt);
+                node.appendChild(clr);
                 input.parentNode.insertBefore(node, input.nextSibling);
             }
             return node;
+        }
+        function setStatus(input, color, text) {
+            var node = statusNodeFor(input);
+            node.style.color = color;
+            node.querySelector('.param-att-text').textContent = text;
+            var hasFiles = !!(input.files && input.files.length);
+            node.querySelector('.param-att-clear').style.display = hasFiles ? 'inline' : 'none';
+        }
+        // One slot per running compression, so the submit lock is let go
+        // exactly once whether the compression finishes or is cleared first.
+        function release(slot) {
+            if (!slot.held) return;
+            slot.held = false;
+            inflight = Math.max(0, inflight - 1);
+            if (inflight === 0) setSubmitDisabled(false);
+        }
+        function clearPick(input) {
+            // Bump the pick generation so a compression still running for
+            // the old selection cannot put its files back afterwards.
+            input._pickGen = (input._pickGen || 0) + 1;
+            if (input._slot) release(input._slot);
+            try { input.value = ''; } catch (e) {}
+            if (input.files && input.files.length) setFiles(input, []);
+            setStatus(input, 'var(--muted)', '');
+            try { input.dispatchEvent(new CustomEvent('attachments-cleared', { bubbles: true })); } catch (e) {}
         }
 
         function setFiles(input, fileArr) {
@@ -997,9 +1041,9 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
         document.addEventListener('change', function (e) {
             if (!e.target.matches || !e.target.matches(INPUT_SELECTOR)) return;
             var input  = e.target;
-            var status = statusNodeFor(input);
+            var gen    = input._pickGen = (input._pickGen || 0) + 1;
             var files  = Array.from(input.files || []);
-            if (!files.length) { status.textContent = ''; return; }
+            if (!files.length) { setStatus(input, 'var(--muted)', ''); return; }
 
             // Weed out what this form cannot take before it costs anyone a
             // long upload on mobile data. Too big is as final as the wrong
@@ -1051,8 +1095,7 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
                     ? ' ⚠ ' + fmtSize(over) + ' attached in total — over this server\'s '
                       + fmtSize(MAX_POST) + ' limit for one submit; remove one and save in two rounds.'
                     : '';
-                status.style.color = (note || warn) ? 'var(--yellow)' : color;
-                status.textContent = note + text + warn;
+                setStatus(input, (note || warn) ? 'var(--yellow)' : color, note + text + warn);
             }
             if (!files.length) { say('var(--muted)', ''); return; }
 
@@ -1066,10 +1109,12 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
             }
 
             inflight++;
+            var slot = input._slot = { held: true };
             setSubmitDisabled(true);
             say('var(--muted)', 'Compressing photo(s)…');
 
             Promise.all(files.map(compressOne)).then(function (out) {
+                if (gen !== input._pickGen) return; // cleared or re-picked meanwhile
                 var newTotal = out.reduce(function (n, f) { return n + f.size; }, 0);
                 if (!setFiles(input, out)) {
                     say('var(--yellow)', 'Could not replace selected files — uploading originals (' + fmtSize(origTotal) + ').');
@@ -1080,10 +1125,10 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
                     say('var(--muted)', out.length + ' file(s) — ' + fmtSize(newTotal));
                 }
             }).catch(function (err) {
+                if (gen !== input._pickGen) return;
                 say('var(--yellow)', 'Compression failed — uploading originals (' + fmtSize(origTotal) + '). ' + (err && err.message ? err.message : ''));
             }).then(function () {
-                inflight = Math.max(0, inflight - 1);
-                if (inflight === 0) setSubmitDisabled(false);
+                release(slot); // no-op if clearPick() already let it go
             });
         }, true);
 
