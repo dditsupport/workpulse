@@ -469,6 +469,22 @@ function auditApplyScope(array &$where, array &$params): void {
 }
 
 // ── Fetch helpers ────────────────────────────────────────
+// Everyone who has filed an audit, for the Auditor filter on the list,
+// its export and the Negative Parameters report. Taken from the audits
+// themselves rather than the audit_create flag, so an auditor who has
+// since moved role still shows up against the audits they did.
+function auditGetAuditors(): array {
+    try {
+        return getDb()->query(
+            "SELECT DISTINCT a.auditor_code, COALESCE(e.full_name, a.auditor_code) AS auditor_name
+             FROM audits a
+             LEFT JOIN employees e ON e.employee_code = a.auditor_code
+             WHERE a.auditor_code IS NOT NULL AND a.auditor_code <> ''
+               AND a.audit_number IS NOT NULL AND a.audit_number <> ''
+             ORDER BY auditor_name")->fetchAll(PDO::FETCH_ASSOC);
+    } catch (Exception $e) { return []; }
+}
+
 function auditGetById(int $id): ?array {
     $st = getDb()->prepare(
         'SELECT a.*, t.name AS template_name, l.location_name,
