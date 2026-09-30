@@ -121,6 +121,7 @@ function pageAuditList(): void {
         <h2>Audits</h2>
         <div class="actions">
             <a href="?page=audit_manual" class="btn btn-ghost">📖 Manual</a>
+            <a href="?page=audit_negative" class="btn btn-ghost">⚠ Negative Parameters</a>
             <?php if (auditCanCreate()): ?>
                 <a href="?page=audit_new" class="btn btn-primary">+ New Audit</a>
             <?php endif; ?>
@@ -3770,4 +3771,322 @@ function renderAuditEditJs(): void {
     })();
     </script>
     <?php
+}
+
+// ===========================================================
+// PAGE: Negative Parameters report
+// Every question a store did not get full marks on, so the Audit and
+// Operation teams can go through what went wrong last time before they
+// start the next audit there. "Negative" means an answered question whose
+// obtain score is below 100 — a No, a low rating, a short value, or a
+// condition that did not carry full points. Unanswered questions (NULL
+// score) are not counted: there is nothing to act on.
+// ===========================================================
+
+// Filters shared by the page and its CSV export, so the export always
+// holds exactly the rows on screen.
+function auditNegativeFilters(): array {
+    $fromDate = trim($_GET['from_date'] ?? '');
+    $toDate   = trim($_GET['to_date']   ?? '');
+    // Six months back is long enough to show a question failing again and
+    // again, short enough that it is still the current store team's record.
+    if ($fromDate === '' || !strtotime($fromDate)) $fromDate = date('Y-m-d', strtotime('-6 months'));
+    if ($toDate   === '' || !strtotime($toDate))   $toDate   = date('Y-m-d');
+    if (strtotime($fromDate) > strtotime($toDate)) [$fromDate, $toDate] = [$toDate, $fromDate];
+
+    // Users who can only ever see their own store get it pinned, the same
+    // rule the Audit List export applies.
+    $canBrowse  = isSuperadmin() || auditCanViewAll() || auditCanApprove() || auditCanAdmin()
+                  || auditCanCreate() || auditCanOperationReview() || auditCanManagementReview();
+    $locationId = $canBrowse ? (int)($_GET['location_id'] ?? 0) : myLocationId();
+
+    return [
+        'from_date'   => date('Y-m-d', strtotime($fromDate)),
+        'to_date'     => date('Y-m-d', strtotime($toDate)),
+        'location_id' => $locationId,
+        'template_id' => (int)($_GET['template_id'] ?? 0),
+        // latest = only the most recent filed audit per store + template,
+        // i.e. "what did we find last time"; all = every audit in range.
+        'mode'        => ($_GET['mode'] ?? 'latest') === 'all' ? 'all' : 'latest',
+        'can_browse'  => $canBrowse,
+    ];
+}
+
+// One row per question, per store + template, with how often it came up
+// negative in the audits selected and the details of the latest time.
+function auditNegativeQuery(array $f): array {
+    $db = getDb();
+
+    // Audits in scope. Drafts are never a finding — nothing was filed.
+    $where  = ["a.audit_number IS NOT NULL AND a.audit_number <> ''", "a.status <> 'draft'",
+               'a.audit_date >= ?', 'a.audit_date <= ?'];
+    $params = [$f['from_date'], $f['to_date']];
+    if ($f['location_id'] > 0) { $where[] = 'a.location_id = ?'; $params[] = $f['location_id']; }
+    if ($f['template_id'] > 0) { $where[] = 'a.template_id = ?'; $params[] = $f['template_id']; }
+    auditApplyScope($where, $params);
+
+    $st = $db->prepare('SELECT a.id, a.location_id, a.template_id, a.audit_date
+                        FROM audits a WHERE ' . implode(' AND ', $where) . '
+                        ORDER BY a.audit_date DESC, a.id DESC');
+    $st->execute($params);
+    $audits = $st->fetchAll(PDO::FETCH_ASSOC);
+
+    // Audits counted per store + template — the "out of" in "negative in
+    // 2 of 3 audits". In latest mode that is one audit per pair.
+    $auditIds = [];
+    $auditsPerGroup = [];
+    foreach ($audits as $a) {
+        $g = $a['location_id'] . '|' . $a['template_id'];
+        if ($f['mode'] === 'latest' && isset($auditsPerGroup[$g])) continue;
+        $auditsPerGroup[$g] = ($auditsPerGroup[$g] ?? 0) + 1;
+        $auditIds[] = (int)$a['id'];
+    }
+    if (!$auditIds) return ['rows' => [], 'audit_count' => 0];
+
+    $hasRsp  = auditHasResponseSnapshotCols();
+    $hasOpt  = auditHasResponseOptionCols();
+    $hasSm   = auditHasManagerReviewCols();
+    $hasFive = auditHasFiveStageCols();
+    $catNameExpr = $hasRsp ? "COALESCE(NULLIF(r.category_name, ''), c.name)"            : 'c.name';
+    $pTextExpr   = $hasRsp ? "COALESCE(NULLIF(r.parameter_text, ''), p.parameter_text)" : 'p.parameter_text';
+    $pTypeExpr   = $hasRsp ? 'COALESCE(r.parameter_type, p.type)'                       : 'p.type';
+    $pMaxExpr    = $hasRsp ? 'COALESCE(r.parameter_max_value, p.max_value)'             : 'p.max_value';
+    $catLinkExpr = $hasRsp ? 'COALESCE(r.category_id, p.category_id)'                   : 'p.category_id';
+
+    $sql = 'SELECT a.id AS audit_id, a.audit_number, a.audit_date, a.status,
+                   a.location_id, l.location_name, a.template_id, t.name AS template_name,
+                   ae.full_name AS auditor_name,
+                   r.parameter_id,
+                   ' . $catLinkExpr . ' AS category_id,
+                   ' . $catNameExpr . ' AS category_name,
+                   ' . $pTextExpr   . ' AS parameter_text,
+                   ' . $pTypeExpr   . ' AS parameter_type,
+                   ' . $pMaxExpr    . ' AS parameter_max_value,
+                   ' . ($hasOpt ? 'r.option_text' : 'NULL') . ' AS option_text,
+                   ' . ($hasOpt ? 'o.action_hint' : 'NULL') . ' AS action_hint,
+                   r.value_entered, r.obtain_score, r.modified_weightage,
+                   r.auditor_remark, r.approver_remark,
+                   ' . ($hasSm   ? 'r.store_manager_remark' : 'NULL') . ' AS store_manager_remark,
+                   ' . ($hasFive ? 'r.operation_remark'     : 'NULL') . ' AS operation_remark,
+                   COALESCE(c.sort_order, 0) AS cat_sort, COALESCE(p.sort_order, 0) AS param_sort
+            FROM audit_responses r
+            JOIN audits a ON a.id = r.audit_id
+            LEFT JOIN audit_templates t  ON t.id = a.template_id
+            LEFT JOIN locations l        ON l.location_id = a.location_id
+            LEFT JOIN employees ae       ON ae.employee_code = a.auditor_code
+            LEFT JOIN audit_parameters p ON p.id = r.parameter_id
+            LEFT JOIN audit_categories c ON c.id = ' . $catLinkExpr
+            . ($hasOpt ? ' LEFT JOIN audit_parameter_options o ON o.id = r.option_id' : '') . '
+            WHERE r.audit_id IN (' . implode(',', array_fill(0, count($auditIds), '?')) . ')
+              AND r.obtain_score IS NOT NULL AND r.obtain_score < 100
+            ORDER BY a.audit_date DESC, a.id DESC';
+    $st = $db->prepare($sql);
+    $st->execute($auditIds);
+
+    // Fold into one row per store + template + question. Rows arrive newest
+    // first, so the first one seen is the latest finding.
+    $out = [];
+    foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $g   = $r['location_id'] . '|' . $r['template_id'];
+        $key = $g . '|' . $r['parameter_id'];
+        if (!isset($out[$key])) {
+            $r['neg_count']    = 0;
+            $r['zero_count']   = 0;
+            $r['audits_in_group'] = $auditsPerGroup[$g] ?? 1;
+            $r['audit_refs']   = [];
+            $out[$key] = $r;
+        }
+        $out[$key]['neg_count']++;
+        if ((float)$r['obtain_score'] <= 0) $out[$key]['zero_count']++;
+        $out[$key]['audit_refs'][] = ['id' => (int)$r['audit_id'], 'number' => $r['audit_number'], 'date' => $r['audit_date']];
+    }
+    $rows = array_values($out);
+    // Store, template, then the order the questions sit in on the sheet.
+    usort($rows, function ($x, $y) {
+        return [strtolower((string)$x['location_name']), strtolower((string)$x['template_name']),
+                (int)$x['cat_sort'], (string)$x['category_name'], (int)$x['param_sort'], (int)$x['parameter_id']]
+           <=> [strtolower((string)$y['location_name']), strtolower((string)$y['template_name']),
+                (int)$y['cat_sort'], (string)$y['category_name'], (int)$y['param_sort'], (int)$y['parameter_id']];
+    });
+    return ['rows' => $rows, 'audit_count' => count($auditIds)];
+}
+
+function pageAuditNegative(): void {
+    $viewClicked = !empty($_GET['view']);
+    $f = auditNegativeFilters();
+    $res = $viewClicked ? auditNegativeQuery($f) : ['rows' => [], 'audit_count' => 0];
+    $rows = $res['rows'];
+    $templates = auditGetTemplates(false);
+    $locations = getActiveLocations();
+    $repeatCount = 0; $zeroCount = 0; $stores = [];
+    foreach ($rows as $r) {
+        if ($r['neg_count'] > 1) $repeatCount++;
+        if ((float)$r['obtain_score'] <= 0) $zeroCount++;
+        $stores[(int)$r['location_id']] = true;
+    }
+    ?>
+    <div class="page-header">
+        <h2>Negative Parameters</h2>
+        <div class="actions">
+            <a href="?page=audit_list" class="btn btn-ghost">← Audit List</a>
+            <?php if (auditCanCreate()): ?>
+                <a href="?page=audit_new" class="btn btn-primary">+ New Audit</a>
+            <?php endif; ?>
+        </div>
+    </div>
+    <p style="color:var(--muted);margin:-4px 0 14px;font-size:13px">
+        Every question a store did not get full marks on. Pick the store and go through
+        the list with the store team before starting its next audit.
+    </p>
+
+    <form method="GET" class="filter-bar">
+        <input type="hidden" name="page" value="audit_negative">
+        <input type="hidden" name="view" value="1">
+        <?php if ($f['can_browse']): ?>
+        <select name="location_id" class="form-control" style="max-width:220px">
+            <option value="">All Stores</option>
+            <?php foreach ($locations as $l): ?>
+                <option value="<?= (int)$l['location_id'] ?>" <?= $f['location_id'] === (int)$l['location_id'] ? 'selected' : '' ?>><?= h($l['location_name']) ?></option>
+            <?php endforeach; ?>
+        </select>
+        <?php endif; ?>
+        <select name="template_id" class="form-control" style="max-width:200px">
+            <option value="">All Templates</option>
+            <?php foreach ($templates as $t): ?>
+                <option value="<?= (int)$t['id'] ?>" <?= $f['template_id'] === (int)$t['id'] ? 'selected' : '' ?>><?= h($t['name']) ?></option>
+            <?php endforeach; ?>
+        </select>
+        <select name="mode" class="form-control" style="max-width:220px" title="Which audits to read the findings from">
+            <option value="latest" <?= $f['mode'] === 'latest' ? 'selected' : '' ?>>Latest audit only</option>
+            <option value="all"    <?= $f['mode'] === 'all'    ? 'selected' : '' ?>>All audits in date range</option>
+        </select>
+        <input type="date" name="from_date" class="form-control" style="max-width:150px" value="<?= h($f['from_date']) ?>">
+        <input type="date" name="to_date"   class="form-control" style="max-width:150px" value="<?= h($f['to_date']) ?>">
+        <button class="btn btn-secondary">View</button>
+        <a class="btn btn-ghost" href="?<?= h(http_build_query([
+            'page'        => 'export_audit_negative',
+            'location_id' => $f['location_id'],
+            'template_id' => $f['template_id'],
+            'mode'        => $f['mode'],
+            'from_date'   => $f['from_date'],
+            'to_date'     => $f['to_date'],
+        ])) ?>">Export CSV</a>
+    </form>
+
+    <?php if (!$viewClicked): ?>
+        <div class="rpt-prompt">Choose a store and click <strong>View</strong> to list its negative questions.</div>
+        <?php return; ?>
+    <?php endif; ?>
+
+    <div class="stats-grid">
+        <div class="stat-card stat-blue">
+            <div class="stat-val"><?= (int)$res['audit_count'] ?></div>
+            <div class="stat-lbl">Audits Read</div>
+        </div>
+        <div class="stat-card stat-yellow">
+            <div class="stat-val"><?= count($rows) ?></div>
+            <div class="stat-lbl">Negative Questions</div>
+        </div>
+        <div class="stat-card stat-red">
+            <div class="stat-val"><?= $zeroCount ?></div>
+            <div class="stat-lbl">Scored Zero</div>
+        </div>
+        <?php if ($f['mode'] === 'all'): ?>
+        <div class="stat-card stat-red">
+            <div class="stat-val"><?= $repeatCount ?></div>
+            <div class="stat-lbl">Repeated Findings</div>
+        </div>
+        <?php endif; ?>
+    </div>
+
+    <div class="table-wrap" data-stack>
+        <table class="table">
+            <thead>
+                <tr>
+                    <th>#</th><th>Category</th><th>Question</th><th>Latest Answer</th><th>Score</th>
+                    <?php if ($f['mode'] === 'all'): ?><th>Times Negative</th><?php endif; ?>
+                    <th>Action Needed</th><th>Auditor Remark</th><th>SM Justification</th><th>Operation Remark</th><th>Audit</th>
+                </tr>
+            </thead>
+            <tbody>
+            <?php
+            $cols = $f['mode'] === 'all' ? 11 : 10;
+            if (!$rows): ?>
+                <tr><td colspan="<?= $cols ?>" class="empty-row">No negative questions — every answered question got full marks in the audits selected.</td></tr>
+            <?php else:
+                $lastGroup = null; $n = 0;
+                foreach ($rows as $r):
+                    $group = $r['location_id'] . '|' . $r['template_id'];
+                    if ($group !== $lastGroup):
+                        $lastGroup = $group; $n = 0;
+                        $groupSize = count(array_filter($rows, fn($x) => $x['location_id'] . '|' . $x['template_id'] === $group));
+            ?>
+                <tr class="audit-tpl-group">
+                    <td colspan="<?= $cols ?>">
+                        <?= h($r['location_name'] ?? '—') ?> · <?= h($r['template_name'] ?? '—') ?>
+                        <span class="audit-tpl-count"><?= $groupSize ?> negative question(s)
+                            <?= $f['mode'] === 'all' ? ' across ' . (int)$r['audits_in_group'] . ' audit(s)' : '' ?></span>
+                    </td>
+                </tr>
+                <?php endif; $n++; ?>
+                <tr>
+                    <td data-label="#"><?= $n ?></td>
+                    <td data-label="Category"><?= h($r['category_name'] ?? '—') ?></td>
+                    <td data-label="Question"><?= nl2br(h($r['parameter_text'] ?? '')) ?></td>
+                    <td data-label="Latest Answer"><?= auditAnswerHtml(
+                        ['type' => $r['parameter_type'], 'max_value' => $r['parameter_max_value']],
+                        $r['value_entered'], (string)($r['option_text'] ?? '')) ?></td>
+                    <td data-label="Score" class="<?= h(auditScoreColor((float)$r['obtain_score'])) ?>"><?= number_format((float)$r['obtain_score'], 2) ?>%</td>
+                    <?php if ($f['mode'] === 'all'): ?>
+                    <td data-label="Times Negative">
+                        <strong<?= $r['neg_count'] > 1 ? ' style="color:var(--danger,#e5484d)"' : '' ?>><?= (int)$r['neg_count'] ?></strong>
+                        <span style="color:var(--muted)">of <?= (int)$r['audits_in_group'] ?></span>
+                    </td>
+                    <?php endif; ?>
+                    <td data-label="Action Needed"><?= nl2br(h($r['action_hint'] ?? '')) ?: '—' ?></td>
+                    <td data-label="Auditor Remark"><?= nl2br(h($r['auditor_remark'] ?? '')) ?: '—' ?></td>
+                    <td data-label="SM Justification"><?= nl2br(h($r['store_manager_remark'] ?? '')) ?: '—' ?></td>
+                    <td data-label="Operation Remark"><?= nl2br(h($r['operation_remark'] ?? '')) ?: '—' ?></td>
+                    <td data-label="Audit">
+                        <?php foreach ($r['audit_refs'] as $i => $ref): ?>
+                            <a href="?page=audit_view&id=<?= $ref['id'] ?>" title="<?= h($ref['date']) ?>"><code><?= h($ref['number']) ?></code></a><?= $i === 0 ? ' <span style="color:var(--muted);font-size:12px">' . h($ref['date']) . '</span>' : '' ?><br>
+                        <?php endforeach; ?>
+                    </td>
+                </tr>
+            <?php endforeach; endif; ?>
+            </tbody>
+        </table>
+    </div>
+    <?php
+}
+
+function exportAuditNegative(): void {
+    $f = auditNegativeFilters();
+    $res = auditNegativeQuery($f);
+    $filename = 'AuditNegativeParameters_' . $f['from_date'] . '_' . $f['to_date'] . '.csv';
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="' . $filename . '"');
+    $out = fopen('php://output', 'w');
+    fwrite($out, "\xEF\xBB\xBF");
+    fputcsv($out, [
+        'Store', 'Audit Template', 'Category', 'Question', 'Parameter Type',
+        'Latest Condition Picked', 'Latest Value', 'Latest Obtain Score',
+        'Times Negative', 'Audits Read', 'Action Needed',
+        'Auditor Remark', 'SM Justification', 'Operation Remark', 'Approver Remark',
+        'Latest Audit Number', 'Latest Audit Date', 'Auditor', 'All Audits Negative In',
+    ], escape: '');
+    foreach ($res['rows'] as $r) {
+        fputcsv($out, [
+            $r['location_name'] ?? '', $r['template_name'] ?? '', $r['category_name'] ?? '',
+            $r['parameter_text'] ?? '', $r['parameter_type'] ?? '',
+            $r['option_text'] ?? '', $r['value_entered'] ?? '', $r['obtain_score'] ?? '',
+            $r['neg_count'], $r['audits_in_group'], $r['action_hint'] ?? '',
+            $r['auditor_remark'] ?? '', $r['store_manager_remark'] ?? '',
+            $r['operation_remark'] ?? '', $r['approver_remark'] ?? '',
+            $r['audit_number'] ?? '', $r['audit_date'] ?? '', $r['auditor_name'] ?? '',
+            implode(', ', array_map(fn($x) => $x['number'] . ' (' . $x['date'] . ')', $r['audit_refs'])),
+        ], escape: '');
+    }
+    fclose($out);
+    exit;
 }

@@ -70,6 +70,7 @@ function buildNav(): array {
         ]],
         ['group' => 'Audit and Performance', 'items' => [
             ['page' => 'audit_list',        'icon' => navIcon('audit_list'),   'label' => 'Audit List'],
+            ['page' => 'audit_negative',    'icon' => navIcon('alert'),        'label' => 'Negative Parameters'],
             ['page' => 'audit_summary',     'icon' => navIcon('summary'),      'label' => 'Audit Summary'],
             ['page' => 'audit_templates',   'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'],
             ['page' => 'perf_reviews',      'icon' => navIcon('summary'),      'label' => 'Performance Review'],
@@ -203,6 +204,13 @@ function buildNav(): array {
     $audit = [];
     if (hasTxn('audit_create') || hasTxn('audit_approve') || hasTxn('audit_view') || hasTxn('audit_admin') || $locOwner) {
         $audit[] = ['page' => 'audit_list', 'icon' => navIcon('audit_list'), 'label' => 'Audit List'];
+    }
+    // Negative Parameters — what each store failed on last time, for the
+    // Audit and Operation teams to go through before the next audit. The
+    // store owner gets it too, pinned to their own store by the page.
+    if (hasTxn('audit_create') || hasTxn('audit_approve') || hasTxn('audit_view') || hasTxn('audit_admin')
+        || hasTxn('audit_operation') || hasTxn('audit_management') || $locOwner) {
+        $audit[] = ['page' => 'audit_negative', 'icon' => navIcon('alert'), 'label' => 'Negative Parameters'];
     }
     if (hasTxn('audit_summary')) $audit[] = ['page' => 'audit_summary',    'icon' => navIcon('summary'),      'label' => 'Audit Summary'];
     // "Create Audit" is no longer a sidebar entry — reach it from the
@@ -419,6 +427,9 @@ function allowedPages(): array {
     $pages = array_merge($pages, [
         'audit_list', 'audit_view', 'export_audit_register', 'download_audit_attachment',
         'audit_param_history', 'audit_manager_review', 'audit_manual',
+        // Negative Parameters report + export — rows come through
+        // auditApplyScope, and store-bound users are pinned to their store.
+        'audit_negative', 'export_audit_negative',
         // Audit attachment annotations — gated inside the page handler by
         // auditCanViewRow / auditCanAnnotate, so expose the page names
         // broadly.
@@ -999,6 +1010,8 @@ function dispatchPage(string $page): void {
         // Audit
         case 'audit_list':        if (function_exists('pageAuditList'))       pageAuditList();       break;
         case 'audit_manual':      if (function_exists('pageAuditManual'))     pageAuditManual();     break;
+        case 'audit_negative':    if (function_exists('pageAuditNegative'))   pageAuditNegative();   break;
+        case 'export_audit_negative': if (function_exists('exportAuditNegative')) exportAuditNegative(); break;
         case 'audit_summary':     if (function_exists('pageAuditSummary'))    pageAuditSummary();    break;
         case 'export_audit_summary': if (function_exists('exportAuditSummary')) exportAuditSummary(); break;
         case 'export_audit_templates': if (function_exists('exportAuditTemplates') && (isSuperadmin() || hasTxn('audit_admin'))) exportAuditTemplates(); break;
