@@ -28,6 +28,8 @@ function pageAuditList(): void {
         $ALL_AUDIT_STATUSES,
         array_map('strval', (array)($_GET['status'] ?? []))));
 
+    $auditorSel = trim((string)($_GET['auditor_code'] ?? ''));
+
     $rows = [];
     $pendingApprove = 0;
     $mySentBack = 0;
@@ -48,6 +50,7 @@ function pageAuditList(): void {
         }
         if (!empty($_GET['template_id'])) { $where[] = 'a.template_id = ?'; $params[] = (int)$_GET['template_id']; }
         if (!empty($_GET['location_id'])) { $where[] = 'a.location_id = ?'; $params[] = (int)$_GET['location_id']; }
+        if ($auditorSel !== '') { $where[] = 'a.auditor_code = ?'; $params[] = $auditorSel; }
         $where[] = 'a.audit_date >= ?'; $params[] = $fromDate;
         $where[] = 'a.audit_date <= ?'; $params[] = $toDate;
         // Hide unsaved drafts (rows the user created but never clicked Save on).
@@ -214,6 +217,14 @@ function pageAuditList(): void {
             <?php endforeach; ?>
         </select>
         <?php endif; ?>
+        <?php // Auditor — list one auditor's audits. Rows still go through
+              // auditApplyScope, so this only narrows what the user can see. ?>
+        <select name="auditor_code" class="form-control" style="max-width:200px">
+            <option value="">All Auditors</option>
+            <?php foreach (auditGetAuditors() as $au): ?>
+                <option value="<?= h($au['auditor_code']) ?>" <?= $auditorSel === (string)$au['auditor_code'] ? 'selected' : '' ?>><?= h($au['auditor_name']) ?></option>
+            <?php endforeach; ?>
+        </select>
         <input type="date" id="audit-from-date" name="from_date" class="form-control" style="max-width:150px" value="<?= h($fromDate) ?>">
         <input type="date" id="audit-to-date"   name="to_date"   class="form-control" style="max-width:150px" value="<?= h($toDate) ?>">
         <button class="btn btn-secondary">View</button>
@@ -225,6 +236,7 @@ function pageAuditList(): void {
             'status'      => $statusSel,
             'template_id' => (int)($_GET['template_id'] ?? 0),
             'location_id' => (int)($_GET['location_id'] ?? 0),
+            'auditor_code' => $auditorSel,
         ])) ?>">Export CSV</a>
     </form>
     <style>
@@ -3805,6 +3817,7 @@ function auditNegativeFilters(): array {
         'to_date'     => date('Y-m-d', strtotime($toDate)),
         'location_id' => $locationId,
         'template_id' => (int)($_GET['template_id'] ?? 0),
+        'auditor_code' => trim((string)($_GET['auditor_code'] ?? '')),
         // latest = only the most recent filed audit per store + template,
         // i.e. "what did we find last time"; all = every audit in range.
         'mode'        => ($_GET['mode'] ?? 'latest') === 'all' ? 'all' : 'latest',
@@ -3823,6 +3836,7 @@ function auditNegativeQuery(array $f): array {
     $params = [$f['from_date'], $f['to_date']];
     if ($f['location_id'] > 0) { $where[] = 'a.location_id = ?'; $params[] = $f['location_id']; }
     if ($f['template_id'] > 0) { $where[] = 'a.template_id = ?'; $params[] = $f['template_id']; }
+    if ($f['auditor_code'] !== '') { $where[] = 'a.auditor_code = ?'; $params[] = $f['auditor_code']; }
     auditApplyScope($where, $params);
 
     $st = $db->prepare('SELECT a.id, a.location_id, a.template_id, a.audit_date
@@ -3956,6 +3970,12 @@ function pageAuditNegative(): void {
                 <option value="<?= (int)$t['id'] ?>" <?= $f['template_id'] === (int)$t['id'] ? 'selected' : '' ?>><?= h($t['name']) ?></option>
             <?php endforeach; ?>
         </select>
+        <select name="auditor_code" class="form-control" style="max-width:200px">
+            <option value="">All Auditors</option>
+            <?php foreach (auditGetAuditors() as $au): ?>
+                <option value="<?= h($au['auditor_code']) ?>" <?= $f['auditor_code'] === (string)$au['auditor_code'] ? 'selected' : '' ?>><?= h($au['auditor_name']) ?></option>
+            <?php endforeach; ?>
+        </select>
         <select name="mode" class="form-control" style="max-width:220px" title="Which audits to read the findings from">
             <option value="latest" <?= $f['mode'] === 'latest' ? 'selected' : '' ?>>Latest audit only</option>
             <option value="all"    <?= $f['mode'] === 'all'    ? 'selected' : '' ?>>All audits in date range</option>
@@ -3968,6 +3988,7 @@ function pageAuditNegative(): void {
             'location_id' => $f['location_id'],
             'template_id' => $f['template_id'],
             'mode'        => $f['mode'],
+            'auditor_code' => $f['auditor_code'],
             'from_date'   => $f['from_date'],
             'to_date'     => $f['to_date'],
         ])) ?>">Export CSV</a>

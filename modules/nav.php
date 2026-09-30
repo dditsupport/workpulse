@@ -70,7 +70,6 @@ function buildNav(): array {
         ]],
         ['group' => 'Audit and Performance', 'items' => [
             ['page' => 'audit_list',        'icon' => navIcon('audit_list'),   'label' => 'Audit List'],
-            ['page' => 'audit_negative',    'icon' => navIcon('alert'),        'label' => 'Negative Parameters'],
             ['page' => 'audit_summary',     'icon' => navIcon('summary'),      'label' => 'Audit Summary'],
             ['page' => 'audit_templates',   'icon' => navIcon('audit_tpl'),    'label' => 'Audit Templates'],
             ['page' => 'perf_reviews',      'icon' => navIcon('summary'),      'label' => 'Performance Review'],
@@ -204,13 +203,6 @@ function buildNav(): array {
     $audit = [];
     if (hasTxn('audit_create') || hasTxn('audit_approve') || hasTxn('audit_view') || hasTxn('audit_admin') || $locOwner) {
         $audit[] = ['page' => 'audit_list', 'icon' => navIcon('audit_list'), 'label' => 'Audit List'];
-    }
-    // Negative Parameters — what each store failed on last time, for the
-    // Audit and Operation teams to go through before the next audit. The
-    // store owner gets it too, pinned to their own store by the page.
-    if (hasTxn('audit_create') || hasTxn('audit_approve') || hasTxn('audit_view') || hasTxn('audit_admin')
-        || hasTxn('audit_operation') || hasTxn('audit_management') || $locOwner) {
-        $audit[] = ['page' => 'audit_negative', 'icon' => navIcon('alert'), 'label' => 'Negative Parameters'];
     }
     if (hasTxn('audit_summary')) $audit[] = ['page' => 'audit_summary',    'icon' => navIcon('summary'),      'label' => 'Audit Summary'];
     // "Create Audit" is no longer a sidebar entry — reach it from the

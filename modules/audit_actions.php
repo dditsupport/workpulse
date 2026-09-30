@@ -1280,6 +1280,8 @@ function exportAuditRegister(): void {
         foreach ($statusSel as $st) $params[] = $st;
     }
     if (!empty($_GET['template_id'])) { $where[] = 'a.template_id = ?'; $params[] = (int)$_GET['template_id']; }
+    $auditorSel = trim((string)($_GET['auditor_code'] ?? ''));
+    if ($auditorSel !== '') { $where[] = 'a.auditor_code = ?'; $params[] = $auditorSel; }
 
     // Location scope
     $locIdParam = (int)($_GET['location_id'] ?? 0);
