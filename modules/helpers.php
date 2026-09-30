@@ -881,7 +881,10 @@ function rejectedFilesNote(array $rejected): string {
 // $opts: allow_pdf (default true), allow_video (default false),
 //        allow_docs (Word/Excel, default false),
 //        max_bytes / max_video_bytes (0 = leave it to the server),
-//        max_post_bytes (the whole submit's ceiling, 0 = do not check).
+//        max_post_bytes (the whole submit's ceiling, 0 = do not check),
+//        chunk_action (POST action that takes videos in resumable pieces
+//        ahead of the submit — see doAuditUploadChunk(); '' = send them
+//        with the form), chunk_bytes (piece size).
 function renderPhotoCompressJs(string $formId, string $inputSelector, array $opts = []): void {
     $allowPdf      = (bool)($opts['allow_pdf']   ?? true);
     $allowVideo    = (bool)($opts['allow_video'] ?? false);
@@ -889,6 +892,8 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
     $maxBytes      = (int)($opts['max_bytes']       ?? 0);
     $maxVideoBytes = (int)($opts['max_video_bytes'] ?? 0);
     $maxPostBytes  = (int)($opts['max_post_bytes']  ?? 0);
+    $chunkAction   = (string)($opts['chunk_action'] ?? '');
+    $chunkBytes    = (int)($opts['chunk_bytes'] ?? 2 * 1024 * 1024);
     ?>
     <script>
     (function () {
@@ -901,6 +906,8 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
         var MAX_BYTES      = <?= (int)$maxBytes ?>;
         var MAX_VIDEO      = <?= (int)$maxVideoBytes ?>;
         var MAX_POST       = <?= (int)$maxPostBytes ?>;
+        var CHUNK_ACTION   = <?= json_encode($chunkAction) ?>;
+        var CHUNK_BYTES    = <?= max(256 * 1024, $chunkBytes) ?>;
         var VIDEO_RE       = /^video\//i;
         // Word/Excel are judged by extension, not by type: the same .xlsx
         // arrives as the openxml type on one machine, as application/zip,
@@ -964,7 +971,7 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
             var node = statusNodeFor(input);
             node.style.color = color;
             node.querySelector('.param-att-text').textContent = text;
-            var hasFiles = !!(input.files && input.files.length);
+            var hasFiles = !!(input.files && input.files.length) || !!(input._videos && input._videos.length);
             node.querySelector('.param-att-clear').style.display = hasFiles ? 'inline' : 'none';
         }
         // One slot per running compression, so the submit lock is let go
@@ -982,8 +989,152 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
             if (input._slot) release(input._slot);
             try { input.value = ''; } catch (e) {}
             if (input.files && input.files.length) setFiles(input, []);
+            cancelVideos(input);
             setStatus(input, 'var(--muted)', '');
             try { input.dispatchEvent(new CustomEvent('attachments-cleared', { bubbles: true })); } catch (e) {}
+        }
+
+        // ── Videos in resumable pieces ──
+        // A phone video sent inside the form POST is lost whenever the
+        // connection blinks — the server gets half of it ("cut off
+        // part-way") and the auditor has to start over. With CHUNK_ACTION
+        // set, a picked video is taken out of the form and sent ahead in
+        // small pieces; a piece that fails is retried on its own and the
+        // upload carries on from the last byte the server has. The form
+        // then carries only the upload's id, in chunked_<field name>.
+        function uploadId() {
+            var a = new Uint8Array(16);
+            (window.crypto || window.msCrypto).getRandomValues(a);
+            return Array.prototype.map.call(a, function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+        }
+        function videoBox(input) {
+            var status = statusNodeFor(input);
+            var box = status.nextElementSibling;
+            if (!box || !box.classList.contains('param-video-status')) {
+                box = document.createElement('div');
+                box.className = 'param-video-status';
+                box.style.cssText = 'font-size:10px;margin-top:2px';
+                status.parentNode.insertBefore(box, status.nextSibling);
+            }
+            return box;
+        }
+        function cancelVideos(input) {
+            (input._videos || []).forEach(function (v) {
+                v.cancelled = true;
+                if (v.timer) clearTimeout(v.timer);
+                if (v.xhr) { try { v.xhr.abort(); } catch (e) {} }
+                if (v.row && v.row.parentNode) v.row.parentNode.removeChild(v.row);
+            });
+            input._videos = [];
+        }
+        function videosPending() {
+            var busy = [], failed = [];
+            form.querySelectorAll(INPUT_SELECTOR).forEach(function (el) {
+                (el._videos || []).forEach(function (v) {
+                    if (v.cancelled || v.done) return;
+                    (v.failed ? failed : busy).push(v);
+                });
+            });
+            return { busy: busy, failed: failed };
+        }
+        function startVideo(input, file) {
+            var v = { file: file, id: uploadId(), sent: 0, done: false, failed: false,
+                      cancelled: false, tries: 0, xhr: null, timer: null };
+            input._videos = input._videos || [];
+            input._videos.push(v);
+            v.row = document.createElement('div');
+            v.text = document.createElement('span');
+            v.row.appendChild(v.text);
+            v.retryBtn = document.createElement('button');
+            v.retryBtn.type = 'button';
+            v.retryBtn.textContent = 'Retry';
+            v.retryBtn.className = 'btn btn-sm btn-ghost';
+            v.retryBtn.style.cssText = 'display:none;margin-left:6px;padding:0 6px;font-size:10px';
+            v.retryBtn.addEventListener('click', function (e) {
+                e.preventDefault(); v.failed = false; v.tries = 0; send(); });
+            v.row.appendChild(v.retryBtn);
+            videoBox(input).appendChild(v.row);
+
+            function show(color, msg) {
+                v.text.style.color = color;
+                v.text.textContent = '🎬 ' + file.name + ' — ' + msg;
+                v.retryBtn.style.display = v.failed ? 'inline' : 'none';
+                setStatus(input, statusNodeFor(input).style.color,
+                          statusNodeFor(input).querySelector('.param-att-text').textContent);
+            }
+            function pct(n) { return Math.min(100, Math.floor(n / file.size * 100)); }
+            function giveUp(msg) {
+                v.failed = true; v.xhr = null;
+                show('var(--red,#e5534b)', msg + ' Tap Retry — what already went up is kept.');
+            }
+            function retryLater(why) {
+                v.tries++;
+                if (v.tries > 8) { giveUp('upload stopped at ' + pct(v.sent) + '% (' + why + ').'); return; }
+                var wait = Math.min(15000, 1000 * Math.pow(2, v.tries - 1));
+                show('var(--yellow)', 'connection dropped at ' + pct(v.sent) + '%, retrying…');
+                v.timer = setTimeout(function () {
+                    v.timer = null;
+                    if (navigator.onLine === false) {
+                        window.addEventListener('online', function once() {
+                            window.removeEventListener('online', once); if (!v.cancelled) send();
+                        });
+                        show('var(--yellow)', 'waiting for network at ' + pct(v.sent) + '%…');
+                        return;
+                    }
+                    send();
+                }, wait);
+            }
+            function send() {
+                if (v.cancelled || v.done) return;
+                var end = Math.min(file.size, v.sent + CHUNK_BYTES);
+                var fd = new FormData();
+                fd.append('action', CHUNK_ACTION);
+                fd.append('upload_id', v.id);
+                fd.append('offset', String(v.sent));
+                fd.append('total', String(file.size));
+                fd.append('name', file.name || 'video.mp4');
+                fd.append('chunk', file.slice(v.sent, end), 'chunk');
+                var xhr = v.xhr = new XMLHttpRequest();
+                xhr.open('POST', 'index.php', true);
+                xhr.timeout = 120000;
+                xhr.upload.onprogress = function (e) {
+                    if (e.lengthComputable) show('var(--muted)', 'uploading ' + pct(v.sent + e.loaded * (end - v.sent) / e.total) + '%…');
+                };
+                xhr.onload = function () {
+                    if (v.cancelled) return;
+                    var r = null;
+                    try { r = JSON.parse(xhr.responseText); } catch (e) {}
+                    if (!r) {
+                        // Not our JSON — usually the login page after the
+                        // session ran out.
+                        if (xhr.status >= 200 && xhr.status < 400) { giveUp('the session may have expired — open the app in another tab, log in, then'); return; }
+                        retryLater('server error ' + xhr.status); return;
+                    }
+                    if (typeof r.received === 'number') v.sent = r.received;
+                    if (r.ok) {
+                        v.tries = 0;
+                        if (r.done) {
+                            v.done = true; v.xhr = null;
+                            var hid = document.createElement('input');
+                            hid.type = 'hidden';
+                            hid.name = 'chunked_' + input.name;
+                            hid.value = v.id;
+                            v.row.appendChild(hid);
+                            show('var(--green)', 'uploaded (' + fmtSize(file.size) + '). Tap Save to attach it.');
+                            return;
+                        }
+                        send(); return;
+                    }
+                    if (xhr.status === 409) { send(); return; } // server had a different count — carry on from it
+                    if (xhr.status === 413) { giveUp(r.error + '.'); v.retryBtn.style.display = 'none'; return; }
+                    retryLater(r.error || ('error ' + xhr.status));
+                };
+                xhr.onerror   = function () { if (!v.cancelled) retryLater('network'); };
+                xhr.ontimeout = function () { if (!v.cancelled) retryLater('timed out'); };
+                xhr.send(fd);
+            }
+            show('var(--muted)', 'uploading 0%…');
+            send();
         }
 
         function setFiles(input, fileArr) {
@@ -1043,6 +1194,8 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
             var input  = e.target;
             var gen    = input._pickGen = (input._pickGen || 0) + 1;
             var files  = Array.from(input.files || []);
+            // A new pick replaces the old one, videos included.
+            if (CHUNK_ACTION) cancelVideos(input);
             if (!files.length) { setStatus(input, 'var(--muted)', ''); return; }
 
             // Weed out what this form cannot take before it costs anyone a
@@ -1087,6 +1240,17 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
                     files = keep;
                 } else {
                     note = 'Cannot be attached: ' + dropped.join('; ') + '. ';
+                }
+            }
+            // Videos leave the form here and go up in pieces of their own.
+            // Without DataTransfer (very old browsers) the input cannot be
+            // edited, so they stay in the form and go the old way.
+            if (CHUNK_ACTION) {
+                var vids = files.filter(function (f) { return VIDEO_RE.test(f.type); });
+                var rest = files.filter(function (f) { return !VIDEO_RE.test(f.type); });
+                if (vids.length && setFiles(input, rest)) {
+                    files = rest;
+                    vids.forEach(function (f) { startVideo(input, f); });
                 }
             }
             function say(color, text) {
@@ -1156,6 +1320,18 @@ function renderPhotoCompressJs(string $formId, string $inputSelector, array $opt
         // click goes through and existing form-level handlers (validation
         // etc.) fire afterward unaffected.
         form.addEventListener('submit', function (e) {
+            if (CHUNK_ACTION) {
+                var pend = videosPending();
+                if (pend.busy.length) {
+                    e.preventDefault();
+                    alert('Video still uploading — please wait until it shows "uploaded", then Save.');
+                    return;
+                }
+                if (pend.failed.length && !confirm(pend.failed.length + ' video(s) did not finish uploading and will NOT be saved.\n\nTap Cancel and use Retry, or OK to save without them.')) {
+                    e.preventDefault();
+                    return;
+                }
+            }
             if (inflight > 0) {
                 e.preventDefault();
                 alert('Still compressing photo(s) — please wait a moment and try again.');

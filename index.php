@@ -231,6 +231,8 @@ function routePost(string $a): void {
         case 'add_audit_annotation_comment':  if (function_exists('doAddAuditAnnotationComment')) doAddAuditAnnotationComment(); break;
         case 'resolve_audit_annotation':      if (function_exists('doResolveAuditAnnotation'))    doResolveAuditAnnotation();    break;
         case 'reopen_audit_annotation':       if (function_exists('doReopenAuditAnnotation'))     doReopenAuditAnnotation();     break;
+        // Large videos arrive ahead of Save in resumable pieces (JSON).
+        case 'audit_upload_chunk':        if (function_exists('doAuditUploadChunk'))       doAuditUploadChunk();       break;
         case 'delete_audit_attachment':   if (function_exists('doDeleteAuditAttachment'))  doDeleteAuditAttachment();  break;
         case 'delete_audit':              if (function_exists('doDeleteAudit'))            doDeleteAudit();            break;
         case 'save_audit_template':       if (function_exists('doSaveAuditTemplate'))      doSaveAuditTemplate();      break;
