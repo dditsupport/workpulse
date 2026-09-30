@@ -837,9 +837,14 @@ function auditAttachmentPath(int $auditId, ?array $auditRow, string $storedName)
 // is ever dropped silently: every file the server refuses comes back with
 // a reason the caller is expected to put in front of the person who
 // attached it.
-function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCode, string $stage = 'auditor'): array {
+//
+// $chunked holds files that already reached the server in pieces through
+// the audit_upload_chunk action (see auditTakeChunkedUploads()); they go
+// through exactly the same checks as a file posted with the form.
+function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCode, string $stage = 'auditor', array $chunked = []): array {
     $result = ['saved' => 0, 'rejected' => []];
-    if (empty($_FILES['attachments']['name'][0])) return $result;
+    $hasPosted = !empty($_FILES['attachments']['name'][0]);
+    if (!$hasPosted && !$chunked) return $result;
     $auditRow = auditGetById($auditId);
     if (!$auditRow) return $result; // can't bucket without template + date
     $dir = auditAttachmentDir($auditRow);
@@ -856,7 +861,25 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
             'INSERT INTO audit_response_attachments
               (response_id, filename, stored_name, mime_type, file_size, uploaded_by)
              VALUES (?, ?, ?, ?, ?, ?)');
-    $files = $_FILES['attachments'];
+    // One list for both routes in: files posted with the form, and files
+    // assembled from chunks. Only the way each is moved into place differs.
+    $files = ['name' => [], 'tmp_name' => [], 'error' => [], 'size' => [], 'chunked' => []];
+    if ($hasPosted) {
+        foreach ((array)$_FILES['attachments']['name'] as $i => $n) {
+            $files['name'][]     = $n;
+            $files['tmp_name'][] = $_FILES['attachments']['tmp_name'][$i];
+            $files['error'][]    = (int)$_FILES['attachments']['error'][$i];
+            $files['size'][]     = (int)$_FILES['attachments']['size'][$i];
+            $files['chunked'][]  = false;
+        }
+    }
+    foreach ($chunked as $c) {
+        $files['name'][]     = $c['name'];
+        $files['tmp_name'][] = $c['path'];
+        $files['error'][]    = $c['error'] ?? UPLOAD_ERR_OK;
+        $files['size'][]     = (int)$c['size'];
+        $files['chunked'][]  = true;
+    }
     // Every rejection below used to be a bare `continue`: the file vanished
     // and the uploader was told nothing, which is how three photos became
     // one with nobody the wiser. Each one now names the file and the reason
@@ -890,7 +913,11 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
         }
         // Video carries its own allowance, and both are held to whatever
         // this server will really accept.
-        $cap = $isVideo ? auditMaxVideoBytes() : auditMaxFileBytes();
+        // A video sent in pieces never met php.ini's per-file limit, so
+        // only the audit's own allowance applies to it.
+        $cap = $isVideo
+            ? ($files['chunked'][$i] ? auditMaxChunkedBytes() : auditMaxVideoBytes())
+            : auditMaxFileBytes();
         if ($files['size'][$i] > $cap) {
             $reject($origName, formatBytes((int)$files['size'][$i]) . ' — over the '
                 . formatBytes($cap) . ' limit for one ' . ($isVideo ? 'video' : 'file'));
@@ -900,7 +927,10 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
         // truth, so the file opens in the right app when downloaded.
         $origName   = nameWithExt($origName, $ext);
         $storedName = uniqid('aud_', true) . '.' . $ext;
-        if (!move_uploaded_file($files['tmp_name'][$i], $dir . $storedName)) {
+        $moved = $files['chunked'][$i]
+            ? @rename($files['tmp_name'][$i], $dir . $storedName)
+            : move_uploaded_file($files['tmp_name'][$i], $dir . $storedName);
+        if (!$moved) {
             $reject($origName, 'the server could not store it — please try again');
             continue;
         }
@@ -910,6 +940,122 @@ function auditSaveAttachments(int $auditId, int $responseId, string $uploaderCod
         $result['saved']++;
     }
     return $result;
+}
+
+// ── Chunked uploads (large videos) ─────────────────────
+// A phone video of 30–60 MB sent as part of one form POST fails as soon
+// as the connection blinks — PHP gets half the body and reports
+// UPLOAD_ERR_PARTIAL ("the upload was cut off part-way"), and on mobile
+// data that is most of the time. So the page sends videos ahead of Save
+// in small pieces through the audit_upload_chunk action, each piece
+// retried on its own, and the form only carries the upload's id. The
+// pieces collect in one .part file per upload, named after the uploader
+// so nobody can claim someone else's upload by guessing its id.
+define('AUDIT_CHUNK_BYTES', 2 * 1024 * 1024);
+
+function auditChunkDir(): string { return AUDIT_UPLOAD_DIR . '_chunks/'; }
+
+// The .part / .json pair for one upload id, or null if the id is not ours.
+function auditChunkPaths(string $uploadId, string $ownerCode): ?array {
+    if (!preg_match('/^[a-f0-9]{16,64}$/', $uploadId) || $ownerCode === '') return null;
+    $base = auditChunkDir() . substr(sha1($ownerCode), 0, 16) . '_' . $uploadId;
+    return ['part' => $base . '.part', 'meta' => $base . '.json'];
+}
+
+// Pieces can go straight to disk regardless of php.ini, so the only cap is
+// the audit's own video allowance.
+function auditMaxChunkedBytes(): int { return AUDIT_MAX_VIDEO_SIZE; }
+
+// The piece size a request here can carry, a little under the per-file cap.
+function auditChunkBytes(): int {
+    return max(256 * 1024, min(AUDIT_CHUNK_BYTES, uploadLimitBytes() - 64 * 1024));
+}
+
+// Abandoned uploads (the page was closed half-way) are swept after a day.
+function auditChunkSweep(): void {
+    $dir = auditChunkDir();
+    if (!is_dir($dir) || mt_rand(1, 50) !== 1) return;
+    foreach ((array)glob($dir . '*.{part,json}', GLOB_BRACE) as $f) {
+        if (is_file($f) && filemtime($f) < time() - 86400) @unlink($f);
+    }
+}
+
+// Collect the finished chunked uploads the form names for one question,
+// e.g. $_POST['chunked_param_files'][$pid] = ['<id>', …]. Each comes back
+// in the shape auditSaveAttachments() takes; one that never finished is
+// returned with an error so the person is told, not left wondering.
+function auditTakeChunkedUploads(string $field, int $pid): array {
+    $ids = $_POST[$field][$pid] ?? [];
+    if (!is_array($ids)) return [];
+    $out = [];
+    foreach (array_slice(array_unique(array_map('strval', $ids)), 0, 20) as $id) {
+        $paths = auditChunkPaths($id, myCode());
+        if (!$paths) continue;
+        $meta = is_file($paths['meta']) ? json_decode((string)file_get_contents($paths['meta']), true) : null;
+        if (!is_array($meta)) continue;
+        $size = is_file($paths['part']) ? (int)filesize($paths['part']) : 0;
+        $done = $size > 0 && $size === (int)($meta['total'] ?? -1);
+        $out[] = ['name' => (string)($meta['name'] ?? 'video'), 'path' => $paths['part'], 'size' => $size,
+                  'error' => $done ? UPLOAD_ERR_OK : UPLOAD_ERR_PARTIAL];
+        @unlink($paths['meta']);
+        if (!$done) @unlink($paths['part']);
+    }
+    return $out;
+}
+
+// Anything left of a chunked upload that auditSaveAttachments() refused.
+function auditDiscardChunked(array $chunked): void {
+    foreach ($chunked as $c) if (is_file($c['path'])) @unlink($c['path']);
+}
+
+// POST action audit_upload_chunk — JSON in, JSON out. The client sends the
+// byte offset it believes it is at; if the server has a different count
+// (a piece whose reply was lost, a retry after a drop) it answers with its
+// own and the client carries on from there, so nothing is sent twice and
+// nothing is skipped.
+function doAuditUploadChunk(): void {
+    header('Content-Type: application/json');
+    $fail = function (string $msg, int $code = 400, array $extra = []) {
+        http_response_code($code);
+        echo json_encode(array_merge(['ok' => false, 'error' => $msg], $extra));
+        exit;
+    };
+    $paths = auditChunkPaths((string)($_POST['upload_id'] ?? ''), myCode());
+    if (!$paths) $fail('bad upload id');
+    $offset = (int)($_POST['offset'] ?? -1);
+    $total  = (int)($_POST['total'] ?? 0);
+    if ($total <= 0 || $offset < 0) $fail('bad request');
+    if ($total > auditMaxChunkedBytes()) {
+        $fail(formatBytes($total) . ' — over the ' . formatBytes(auditMaxChunkedBytes()) . ' limit for one video', 413);
+    }
+    $dir = auditChunkDir();
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+    auditChunkSweep();
+
+    clearstatcache();
+    $have = is_file($paths['part']) ? (int)filesize($paths['part']) : 0;
+    if ($offset === 0 && $have > 0 && !is_file($paths['meta'])) { @unlink($paths['part']); $have = 0; }
+    if ($offset !== $have) $fail('offset mismatch', 409, ['received' => $have]);
+
+    $c = $_FILES['chunk'] ?? null;
+    if (!$c || (int)$c['error'] !== UPLOAD_ERR_OK || !is_uploaded_file($c['tmp_name'])) {
+        $fail('piece did not arrive', 400, ['received' => $have]);
+    }
+    if ($have + (int)$c['size'] > $total) $fail('piece runs past the end', 400, ['received' => $have]);
+
+    if ($offset === 0) {
+        $name = basename(str_replace('\\', '/', (string)($_POST['name'] ?? 'video')));
+        file_put_contents($paths['meta'], json_encode(['name' => mb_substr($name, 0, 200), 'total' => $total]));
+    }
+    $in  = fopen($c['tmp_name'], 'rb');
+    $out = fopen($paths['part'], 'ab');
+    if (!$in || !$out) $fail('the server could not store it', 500, ['received' => $have]);
+    stream_copy_to_stream($in, $out);
+    fclose($in); fclose($out);
+    clearstatcache();
+    $have = (int)filesize($paths['part']);
+    echo json_encode(['ok' => true, 'received' => $have, 'done' => $have >= $total]);
+    exit;
 }
 
 // Why a file the server can't take was turned away, in words the person

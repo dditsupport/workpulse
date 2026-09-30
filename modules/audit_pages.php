@@ -1044,7 +1044,10 @@ function pageAuditEdit(): void {
     <?php renderAuditEditJs(); ?>
     <?php renderPhotoCompressJs('auditForm', '.param-files',
         ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(),
-         'max_video_bytes' => auditMaxVideoBytes(), 'max_post_bytes' => postLimitBytes()]); ?>
+         // Videos go up ahead of Save in resumable pieces, so php.ini's
+         // per-file limit no longer applies to them.
+         'max_video_bytes' => auditMaxChunkedBytes(), 'max_post_bytes' => postLimitBytes(),
+         'chunk_action' => 'audit_upload_chunk', 'chunk_bytes' => auditChunkBytes()]); ?>
     <?php
 }
 
@@ -1496,7 +1499,10 @@ function pageAuditManagerReview(): void {
     </form>
     <?php renderPhotoCompressJs('auditManagerReviewForm', '.param-files',
         ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(),
-         'max_video_bytes' => auditMaxVideoBytes(), 'max_post_bytes' => postLimitBytes()]); ?>
+         // Videos go up ahead of Save in resumable pieces, so php.ini's
+         // per-file limit no longer applies to them.
+         'max_video_bytes' => auditMaxChunkedBytes(), 'max_post_bytes' => postLimitBytes(),
+         'chunk_action' => 'audit_upload_chunk', 'chunk_bytes' => auditChunkBytes()]); ?>
     <?php
 }
 

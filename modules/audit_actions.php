@@ -403,22 +403,28 @@ function doSaveAuditWeights(): void {
             $up->execute($upArgs);
 
             // Attachments: response id was pre-fetched above
-            if (!empty($_FILES['param_files']['name'][$pid][0] ?? null)) {
+            // Videos sent ahead in pieces arrive as ids under
+            // chunked_param_files; everything else rides in $_FILES.
+            $chunked = auditTakeChunkedUploads('chunked_param_files', (int)$pid);
+            if ($chunked || !empty($_FILES['param_files']['name'][$pid][0] ?? null)) {
                 $rid = (int)($p['response_id'] ?? 0);
                 if ($rid) {
                     // re-shape $_FILES for a single pid
-                    $orig = $_FILES['param_files'];
-                    $_FILES['attachments'] = [
-                        'name'     => $orig['name'][$pid],
-                        'type'     => $orig['type'][$pid],
-                        'tmp_name' => $orig['tmp_name'][$pid],
-                        'error'    => $orig['error'][$pid],
-                        'size'     => $orig['size'][$pid],
-                    ];
-                    $res = auditSaveAttachments($auditId, $rid, myCode());
+                    if (!empty($_FILES['param_files']['name'][$pid][0] ?? null)) {
+                        $orig = $_FILES['param_files'];
+                        $_FILES['attachments'] = [
+                            'name'     => $orig['name'][$pid],
+                            'type'     => $orig['type'][$pid],
+                            'tmp_name' => $orig['tmp_name'][$pid],
+                            'error'    => $orig['error'][$pid],
+                            'size'     => $orig['size'][$pid],
+                        ];
+                    }
+                    $res = auditSaveAttachments($auditId, $rid, myCode(), 'auditor', $chunked);
                     $uploadRejected = array_merge($uploadRejected, $res['rejected']);
                     unset($_FILES['attachments']);
                 }
+                auditDiscardChunked($chunked);
             }
         }
 
@@ -584,7 +590,9 @@ function doManagerReviewAudit(): void {
 // on, so it is skipped — the upload box isn't rendered for those either.
 function auditSaveManagerReviewFiles(int $auditId): array {
     $out = ['saved' => 0, 'rejected' => []];
-    if (empty($_FILES['sm_files']['name']) || !is_array($_FILES['sm_files']['name'])) return $out;
+    $hasPosted  = !empty($_FILES['sm_files']['name']) && is_array($_FILES['sm_files']['name']);
+    $hasChunked = !empty($_POST['chunked_sm_files']) && is_array($_POST['chunked_sm_files']);
+    if (!$hasPosted && !$hasChunked) return $out;
     $db = getDb();
     $st = $db->prepare('SELECT parameter_id, id FROM audit_responses WHERE audit_id = ?');
     $st->execute([$auditId]);
@@ -593,25 +601,31 @@ function auditSaveManagerReviewFiles(int $auditId): array {
         $respByParam[(int)$row['parameter_id']] = (int)$row['id'];
     }
 
-    $orig = $_FILES['sm_files'];
-    foreach (array_keys($orig['name']) as $pidRaw) {
+    $orig = $hasPosted ? $_FILES['sm_files'] : ['name' => []];
+    $pids = array_unique(array_merge(array_keys($orig['name']),
+                                     $hasChunked ? array_keys($_POST['chunked_sm_files']) : []));
+    foreach ($pids as $pidRaw) {
         $pid = (int)$pidRaw;
+        $chunked = auditTakeChunkedUploads('chunked_sm_files', $pid);
         $rid = $respByParam[$pid] ?? 0;
-        if (!$rid) continue;
+        if (!$rid) { auditDiscardChunked($chunked); continue; }
         // Each entry is the multi-file array the [] in the field name
         // produces. Anything else is a hand-built request, not our form.
-        if (!is_array($orig['name'][$pid] ?? null)) continue;
-        if (empty($orig['name'][$pid][0])) continue;
+        $posted = is_array($orig['name'][$pid] ?? null) && !empty($orig['name'][$pid][0]);
+        if (!$posted && !$chunked) continue;
         // auditSaveAttachments() reads the one-file-set shape, so reshape
         // this parameter's slice of the array-of-arrays into it.
-        $_FILES['attachments'] = [
-            'name'     => $orig['name'][$pid],
-            'type'     => $orig['type'][$pid],
-            'tmp_name' => $orig['tmp_name'][$pid],
-            'error'    => $orig['error'][$pid],
-            'size'     => $orig['size'][$pid],
-        ];
-        $res = auditSaveAttachments($auditId, $rid, myCode(), 'store_manager');
+        if ($posted) {
+            $_FILES['attachments'] = [
+                'name'     => $orig['name'][$pid],
+                'type'     => $orig['type'][$pid],
+                'tmp_name' => $orig['tmp_name'][$pid],
+                'error'    => $orig['error'][$pid],
+                'size'     => $orig['size'][$pid],
+            ];
+        }
+        $res = auditSaveAttachments($auditId, $rid, myCode(), 'store_manager', $chunked);
+        auditDiscardChunked($chunked);
         $out['saved']   += $res['saved'];
         $out['rejected'] = array_merge($out['rejected'], $res['rejected']);
         unset($_FILES['attachments']);
