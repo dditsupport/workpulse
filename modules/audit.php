@@ -1342,6 +1342,41 @@ function auditGetParameterHistory(int $paramId, int $excludeAuditId = 0, int $lo
     return $st->fetchAll(PDO::FETCH_ASSOC);
 }
 
+// ── Recent negatives for one store + template ─────────
+// Which questions this store did not get full marks on in the last
+// $months months of filed audits on the same template — shown to the
+// auditor as they start the next one (a count on each section pill, a red
+// history icon on each such question). The audit being worked on is left
+// out, so its own answers never count against it. Counts are of audits,
+// not of people, so no visibility scope applies: everyone who can open
+// this audit may see how the store has been doing on its questions.
+function auditRecentNegatives(int $locationId, int $templateId, int $excludeAuditId = 0, int $months = 6): array {
+    $from = date('Y-m-d', strtotime('-' . max(1, $months) . ' months'));
+    $out  = ['from' => $from, 'audits' => 0, 'params' => []];
+    if ($locationId <= 0 || $templateId <= 0) return $out;
+    $where = "a.location_id = ? AND a.template_id = ? AND a.status <> 'draft'
+              AND a.audit_number IS NOT NULL AND a.audit_number <> ''
+              AND a.audit_date >= ? AND a.id <> ?";
+    $args  = [$locationId, $templateId, $from, $excludeAuditId];
+    try {
+        $db = getDb();
+        $st = $db->prepare('SELECT COUNT(*) FROM audits a WHERE ' . $where);
+        $st->execute($args);
+        $out['audits'] = (int)$st->fetchColumn();
+        if (!$out['audits']) return $out;
+        $st = $db->prepare('SELECT r.parameter_id, COUNT(*) AS n, MAX(a.audit_date) AS last_date
+                            FROM audit_responses r JOIN audits a ON a.id = r.audit_id
+                            WHERE ' . $where . '
+                              AND r.obtain_score IS NOT NULL AND r.obtain_score < 100
+                            GROUP BY r.parameter_id');
+        $st->execute($args);
+        foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $out['params'][(int)$r['parameter_id']] = ['count' => (int)$r['n'], 'last_date' => $r['last_date']];
+        }
+    } catch (Exception $e) {}
+    return $out;
+}
+
 // ── Send-back agenda gate ─────────────────────────────
 // Returns the list of open pins on this audit's attached images that the
 // given actor still has to address before the audit can move forward.

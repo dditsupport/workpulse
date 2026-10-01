@@ -1013,7 +1013,9 @@ function pageAuditEdit(): void {
     $currentCat = $total > 0 ? $tree[$section - 1] : null;
 
     renderAuditHeader($a);
-    if ($total > 0) renderAuditSectionStepper($tree, $section, $id, $draftToken);
+    $neg = auditRecentNegatives((int)($a['location_id'] ?? 0), (int)($a['template_id'] ?? 0), $id);
+    renderAuditNegativeBanner($a, $neg);
+    if ($total > 0) renderAuditSectionStepper($tree, $section, $id, $draftToken, $neg['params']);
     ?>
     <form method="POST" enctype="multipart/form-data" id="auditForm">
         <input type="hidden" name="action" value="save_audit_weights">
@@ -1042,6 +1044,7 @@ function pageAuditEdit(): void {
         <input type="hidden" name="att_id" id="auditAttDelAttId" value="">
     </form>
     <?php renderAuditEditJs(); ?>
+    <?php renderAuditNegativeMarks($neg); ?>
     <?php renderPhotoCompressJs('auditForm', '.param-files',
         ['allow_video' => true, 'max_bytes' => auditMaxFileBytes(),
          // Videos go up ahead of Save in resumable pieces, so php.ini's
@@ -1056,7 +1059,63 @@ function pageAuditEdit(): void {
 // whichever one they like and jump around freely. A section turns green
 // with a checkmark once every question in it is answered; the current
 // section is highlighted; anything else is a plain clickable link.
-function renderAuditSectionStepper(array $tree, int $current, int $auditId, string $draftToken): void {
+// Above the audit form: what this store got wrong in the last 6 months on
+// this template, with the full list a click away.
+function renderAuditNegativeBanner(array $a, array $neg): void {
+    $n = count($neg['params']);
+    $url = '?' . http_build_query([
+        'page' => 'audit_negative', 'view' => 1, 'mode' => 'all',
+        'location_id' => (int)($a['location_id'] ?? 0), 'template_id' => (int)($a['template_id'] ?? 0),
+        'from_date' => $neg['from'], 'to_date' => date('Y-m-d'),
+    ]);
+    ?>
+    <div class="alert <?= $n ? 'alert-error' : 'alert-success' ?>" style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:space-between">
+        <span>
+        <?php if (!$neg['audits']): ?>
+            No audits of this template at <?= h($a['location_name'] ?? 'this store') ?> in the last 6 months.
+        <?php elseif ($n): ?>
+            <strong><?= $n ?></strong> negative parameter(s) at <?= h($a['location_name'] ?? 'this store') ?>
+            in the last 6 months (<?= (int)$neg['audits'] ?> audit(s)). They are marked <strong style="color:var(--red,#e5534b)">*</strong>
+            on the sections below and the history icon of each is red — check those first.
+        <?php else: ?>
+            0 negative parameters at <?= h($a['location_name'] ?? 'this store') ?> in the last 6 months
+            (<?= (int)$neg['audits'] ?> audit(s)).
+        <?php endif; ?>
+        </span>
+        <?php if ($n): ?><a class="btn btn-sm btn-ghost" href="<?= h($url) ?>" target="_blank" rel="noopener">View Negative Parameters</a><?php endif; ?>
+    </div>
+    <?php
+}
+
+// Turn the history icon red on every question that came up negative at
+// this store in the last 6 months. Done after render so every audit table
+// (edit, view and each review desk) gets it without its own branch.
+function renderAuditNegativeMarks(array $neg): void {
+    if (!$neg['params']) return;
+    $map = [];
+    foreach ($neg['params'] as $pid => $info) $map[$pid] = $info;
+    ?>
+    <style>
+    .btn-icon-history.is-negative{color:var(--red,#e5534b);border-color:var(--red,#e5534b);background:rgba(229,83,75,.12)}
+    .btn-icon-history.is-negative:hover{background:var(--red,#e5534b);color:#fff}
+    </style>
+    <script>
+    (function () {
+        var NEG = <?= json_encode($map) ?>;
+        document.querySelectorAll('.btn-icon-history').forEach(function (b) {
+            var n = NEG[b.getAttribute('data-param-id')];
+            if (!n) return;
+            b.classList.add('is-negative');
+            b.title = 'Negative ' + n.count + ' time(s) in the last 6 months (last on ' + n.last_date + ') — view history';
+        });
+    })();
+    </script>
+    <?php
+}
+
+// $negParams is auditRecentNegatives()['params']: each pill carries how many
+// of its questions came up negative at this store in the last 6 months.
+function renderAuditSectionStepper(array $tree, int $current, int $auditId, string $draftToken, array $negParams = []): void {
     $base = $auditId > 0 ? ('?page=audit_edit&id=' . $auditId) : ('?page=audit_edit&draft=' . h($draftToken));
     ?>
     <style>
@@ -1068,6 +1127,8 @@ function renderAuditSectionStepper(array $tree, int $current, int $auditId, stri
     .audit-step.is-current .n{background:var(--accent);color:#fff}
     .audit-step.is-done{color:var(--green)}
     .audit-step.is-done .n{background:rgba(39,174,96,.22);color:var(--green)}
+    .audit-step .neg{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:18px;padding:0 5px;border-radius:9px;font-size:10.5px;font-weight:700;background:rgba(255,255,255,.06);color:var(--muted)}
+    .audit-step .neg.has{background:rgba(229,83,75,.18);color:var(--red,#e5534b)}
     </style>
     <div class="audit-stepper">
         <?php foreach ($tree as $i => $c):
@@ -1079,14 +1140,20 @@ function renderAuditSectionStepper(array $tree, int $current, int $auditId, stri
                 if (!$r || $r['value_entered'] === null) { $done = false; break; }
             }
             $cls = 'audit-step' . ($isCurrent ? ' is-current' : ($done ? ' is-done' : ''));
+            $negN = 0;
+            foreach ($c['parameters'] as $p) if (isset($negParams[(int)$p['id']])) $negN++;
+            $negBadge = '<span class="neg' . ($negN ? ' has' : '') . '" title="'
+                      . ($negN ? $negN . ' question(s) negative at this store in the last 6 months'
+                               : 'No negative questions here in the last 6 months')
+                      . '">' . ($negN ? '*' . $negN : '0') . '</span>';
         ?>
             <?php if (!$isCurrent): ?>
                 <a class="<?= $cls ?>" href="<?= $base . '&section=' . $idx ?>">
-                    <span class="n"><?= $done ? '✓' : $idx ?></span><?= h($c['name']) ?>
+                    <span class="n"><?= $done ? '✓' : $idx ?></span><?= h($c['name']) ?><?= $negBadge ?>
                 </a>
             <?php else: ?>
                 <span class="<?= $cls ?>">
-                    <span class="n"><?= $done ? '✓' : $idx ?></span><?= h($c['name']) ?>
+                    <span class="n"><?= $done ? '✓' : $idx ?></span><?= h($c['name']) ?><?= $negBadge ?>
                 </span>
             <?php endif; ?>
         <?php endforeach; ?>
@@ -1182,6 +1249,7 @@ function pageAuditView(): void {
     renderAuditHeader($a);
     renderOpenPinsBanner($a);
     renderAuditEditTable($tree, $id, true, (int)($a['location_id'] ?? 0));
+    renderAuditNegativeMarks(auditRecentNegatives((int)$a['location_id'], (int)$a['template_id'], $id));
     renderAuditViewLog($id);
     ?>
     <div class="form-actions" style="margin-top:18px">
@@ -1279,6 +1347,7 @@ function pageAuditApprove(): void {
         <input type="hidden" name="action" value="approve_audit">
         <input type="hidden" name="audit_id" value="<?= (int)$id ?>">
         <?php renderAuditApproveTable($tree, $id, (int)($a['location_id'] ?? 0)); ?>
+        <?php renderAuditNegativeMarks(auditRecentNegatives((int)$a['location_id'], (int)$a['template_id'], $id)); ?>
         <div class="form-actions audit-approve-bar"
              style="position:sticky;bottom:0;z-index:50;
                     margin:20px -8px 0;padding:12px 16px;
@@ -1327,6 +1396,7 @@ function pageAuditOperationReview(): void {
         <input type="hidden" name="action" value="operation_review_audit">
         <input type="hidden" name="audit_id" value="<?= (int)$id ?>">
         <?php renderAuditOperationReviewTable($tree, $id, (int)($a['location_id'] ?? 0)); ?>
+        <?php renderAuditNegativeMarks(auditRecentNegatives((int)$a['location_id'], (int)$a['template_id'], $id)); ?>
         <div class="form-actions audit-ops-bar"
              style="position:sticky;bottom:0;z-index:50;
                     margin:20px -8px 0;padding:12px 16px;
@@ -1377,6 +1447,7 @@ function pageAuditManagementReview(): void {
         <input type="hidden" name="action" value="management_approve_audit">
         <input type="hidden" name="audit_id" value="<?= (int)$id ?>">
         <?php renderAuditManagementReviewTable($tree, $id, (int)($a['location_id'] ?? 0)); ?>
+        <?php renderAuditNegativeMarks(auditRecentNegatives((int)$a['location_id'], (int)$a['template_id'], $id)); ?>
         <div class="form-actions audit-mgmt-bar"
              style="position:sticky;bottom:0;z-index:50;
                     margin:20px -8px 0;padding:12px 16px;
@@ -1475,6 +1546,7 @@ function pageAuditManagerReview(): void {
         <input type="hidden" name="action" value="manager_review_audit">
         <input type="hidden" name="audit_id" value="<?= (int)$id ?>">
         <?php renderAuditManagerReviewTable($tree, $id, (int)($a['location_id'] ?? 0)); ?>
+        <?php renderAuditNegativeMarks(auditRecentNegatives((int)$a['location_id'], (int)$a['template_id'], $id)); ?>
         <!-- Sticky-bottom action bar so Save / Forward stay visible while
              the SM scrolls through long audits. Same pattern as the
              approver page. -->
@@ -3843,7 +3915,10 @@ function auditNegativeQuery(array $f): array {
     if ($f['location_id'] > 0) { $where[] = 'a.location_id = ?'; $params[] = $f['location_id']; }
     if ($f['template_id'] > 0) { $where[] = 'a.template_id = ?'; $params[] = $f['template_id']; }
     if ($f['auditor_code'] !== '') { $where[] = 'a.auditor_code = ?'; $params[] = $f['auditor_code']; }
-    auditApplyScope($where, $params);
+    // An auditor otherwise sees only their own audits, but this report is
+    // for reading a store's record before auditing it — whoever filed the
+    // earlier audits. Drafts are already excluded above.
+    if (!auditCanCreate()) auditApplyScope($where, $params);
 
     $st = $db->prepare('SELECT a.id, a.location_id, a.template_id, a.audit_date
                         FROM audits a WHERE ' . implode(' AND ', $where) . '
