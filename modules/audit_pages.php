@@ -3194,7 +3194,7 @@ function renderAuditHistoryModal(): void {
                              + '<th class="num">Modified Wt.</th>'
                              + '<th class="num">Value</th>'
                              + '<th class="num">Obtain</th>'
-                             + '<th>Auditor Remarks</th>'
+                             + '<th>Auditor / Remarks</th>'
                              + '</tr></thead><tbody>';
                     // Highlight history rows where the question's wording
                     // at that audit differs from the current text — keeps
@@ -3205,9 +3205,13 @@ function renderAuditHistoryModal(): void {
                     rows.forEach(function(r){
                         var asked = r.hist_parameter_text || '';
                         var differs = asked && asked !== currentText;
-                        var remarkCell = r.auditor_remark
-                            ? esc(r.auditor_remark).replace(/\n/g,'<br>')
-                            : '—';
+                        // Who said it, then what they said — a remark reads
+                        // differently from one auditor to the next.
+                        var remarkCell = '<div style="font-weight:600;font-size:12px">'
+                            + esc(r.auditor_name || '—') + '</div>'
+                            + (r.auditor_remark
+                                ? '<div style="color:var(--muted)">' + esc(r.auditor_remark).replace(/\n/g,'<br>') + '</div>'
+                                : '');
                         if (differs) {
                             remarkCell = '<div style="font-size:11px;color:var(--yellow);margin-bottom:4px" title="Wording at the time of this audit">Asked then: ' + esc(asked) + '</div>' + remarkCell;
                         }
@@ -3225,7 +3229,7 @@ function renderAuditHistoryModal(): void {
                                    : (r.value_entered === null ? '—' : esc(r.value_entered)))
                               + '</td>'
                               + '<td data-label="Obtain" class="num">' + fmt(r.obtain_score) + '</td>'
-                              + '<td data-label="Auditor Remarks">' + remarkCell + '</td>'
+                              + '<td data-label="Auditor / Remarks">' + remarkCell + '</td>'
                               + '</tr>';
                     });
                     html += '</tbody></table>';
