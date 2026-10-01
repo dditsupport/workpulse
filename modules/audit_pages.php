@@ -227,6 +227,8 @@ function pageAuditList(): void {
         </select>
         <input type="date" id="audit-from-date" name="from_date" class="form-control" style="max-width:150px" value="<?= h($fromDate) ?>">
         <input type="date" id="audit-to-date"   name="to_date"   class="form-control" style="max-width:150px" value="<?= h($toDate) ?>">
+        <?php // Forces View and Export CSV onto a line of their own, together. ?>
+        <div style="flex-basis:100%;height:0"></div>
         <button class="btn btn-secondary">View</button>
         <?php // status is a set now, so the query string is built rather than interpolated. ?>
         <a class="btn btn-ghost" href="?<?= h(http_build_query([
