@@ -2227,7 +2227,12 @@ function pagePerfReview(): void {
     <?php if ($justify): ?><input type="hidden" name="justify" value="1"><?php endif; ?>
     <?php if (perfCanViewAll() && $pickable): ?>
         <label class="text-muted">Outlet</label>
-        <select name="loc" class="form-control" style="width:230px" onchange="this.form.submit()">
+        <!-- Changing outlet leaves the month behind: the month on show is
+             the last outlet's, and an outlet closed early would otherwise
+             drag every outlet after it back to its final month. With no
+             month sent, the new outlet opens on its own latest. -->
+        <select name="loc" class="form-control" style="width:230px"
+                onchange="this.form.elements['month'].disabled = true; this.form.submit()">
             <?php foreach ($pickable as $p): ?>
                 <option value="<?= (int)$p['location_id'] ?>" <?= (int)$p['location_id'] === $locId ? 'selected' : '' ?>>
                     <?= h($p['location_name']) ?>
