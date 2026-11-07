@@ -1748,6 +1748,10 @@ function doDeleteChecklistMonth(): void {
 // Validators are designated per task (chk_validators.item_id), so a
 // department checklist shows each validator only their own tasks; a
 // validator designated for the whole checklist (item_id 0) sees them all.
+//
+// A saved validation is final: once a task has a row in chk_validations it
+// shows read-only, with who signed it off and when, and the save handler
+// will not overwrite or clear it.
 function pageChecklistValidate(): void {
     $db = getDb();
     $me = myCode();
@@ -1832,7 +1836,10 @@ function pageChecklistValidate(): void {
             }
         }
 
-        $vs = $db->prepare("SELECT item_id, status, remarks FROM chk_validations WHERE checklist_id = ? AND location_id = ? AND log_date = ?");
+        $vs = $db->prepare("SELECT v.item_id, v.status, v.remarks, v.validated_at, e.full_name AS val_name
+                            FROM chk_validations v
+                            LEFT JOIN employees e ON v.validated_by = e.employee_code
+                            WHERE v.checklist_id = ? AND v.location_id = ? AND v.log_date = ?");
         $vs->execute([$checklistId, $locationId, $logDate]);
         foreach ($vs->fetchAll(PDO::FETCH_ASSOC) as $v) $vals[(int)$v['item_id']] = $v;
 
@@ -1908,6 +1915,7 @@ function pageChecklistValidate(): void {
             </tr></thead>
             <tbody>
             <?php $vCols = $remarkCol ? 6 : 5;
+            $openRows = 0;
             $section = null; $sr = 1; foreach ($items as $it):
                 if (($it['section_name'] ?? '') !== $section): $section = (string)($it['section_name'] ?? ''); ?>
                 <tr><td colspan="<?= $vCols ?>" style="background:var(--border);font-weight:700;font-size:12px;padding:8px 13px"><?= h($section ?: 'General') ?></td></tr>
@@ -1917,6 +1925,7 @@ function pageChecklistValidate(): void {
                 $v       = $vals[$iid] ?? null;
                 $vstatus = $v['status']  ?? '';
                 $vrem    = $v['remarks'] ?? '';
+                if ($v === null) $openRows++;
             ?>
                 <tr>
                     <td style="text-align:center;color:var(--muted);font-size:12px"><?= $sr++ ?></td>
@@ -1941,20 +1950,39 @@ function pageChecklistValidate(): void {
                         <?php else: ?><span class="text-muted">—</span><?php endif; ?>
                     </td>
                     <?php endif; ?>
+                    <?php if ($v !== null): // saved — locked ?>
+                    <td>
+                        <span class="badge <?= $vstatus === 'done' ? 'badge-green' : 'badge-red' ?>">🔒 <?= $vstatus === 'done' ? 'Done' : 'Not done' ?></span>
+                        <div class="text-muted" style="font-size:11px;margin-top:4px">
+                            <?= h((string)($v['val_name'] ?? '')) ?><?php if (!empty($v['validated_at'])): ?> · <?= h(date('d M Y, H:i', strtotime((string)$v['validated_at']))) ?><?php endif; ?>
+                        </div>
+                    </td>
+                    <td style="white-space:normal;word-break:break-word;font-size:12px">
+                        <?php if (trim((string)$vrem) !== ''): ?><?= h($vrem) ?><?php else: ?><span class="text-muted">—</span><?php endif; ?>
+                    </td>
+                    <?php else: ?>
                     <td>
                         <select name="status[<?= $iid ?>]" class="form-control" style="width:140px">
                             <option value="">— Not validated —</option>
-                            <option value="done"     <?= $vstatus === 'done' ? 'selected' : '' ?>>Done</option>
-                            <option value="not_done" <?= $vstatus === 'not_done' ? 'selected' : '' ?>>Not done</option>
+                            <option value="done">Done</option>
+                            <option value="not_done">Not done</option>
                         </select>
                     </td>
-                    <td><input type="text" name="remark[<?= $iid ?>]" class="form-control" value="<?= h($vrem) ?>" maxlength="500" placeholder="Optional remark"></td>
+                    <td><input type="text" name="remark[<?= $iid ?>]" class="form-control" value="" maxlength="500" placeholder="Optional remark"></td>
+                    <?php endif; ?>
                 </tr>
             <?php endforeach; ?>
             </tbody>
         </table>
     </div>
-    <div style="margin-top:12px"><button type="submit" class="btn btn-primary">Save validation</button></div>
+    <?php if ($openRows > 0): ?>
+    <div style="margin-top:12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <button type="submit" class="btn btn-primary">Save validation</button>
+        <span class="text-muted" style="font-size:12px">Saved validations are final and cannot be changed afterwards.</span>
+    </div>
+    <?php else: ?>
+    <div class="text-muted" style="margin-top:12px;font-size:13px">🔒 Every task here is validated. Saved validations cannot be changed.</div>
+    <?php endif; ?>
 </form>
 <?php endif; ?>
 
@@ -2023,17 +2051,18 @@ function doSaveChecklistValidation(): void {
     $statuses = (array)($_POST['status'] ?? []);
     $remarks  = (array)($_POST['remark'] ?? []);
 
+    // A saved validation is final: tasks already validated for this
+    // location/day are neither overwritten nor cleared. INSERT IGNORE keeps
+    // that true even when two validators save the same task at once — the
+    // first one in stands.
     $up = $db->prepare(
-        "INSERT INTO chk_validations (checklist_id, location_id, item_id, log_date, status, remarks, validated_by)
-         VALUES (?,?,?,?,?,?,?)
-         ON DUPLICATE KEY UPDATE checklist_id=VALUES(checklist_id), status=VALUES(status), remarks=VALUES(remarks),
-                                 validated_by=VALUES(validated_by), validated_at=NOW()"
+        "INSERT IGNORE INTO chk_validations (checklist_id, location_id, item_id, log_date, status, remarks, validated_by)
+         VALUES (?,?,?,?,?,?,?)"
     );
-    $del = $db->prepare("DELETE FROM chk_validations WHERE location_id=? AND item_id=? AND log_date=?");
 
     $saved = 0;
     try {
-        $skipped = 0;
+        $skipped = 0; $locked = 0;
         foreach ($statuses as $itemId => $st) {
             $itemId = (int)$itemId;
             if ($itemId <= 0) continue;
@@ -2042,14 +2071,12 @@ function doSaveChecklistValidation(): void {
             if (!chkCanValidateItem($checklistId, $itemId, $code)) { $skipped++; continue; }
             $st  = (string)$st;
             $rem = trim((string)($remarks[$itemId] ?? ''));
-            if ($st === 'done' || $st === 'not_done') {
-                $up->execute([$checklistId, $locationId, $itemId, $logDate, $st, ($rem !== '' ? mb_substr($rem, 0, 500) : null), $code]);
-                $saved++;
-            } else {
-                $del->execute([$locationId, $itemId, $logDate]);
-            }
+            if ($st !== 'done' && $st !== 'not_done') continue;   // left unvalidated
+            $up->execute([$checklistId, $locationId, $itemId, $logDate, $st, ($rem !== '' ? mb_substr($rem, 0, 500) : null), $code]);
+            if ($up->rowCount() > 0) $saved++; else $locked++;
         }
         flash('success', "Validation saved — {$saved} task(s) marked."
+            . ($locked > 0 ? " {$locked} task(s) were already validated and left unchanged." : '')
             . ($skipped > 0 ? " {$skipped} task(s) skipped — not designated to you." : ''));
     } catch (Exception $e) {
         flash('error', $e->getMessage());
