@@ -861,9 +861,9 @@ function perfOpenRequests(array $rows): array {
 }
 
 // ── Goals as standing requests ──────────────────────────
-// A figure that misses the outlet's goal needs a justification whether or
-// not Operations got round to ticking it: the goal is the question, asked
-// in advance. These requests are worked out from the figure and the goal
+// A figure that misses the outlet's goal in its current month needs a
+// justification whether or not Operations got round to ticking it: the
+// goal is the question, asked in advance. These requests are worked out from the figure and the goal
 // each time rather than stored, so changing a goal (or correcting an
 // upload) moves them with it, and Operations cannot withdraw one by
 // unticking — they change the goal instead.
@@ -890,12 +890,22 @@ function perfGoalMisses(int $locId, string $month, array $grid): array {
     return $out;
 }
 
+// Only the outlet's current month — the latest one uploaded for it — is
+// asked about. Past months are history: a goal missed there is visible in
+// the colouring and the hover, but it does not reopen a month the store
+// has moved on from, nor block submitting one.
+function perfGoalRequestMonth(int $locId): ?string {
+    return perfMonths($locId)[0] ?? null;
+}
+
 // Lay the goal requests over perfRemarkGrid() so every reader — the grid,
 // the open-request count, the CSV — sees them as flagged rows. A row
 // Operations flagged by hand keeps its own question; goal_missed marks
-// both kinds. Concluded months are left as they were closed.
+// both kinds. A concluded month is left as it was closed.
 function perfApplyGoalRequests(array $remarks, int $locId, array $grid, array $months, array $reviews): array {
+    $current = perfGoalRequestMonth($locId);
     foreach ($months as $m) {
+        if ($m !== $current) continue;
         if ((string)($reviews[$m]['status'] ?? '') === 'concluded') continue;
         foreach (perfGoalMisses($locId, $m, $grid) as $code => $note) {
             $row = $remarks[$m][$code] ?? [];
@@ -1212,13 +1222,16 @@ function doPerfSaveRemarks(): void {
                  WHERE m.review_id = ? AND m.flagged = 1 AND COALESCE(m.remark, \'\') = \'\'');
             $st->execute([$reviewId]);
             $blocked = array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN));
-            // A missed goal asks for a justification too, unflagged or not.
+            // A missed goal asks for a justification too, unflagged or not —
+            // in the outlet's current month only.
+            $goalMisses = $month === perfGoalRequestMonth($locId)
+                ? perfGoalMisses($locId, $month, perfValueGrid($locId, [$month])) : [];
             $st = $db->prepare(
                 'SELECT param_code FROM perf_remarks
                  WHERE review_id = ? AND COALESCE(remark, \'\') <> \'\'');
             $st->execute([$reviewId]);
             $answered = array_flip(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)));
-            foreach (array_keys(perfGoalMisses($locId, $month, perfValueGrid($locId, [$month]))) as $code) {
+            foreach (array_keys($goalMisses) as $code) {
                 $code = (string)$code;      // '11' comes back as an int key
                 if (!isset($answered[$code]) && !in_array($code, $blocked, true)) $blocked[] = $code;
             }
@@ -1870,6 +1883,9 @@ function pagePerfReviews(): void {
     foreach ($outlets as $o) {
         $l = (int)$o['location_id'];
         if (($reviews[$l]['status'] ?? '') === 'concluded') continue;
+        // Goals only ask in an outlet's current month; for an older month
+        // the stored counts above already say everything.
+        if ($month !== perfGoalRequestMonth($l)) continue;
         $asked = $flaggedBy[$l] ?? [];
         foreach (array_keys(perfGoalMisses($l, $month, $monthGrid[$l] ?? [])) as $c) $asked[(string)$c] = true;
         $open = 0;
@@ -2706,7 +2722,7 @@ function pagePerfReview(): void {
         <div class="text-muted" style="margin-top:6px">
             Unticking a parameter withdraws the request. An answer the store has already given is
             kept; a question nobody answered leaves no trace. A figure that misses the outlet's goal
-            is asked about automatically — change the goal under Outlet goals to stop that.
+            in the outlet's current month is asked about automatically — change the goal under Outlet goals to stop that.
         </div>
     <?php elseif ($canRemark): ?>
         <div class="form-actions">
