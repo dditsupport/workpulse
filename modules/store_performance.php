@@ -860,6 +860,58 @@ function perfOpenRequests(array $rows): array {
     return $open;
 }
 
+// ── Goals as standing requests ──────────────────────────
+// A figure that misses the outlet's goal needs a justification whether or
+// not Operations got round to ticking it: the goal is the question, asked
+// in advance. These requests are worked out from the figure and the goal
+// each time rather than stored, so changing a goal (or correcting an
+// upload) moves them with it, and Operations cannot withdraw one by
+// unticking — they change the goal instead.
+//
+// Parameters judged against a benchmark (perfBenchmarks — Achievement vs
+// Target) are skipped, as they are for colouring: their standing goal is
+// not what the grid holds them to.
+//   $grid: perfValueGrid() rows covering $month. [param_code => note]
+function perfGoalMisses(int $locId, string $month, array $grid): array {
+    $goals      = perfGoals($locId);
+    $benchmarks = perfBenchmarks();
+    $out = [];
+    foreach (perfParameters() as $p) {
+        $code = (string)$p['param_code'];
+        if (isset($benchmarks[$code])) continue;
+        $cell = $grid[$code][$month] ?? null;
+        if (!$cell || $cell['value_num'] === null) continue;
+        $goal = $goals[$code] ?? null;
+        if (perfMeetsGoal((float)$cell['value_num'], $goal, (string)$p['better']) === false) {
+            $out[$code] = 'Missed goal ' . perfGoalLabel($goal, $p)
+                        . ' — this month ' . perfDisplayValue($cell, $p) . '. Please explain.';
+        }
+    }
+    return $out;
+}
+
+// Lay the goal requests over perfRemarkGrid() so every reader — the grid,
+// the open-request count, the CSV — sees them as flagged rows. A row
+// Operations flagged by hand keeps its own question; goal_missed marks
+// both kinds. Concluded months are left as they were closed.
+function perfApplyGoalRequests(array $remarks, int $locId, array $grid, array $months, array $reviews): array {
+    foreach ($months as $m) {
+        if ((string)($reviews[$m]['status'] ?? '') === 'concluded') continue;
+        foreach (perfGoalMisses($locId, $m, $grid) as $code => $note) {
+            $row = $remarks[$m][$code] ?? [];
+            if ((int)($row['flagged'] ?? 0) !== 1) {
+                $row['flagged']      = 1;
+                $row['flag_note']    = $note;
+                $row['flagged_name'] = 'Automatic — outlet goal';
+                $row['goal_auto']    = 1;      // asked by the goal alone
+            }
+            $row['goal_missed'] = 1;
+            $remarks[$m][$code] = $row;
+        }
+    }
+    return $remarks;
+}
+
 // ── Admin: the parameter master ─────────────────────────
 // Operations owns the list of 18 (or however many it grows to). Adding
 // one, renaming it, changing how it reads or what it is held to, and
@@ -1160,6 +1212,16 @@ function doPerfSaveRemarks(): void {
                  WHERE m.review_id = ? AND m.flagged = 1 AND COALESCE(m.remark, \'\') = \'\'');
             $st->execute([$reviewId]);
             $blocked = array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN));
+            // A missed goal asks for a justification too, unflagged or not.
+            $st = $db->prepare(
+                'SELECT param_code FROM perf_remarks
+                 WHERE review_id = ? AND COALESCE(remark, \'\') <> \'\'');
+            $st->execute([$reviewId]);
+            $answered = array_flip(array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN)));
+            foreach (array_keys(perfGoalMisses($locId, $month, perfValueGrid($locId, [$month]))) as $code) {
+                $code = (string)$code;      // '11' comes back as an int key
+                if (!isset($answered[$code]) && !in_array($code, $blocked, true)) $blocked[] = $code;
+            }
             if (!$blocked) {
                 $db->prepare(
                     'UPDATE perf_reviews
@@ -1781,6 +1843,42 @@ function pagePerfReviews(): void {
     $reviews = [];
     foreach ($st->fetchAll(PDO::FETCH_ASSOC) as $r) $reviews[(int)$r['location_id']] = $r;
 
+    // The counts above only see what Operations ticked. A missed goal asks
+    // too (perfGoalMisses), so recount requested/unanswered per outlet with
+    // those folded in — the month's figures for every outlet in one read,
+    // and which parameters each review has flagged or answered in another.
+    $monthGrid = [];
+    $vs = $db->prepare('SELECT location_id, param_code, value_num, value_text FROM perf_values WHERE period_month = ?');
+    $vs->execute([$month]);
+    foreach ($vs->fetchAll(PDO::FETCH_ASSOC) as $v) {
+        $monthGrid[(int)$v['location_id']][(string)$v['param_code']][$month] = [
+            'value_num'  => $v['value_num'] === null ? null : (float)$v['value_num'],
+            'value_text' => $v['value_text'],
+        ];
+    }
+    $flaggedBy = $answeredBy = [];
+    $ms = $db->prepare(
+        'SELECT r.location_id, m.param_code, m.flagged, COALESCE(m.remark, \'\') <> \'\' AS answered
+         FROM perf_remarks m JOIN perf_reviews r ON r.id = m.review_id
+         WHERE r.period_month = ?');
+    $ms->execute([$month]);
+    foreach ($ms->fetchAll(PDO::FETCH_ASSOC) as $m) {
+        $l = (int)$m['location_id']; $c = (string)$m['param_code'];
+        if ((int)$m['flagged'] === 1)  $flaggedBy[$l][$c]  = true;
+        if ((int)$m['answered'] === 1) $answeredBy[$l][$c] = true;
+    }
+    foreach ($outlets as $o) {
+        $l = (int)$o['location_id'];
+        if (($reviews[$l]['status'] ?? '') === 'concluded') continue;
+        $asked = $flaggedBy[$l] ?? [];
+        foreach (array_keys(perfGoalMisses($l, $month, $monthGrid[$l] ?? [])) as $c) $asked[(string)$c] = true;
+        $open = 0;
+        foreach (array_keys($asked) as $c) if (empty($answeredBy[$l][(string)$c])) $open++;
+        $reviews[$l] = ($reviews[$l] ?? []) + ['status' => null, 'remarked_at' => null, 'remarks' => 0];
+        $reviews[$l]['requested']  = count($asked);
+        $reviews[$l]['unanswered'] = $open;
+    }
+
     $paramCount = count(perfParameters());
 ?>
 <div class="page-header">
@@ -2011,7 +2109,7 @@ function pagePerfReview(): void {
     $grid     = perfValueGrid($locId, array_values(array_unique(
         array_merge($months, array_map('perfPrevYearMonth', $months)))));
     $reviews  = perfReviewHeaders($locId, $months);
-    $remarks  = perfRemarkGrid($reviews);
+    $remarks  = perfApplyGoalRequests(perfRemarkGrid($reviews), $locId, $grid, $months, $reviews);
     $review   = $reviews[$month] ?? null;
     $status   = (string)($review['status'] ?? 'pending');
 
@@ -2550,7 +2648,17 @@ function pagePerfReview(): void {
                         <?php endif; ?>
                         </div>
 
-                        <?php if ($isReview && $flagMode): ?>
+                        <?php if ($isReview && $flagMode && !empty($row['goal_auto'])): ?>
+                            <!-- Asked by the goal, not by a tick: nothing to
+                                 withdraw here. Changing the goal is how. -->
+                            <div class="perf-cell-ask"><b>Asked automatically:</b> <?= h($question) ?></div>
+                            <?php if ($answer !== ''): ?>
+                                <div class="perf-cell-remark"><?= nl2br(h($answer)) ?>
+                                    <div class="perf-remark-by">— <?= h((string)($row['full_name'] ?? '')) ?></div>
+                                </div>
+                            <?php endif; ?>
+
+                        <?php elseif ($isReview && $flagMode): ?>
                             <label class="perf-flag-tick">
                                 <input type="checkbox" name="flag[<?= h($code) ?>]" value="1"
                                        <?= $isFlagged ? 'checked' : '' ?>> needs justification
@@ -2597,7 +2705,8 @@ function pagePerfReview(): void {
         </div>
         <div class="text-muted" style="margin-top:6px">
             Unticking a parameter withdraws the request. An answer the store has already given is
-            kept; a question nobody answered leaves no trace.
+            kept; a question nobody answered leaves no trace. A figure that misses the outlet's goal
+            is asked about automatically — change the goal under Outlet goals to stop that.
         </div>
     <?php elseif ($canRemark): ?>
         <div class="form-actions">
@@ -2850,7 +2959,7 @@ function exportPerfReview(): void {
     $params  = perfParameters();
     $grid    = perfValueGrid($locId, $months);
     $reviews = perfReviewHeaders($locId, $months);
-    $remarks = perfRemarkGrid($reviews);
+    $remarks = perfApplyGoalRequests(perfRemarkGrid($reviews), $locId, $grid, $months, $reviews);
 
     // Same shape as the screen: a row per parameter per financial year,
     // twelve fixed columns Apr → Mar, so a year lines up under the year
@@ -2890,7 +2999,7 @@ function exportPerfReview(): void {
     // prompted one is not repeated here for past months, the same rule the
     // screen follows; a * marks a month where one was asked.
     fputcsv($out, [], escape: '');
-    fputcsv($out, ['Store Manager justifications', '(* = Operations asked for this one)'], escape: '');
+    fputcsv($out, ['Store Manager justifications', '(* = a justification was asked for: by Operations or a missed goal)'], escape: '');
     fputcsv($out, $head, escape: '');
     foreach ($params as $p) {
         foreach ($fyList as $fyStart) {
